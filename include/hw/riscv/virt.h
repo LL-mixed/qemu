@@ -61,11 +61,17 @@ enum {
     VIRT_DRAM,
     VIRT_PCIE_MMIO,
     VIRT_PCIE_PIO,
-    VIRT_PCIE_ECAM
+    VIRT_PCIE_ECAM,
+    VIRT_UART1,
+    VIRT_UART2,
+    VIRT_UART3,
 };
 
 enum {
     UART0_IRQ = 10,
+    UART1_IRQ = 2,
+    UART2_IRQ = 4,
+    UART3_IRQ = 6,
     RTC_IRQ = 11,
     VIRTIO_IRQ = 1, /* 1 to 8 */
     VIRTIO_COUNT = 8,
