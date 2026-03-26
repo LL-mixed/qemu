@@ -56,6 +56,7 @@ enum UbCfgEmulatedSlice {
 #define UB_CFG_SLICE_NUMS (UB_CFG_GENERAL_SLICES_NUM + UB_DEV_MAX_NUM_OF_PORT + 1)
 #define UB_CFG_START_OFFSET_GRANU 4
 #define UB_CFG_SLICE_SIZE (1 * KiB)
+#define UB_PORT_EMULATED_SLICE_SIZE (2 * KiB)
 
 typedef struct UbCfgAddrMapEntry {
     uint64_t start_addr;

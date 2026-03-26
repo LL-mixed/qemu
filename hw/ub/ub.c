@@ -47,6 +47,8 @@
 #include "trace.h"
 
 QLIST_HEAD(, BusControllerState) ub_bus_controllers;
+
+#define UB_PORT_PHYSICAL_PORT_LINK_STATUS 0x700
 static void ub_update_mappings(UBDevice *dev);
 
 static void ubbus_dev_print(Monitor *mon, DeviceState *dev, int indent)
@@ -881,14 +883,16 @@ static void ub_config_set_port_basic(NeighborInfo *info, UBDevice *dev)
     ConfigPortBasic *port_basic = NULL;
     ConfigPortBasic *port_basic_wmask = NULL;
     ConfigPortBasic *port_basic_w1cmask = NULL;
+    uint8_t *port_basic_raw = NULL;
 
     emulated_offset = ub_cfg_offset_to_emulated_offset(UB_PORT_SLICE_START + port_idx * UB_PORT_SZ, true);
     port_basic = (ConfigPortBasic *)(dev->config + emulated_offset);
     port_basic_wmask = (ConfigPortBasic *)(dev->wmask + emulated_offset);
     port_basic_w1cmask = (ConfigPortBasic *)(dev->w1cmask + emulated_offset);
-    memset(port_basic, 0, sizeof(ConfigPortBasic));
-    memset(port_basic_wmask, 0, sizeof(ConfigPortBasic));
-    memset(port_basic_w1cmask, 0, sizeof(ConfigPortBasic));
+    port_basic_raw = dev->config + emulated_offset;
+    memset(port_basic, 0, UB_PORT_EMULATED_SLICE_SIZE);
+    memset(port_basic_wmask, 0, UB_PORT_EMULATED_SLICE_SIZE);
+    memset(port_basic_w1cmask, 0, UB_PORT_EMULATED_SLICE_SIZE);
     /* slice header */
     port_basic->header.slice_version = UB_SLICE_VERSION;
     port_basic->header.slice_used_size = UB_PORT_BASIC_SLICE_USED_SIZE;
@@ -899,6 +903,7 @@ static void ub_config_set_port_basic(NeighborInfo *info, UBDevice *dev)
     port_basic->neighbor_port_info.neighbor_port_idx = info->neighbor_port_idx & UINT16_MASK;
     port_basic->neighbor_port_info.neighbot_port_guid = info->neighbor_dev->guid;
     port_basic->port_reset = 0;
+    port_basic_raw[UB_PORT_PHYSICAL_PORT_LINK_STATUS] = 0x1;
 
     /* set wmask */
     port_basic_wmask->port_cna = ~0;

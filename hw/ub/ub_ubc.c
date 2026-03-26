@@ -279,6 +279,11 @@ static void ub_bus_controller_space_cfg0_init(UBDevice *ub_dev)
     shp_cap->header.slice_used_size = (shp_cap->slot_num * sizeof(UbSlotInfo) + sizeof(UbCfg0ShpCap)) / DWORD_SIZE;
     for (int i = 0; i < shp_cap->slot_num; ++i) {
         slot_info = (UbSlotInfo *)((uint8_t *)shp_cap->slot_info + i * sizeof(UbSlotInfo));
+        slot_info->pps = 1;
+        slot_info->wlps = 1;
+        slot_info->plps = 1;
+        slot_info->pdss = 1;
+        slot_info->pwcs = 1;
         slot_info->start_port_idx = 0;
         slot_info->end_port_idx = cfg0_basic->total_num_of_port - 1;
         slot_info->pp_ctrl = 1;

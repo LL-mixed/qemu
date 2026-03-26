@@ -29,6 +29,16 @@
 UbCfgAddrMapEntry *g_ub_cfg_addr_map_table = NULL;
 uint32_t g_emulated_ub_cfg_size;
 
+static inline uint32_t ub_cfg_emulated_slice_size(int idx)
+{
+    if (idx >= UB_CFG_GENERAL_SLICES_NUM &&
+        idx < UB_CFG_GENERAL_SLICES_NUM + UB_DEV_MAX_NUM_OF_PORT) {
+        return UB_PORT_EMULATED_SLICE_SIZE;
+    }
+
+    return UB_CFG_SLICE_SIZE;
+}
+
 uint64_t ub_cfg_slice_start_offset[UB_CFG_EMULATED_SLICES_NUM] = {
     [CFG0_BASIC]        = 0x0,
     [CAP1_RSV]          = 0x100,
@@ -81,16 +91,22 @@ int ub_cfg_addr_map_table_init(void)
         g_ub_cfg_addr_map_table[idx].start_addr = ub_cfg_slice_start_offset[CFG0_PORT_BASIC];
         g_ub_cfg_addr_map_table[idx].start_addr *= UB_CFG_START_OFFSET_GRANU;
         g_ub_cfg_addr_map_table[idx].start_addr += i * UB_PORT_SZ;
-        g_ub_cfg_addr_map_table[idx].mapped_offset = idx * UB_CFG_SLICE_SIZE;
+        g_ub_cfg_addr_map_table[idx].mapped_offset =
+            UB_CFG_GENERAL_SLICES_NUM * UB_CFG_SLICE_SIZE +
+            i * UB_PORT_EMULATED_SLICE_SIZE;
     }
 
     /* fill route table slice map table */
     idx = UB_CFG_GENERAL_SLICES_NUM + UB_DEV_MAX_NUM_OF_PORT;
     g_ub_cfg_addr_map_table[idx].start_addr = ub_cfg_slice_start_offset[CFG0_ROUTE_TABLE];
     g_ub_cfg_addr_map_table[idx].start_addr *= UB_CFG_START_OFFSET_GRANU;
-    g_ub_cfg_addr_map_table[idx].mapped_offset = idx * UB_CFG_SLICE_SIZE;
+    g_ub_cfg_addr_map_table[idx].mapped_offset =
+        UB_CFG_GENERAL_SLICES_NUM * UB_CFG_SLICE_SIZE +
+        UB_DEV_MAX_NUM_OF_PORT * UB_PORT_EMULATED_SLICE_SIZE;
 
-    g_emulated_ub_cfg_size = UB_CFG_SLICE_NUMS * UB_CFG_SLICE_SIZE;
+    g_emulated_ub_cfg_size = UB_CFG_GENERAL_SLICES_NUM * UB_CFG_SLICE_SIZE +
+        UB_DEV_MAX_NUM_OF_PORT * UB_PORT_EMULATED_SLICE_SIZE +
+        UB_CFG_SLICE_SIZE;
     qemu_log("each ub-dev emulated ub cfg size is 0x%x bytes\n", g_emulated_ub_cfg_size);
 
     return 0;
@@ -113,7 +129,7 @@ uint64_t ub_cfg_offset_to_emulated_offset(uint64_t offset, bool check_success)
         }
 
         diff = offset - g_ub_cfg_addr_map_table[i].start_addr;
-        if (diff >= UB_CFG_SLICE_SIZE) {
+        if (diff >= ub_cfg_emulated_slice_size(i)) {
             continue;
         }
 

@@ -102,6 +102,7 @@
 #include "hw/ub/ub_ummu.h"
 #include "hw/ub/ub_common.h"
 #include "hw/ub/ub_config.h"
+#define TYPE_UB_SWITCH_DEV "ub-switch-dev"
 #endif // CONFIG_UB
 #ifdef CONFIG_UBMEM_VMMU
 #include "hw/misc/ubmem_vmmu.h"
@@ -1899,7 +1900,20 @@ static void create_ub(VirtMachineState *vms)
     ubc_dev_state->bus_instance_guid.version = 0;
     ubc_dev_state->bus_instance_guid.type = UB_GUID_TYPE_BUS_INSTANCE;
     ubc_dev_state->bus_instance_guid.seq_num = 1;
+    ubc_dev_state->parent.port.neighbors_cmd = g_strdup("0:ubsw0:0");
     qdev_realize_and_unref(ubc_dev, BUS(ubc_state->bus), &error_fatal);
+
+    DeviceState *ubsw_dev = qdev_new(TYPE_UB_SWITCH_DEV);
+    UBDevice *ubsw = UB_DEVICE(ubsw_dev);
+    qdev_set_id(ubsw_dev, g_strdup("ubsw0"), &error_fatal);
+    ubsw->eid = 2;
+    ubsw->port.port_num = 1;
+    ubsw->guid.vendor = VENDER_ID_HUAWEI;
+    ubsw->guid.device_id = 0x0542;
+    ubsw->guid.version = 0;
+    ubsw->guid.type = UB_GUID_TYPE_SWITCH;
+    ubsw->guid.seq_num = 2;
+    qdev_realize_and_unref(ubsw_dev, BUS(ubc_state->bus), &error_fatal);
 }
 #endif // CONFIG_UB
 static void create_pcie(VirtMachineState *vms)
