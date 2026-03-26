@@ -413,13 +413,64 @@ static void create_fdt(VirtMachineState *vms)
 static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *machine_ram)
 {
     MachineState *ms = MACHINE(vms);
+    char *ubc_nodename;
+    char *ummu_nodename;
 
     qemu_fdt_setprop_u64(ms->fdt, "/chosen", "linux,ubios-information-table",
                          vms->memmap[VIRT_UBIOS_INFO_TABLE].base);
     qemu_log("create fdt for ubios-information-table 0x%lx\n",
              vms->memmap[VIRT_UBIOS_INFO_TABLE].base);
 
+    ubc_nodename = g_strdup_printf("/ubc@%" PRIx64,
+                                   vms->memmap[VIRT_UBC_BASE_REG].base);
+    qemu_fdt_add_subnode(ms->fdt, ubc_nodename);
+    qemu_fdt_setprop_string(ms->fdt, ubc_nodename, "compatible", "ub,ubc");
+    qemu_fdt_setprop_sized_cells(ms->fdt, ubc_nodename, "reg",
+                                 2, vms->memmap[VIRT_UBC_BASE_REG].base,
+                                 2, vms->memmap[VIRT_UBC_BASE_REG].size);
+    qemu_fdt_setprop_cells(ms->fdt, ubc_nodename, "interrupts",
+                           GIC_FDT_IRQ_TYPE_SPI,
+                           vms->irqmap[VIRT_PLATFORM_BUS],
+                           GIC_FDT_IRQ_FLAGS_LEVEL_HI);
+    qemu_fdt_setprop_cell(ms->fdt, ubc_nodename, "index", 0);
+
+    ummu_nodename = g_strdup_printf("/ummu@%" PRIx64,
+                                    vms->memmap[VIRT_UBC_BASE_REG].base + UMMU_REG_OFFSET);
+    qemu_fdt_add_subnode(ms->fdt, ummu_nodename);
+    qemu_fdt_setprop_string(ms->fdt, ummu_nodename, "compatible", "ub,ummu");
+    qemu_fdt_setprop_sized_cells(ms->fdt, ummu_nodename, "reg",
+                                 2, vms->memmap[VIRT_UBC_BASE_REG].base + UMMU_REG_OFFSET,
+                                 2, UMMU_REG_SIZE);
+    qemu_fdt_setprop_cell(ms->fdt, ummu_nodename, "index", 0);
+
+    g_free(ummu_nodename);
+    g_free(ubc_nodename);
+
     ub_init_ubios_info_table(ROUND_UP(UBIOS_TABLE_SIZE, 4 * KiB));
+}
+
+static void update_ub_fdt_msi_links(VirtMachineState *vms)
+{
+    MachineState *ms = MACHINE(vms);
+    char *ubc_nodename;
+    char *ummu_nodename;
+
+    if (!vms->msi_phandle) {
+        return;
+    }
+
+    ubc_nodename = g_strdup_printf("/ubc@%" PRIx64,
+                                   vms->memmap[VIRT_UBC_BASE_REG].base);
+    ummu_nodename = g_strdup_printf("/ummu@%" PRIx64,
+                                    vms->memmap[VIRT_UBC_BASE_REG].base + UMMU_REG_OFFSET);
+
+    qemu_fdt_setprop_cells(ms->fdt, ubc_nodename, "msi-parent",
+                           vms->msi_phandle, 0);
+    qemu_fdt_setprop_cells(ms->fdt, ummu_nodename, "msi-parent",
+                           vms->msi_phandle, 0);
+
+    g_free(ummu_nodename);
+    g_free(ubc_nodename);
 }
 #endif // CONFIG_UB
 
@@ -489,6 +540,7 @@ static void fdt_add_timer_nodes(const VirtMachineState *vms)
 bool cpu_l1_cache_unified(int cpu)
 {
     bool unified = false;
+#ifdef __linux__
     uint64_t clidr;
     ARMCPU *armcpu = ARM_CPU(qemu_get_cpu(cpu));
     CPUState *cs = CPU(armcpu);
@@ -510,6 +562,7 @@ bool cpu_l1_cache_unified(int cpu)
             unified = true;
         }
     }
+#endif
 
     return unified;
 }
@@ -1772,10 +1825,12 @@ static void create_virtio_iommu_dt_bindings(VirtMachineState *vms)
 static void create_ub(VirtMachineState *vms)
 {
     DeviceState *ubc;
+    DeviceState *ubc_dev;
     DeviceState *ummu;
     MemoryRegion *mmio_reg;
     MemoryRegion *mmio_alias;
     BusControllerState *ubc_state;
+    BusControllerDev *ubc_dev_state;
 
     if (ub_cfg_addr_map_table_init() < 0) {
         qemu_log("failed to init ub cfg addr map table\n");
@@ -1814,9 +1869,26 @@ static void create_ub(VirtMachineState *vms)
                              vms->memmap[VIRT_UB_IDEV_ERS].size);
     memory_region_add_subregion(get_system_memory(),
                                 vms->memmap[VIRT_UB_IDEV_ERS].base, mmio_alias);
+
+    ubc_state = BUS_CONTROLLER(ubc);
+    ubc_dev = qdev_new(TYPE_BUS_CONTROLLER_DEV);
+    ubc_dev_state = BUS_CONTROLLER_DEV(ubc_dev);
+    ubc_dev_state->parent.eid = 1;
+    ubc_dev_state->parent.port.port_num = 1;
+    ubc_dev_state->parent.guid.vendor = VENDER_ID_HUAWEI;
+    ubc_dev_state->parent.guid.device_id = 0x0541;
+    ubc_dev_state->parent.guid.version = 0;
+    ubc_dev_state->parent.guid.type = UB_GUID_TYPE_IBUS_CONTROLLER;
+    ubc_dev_state->parent.guid.seq_num = 1;
+    ubc_dev_state->bus_instance_guid.vendor = VENDER_ID_HUAWEI;
+    ubc_dev_state->bus_instance_guid.device_id = 0x0541;
+    ubc_dev_state->bus_instance_guid.version = 0;
+    ubc_dev_state->bus_instance_guid.type = UB_GUID_TYPE_BUS_INSTANCE;
+    ubc_dev_state->bus_instance_guid.seq_num = 1;
+    qdev_realize_and_unref(ubc_dev, BUS(ubc_state->bus), &error_fatal);
+
     if (vms->ummu) {
         ummu = qdev_new(TYPE_UB_UMMU);
-        ubc_state = BUS_CONTROLLER(ubc);
         object_property_set_link(OBJECT(ummu), "primary-bus", OBJECT(ubc_state->bus), &error_abort);
         /* default set ummu nested */
         object_property_set_bool(OBJECT(ummu), "nested", true, &error_abort);
@@ -2235,15 +2307,25 @@ static void virt_set_memmap(VirtMachineState *vms, int pa_bits)
             vms->memmap[VIRT_KAE_DEVICE] = (MemMapEntry) { 0x3edf0000, 0x00200000 };
             uint64_t tmi_version = 0;
             int ret = -1;
-            if (kvm_enabled()) {
+            if (
+#ifdef __linux__
+                kvm_enabled()
+#else
+                false
+#endif
+            ) {
+#ifdef __linux__
                 ret = kvm_ioctl(kvm_state, KVM_GET_TMI_VERSION,  &tmi_version);
+#endif
             }
             if (ret < 0) {
                 warn_report("can not get tmi version");
             }
+#ifdef __linux__
             if (tmi_version < MIN_TMI_VERSION_FOR_UEFI_BOOTED_CVM) {
                 vms->memmap[VIRT_MEM].base = 3 * GiB;
             }
+#endif
             virtcca_cvm_gpa_start = vms->memmap[VIRT_MEM].base;
             vms->memmap[VIRT_MEM].size = ms->ram_size;
             info_report("[qemu] fix VIRT_MEM range 0x%llx - 0x%llx\n", (unsigned long long)(vms->memmap[VIRT_MEM].base),
@@ -3000,6 +3082,9 @@ static void machvirt_init(MachineState *machine)
 #endif // CONFIG_UB
 
     create_gic(vms, sysmem);
+#ifdef CONFIG_UB
+    update_ub_fdt_msi_links(vms);
+#endif // CONFIG_UB
 
     if (has_ged) {
         vms->acpi_dev = create_acpi_ged(vms);

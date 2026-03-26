@@ -20,7 +20,9 @@
 #include "hw/ub/ub_usi.h"
 #include "sysemu/dma.h"
 #include "sysemu/iommufd.h"
+#ifdef __linux__
 #include <linux/iommufd.h>
+#endif
 
 /* ummu spec register define */
 REG32(IIDR, 0x0000)
@@ -245,6 +247,11 @@ REG32(MAPT_CMDQ_CTXT_BADDR0, 0x1160)
 REG32(MAPT_CMDQ_CTXT_BADDR1, 0x1164)
     FIELD(MAPT_CMDQ_CTXT_BADDR1, MAPT_CMDQ_CTXT_ADDR1,    0, 20)
     FIELD(MAPT_CMDQ_CTXT_BADDR1, MAPT_CMDQ_CTXT_RA_CFG,   31, 1)
+
+#define MAPT_CMDQ_CTXT_MATTR_WMASK GENMASK(5, 0)
+REG32(MAPT_CMDQ_CTXT_MATTR, 0x1168)
+    FIELD(MAPT_CMDQ_CTXT_MATTR, MAPT_CTXT_MEM_ATTR_CFG, 0, 4)
+    FIELD(MAPT_CMDQ_CTXT_MATTR, MAPT_CTXT_SH_CFG,       4, 2)
 
 #define RELEASE_UM_QUEUE_WMASK 0x1
 REG32(RELEASE_UM_QUEUE, 0x1178)

@@ -30,8 +30,8 @@
 #define QEMU_MIGRATION_COMPRESS_H
 
 #ifdef CONFIG_ZSTD
-#include <zstd.h>
-#include <zstd_errors.h>
+#include "/opt/homebrew/opt/zstd/include/zstd.h"
+#include "/opt/homebrew/opt/zstd/include/zstd_errors.h"
 #endif
 #include "qemu-file.h"
 #include "qapi/qapi-types-migration.h"

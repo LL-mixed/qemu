@@ -65,3 +65,6 @@ else
   stub_ss.add(files('qdev.c'))
 endif
 stub_ss.add(files('semihost-all.c'))
+if targetos == 'darwin'
+  stub_ss.add(files('darwin-link-shims.c'))
+endif

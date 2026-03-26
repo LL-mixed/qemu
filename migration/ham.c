@@ -225,6 +225,10 @@ void ham_migrate_cleanup(void)
     ham_dlfunc_close();
 }
 
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE MADV_WILLNEED
+#endif
+
 void ham_madvise_page(void)
 {
     RAMBlock *ram_block;

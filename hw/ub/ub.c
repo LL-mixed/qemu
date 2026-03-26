@@ -486,7 +486,6 @@ void ub_default_write_config(UBDevice *dev, uint64_t offset,
     dw_w1cmask = *(uint32_t *)(dev->w1cmask + emulated_offset) & dw_mask;
     *dst_data = (*dst_data & ~dw_wmask) | (write_data & dw_wmask);
     *dst_data &= ~(write_data & dw_w1cmask);
-
     if (ranges_overlap(offset, DWORD_SIZE,
         UB_CFG1_BASIC_START + offsetof(UbCfg1Basic, ers_ubba),
         UB_NUM_REGIONS * sizeof(uint64_t)) && write_data != UINT32_MAX) {

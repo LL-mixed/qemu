@@ -17,7 +17,9 @@
 
 #ifndef UB_H
 #define UB_H
+#ifdef __linux__
 #include <linux/vfio.h>
+#endif
 #include "qemu/typedefs.h"
 #include "exec/memory.h"
 #include "sysemu/host_iommu_device.h"
@@ -29,7 +31,11 @@
 #define UINT16_MASK 0x0000FFFF
 
 #define UB_DEV_NAME_LEN 64
+#ifdef __linux__
 #define UB_NUM_REGIONS (VFIO_UB_NUM_REGIONS - 1) /* Exclude the config region */
+#else
+#define UB_NUM_REGIONS 8
+#endif
 #define UB_SUPPORT_MIN_EID 1
 #define UB_SUPPORT_MAX_EID 0xFFFFF
 #define UB_GUID_BASE_CODE_MASK 0x00FF

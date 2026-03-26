@@ -42,6 +42,9 @@
 #endif /* CONFIG_TCG */
 #endif /* !CONFIG_USER_ONLY */
 #include "sysemu/tcg.h"
+#define NEED_CPU_H
+#include "sysemu/hvf.h"
+#undef NEED_CPU_H
 #include "sysemu/qtest.h"
 #include "sysemu/hw_accel.h"
 #include "kvm_arm.h"

@@ -294,16 +294,22 @@ static void ub_bus_controller_space_cfg1_init(UBDevice *ub_dev)
     UbCfg1Basic *cfg1_basic;
     Cfg1SupportFeature *support_feature;
     UbCfg1DecoderCap *dec_cap;
+    uint8_t *int_type1_raw;
     uint64_t emulated_offset;
+    uint8_t *cfg1_raw;
+    uint32_t support_feature_l = 0;
 
     /* basic */
     emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG1_BASIC_START, true);
     cfg1_basic = (UbCfg1Basic *)(ub_dev->config + emulated_offset);
+    cfg1_raw = ub_dev->config + emulated_offset;
     cfg1_basic->header.slice_version = UB_SLICE_VERSION;
     cfg1_basic->header.slice_used_size = UB_CFG1_BASIC_SLICE_USED_SIZE;
 
     cfg1_basic->cap_bitmap[CFG1_DECODER_CAP_INDEX / BITS_PER_BYTE] |=
         1 << (CFG1_DECODER_CAP_INDEX % BITS_PER_BYTE);
+    cfg1_basic->cap_bitmap[CFG1_INT_CAP_INDEX / BITS_PER_BYTE] |=
+        1 << (CFG1_INT_CAP_INDEX % BITS_PER_BYTE);
 
     support_feature = &cfg1_basic->support_feature;
     support_feature->bits.mgs = SUPPORTED;
@@ -312,6 +318,10 @@ static void ub_bus_controller_space_cfg1_init(UBDevice *ub_dev)
     support_feature->bits.ers1s = NOT_SUPPORTED;
     support_feature->bits.ers2s = SUPPORTED;
     support_feature->bits.matt_juris = UB_DRIVE;
+    support_feature_l |= BIT(2);  /* MGS */
+    support_feature_l |= BIT(6);  /* ERS0S */
+    support_feature_l |= BIT(8);  /* ERS2S */
+    support_feature_l |= BIT(10); /* DECODER_JURIS */
     cfg1_basic->ers_space_size[0] = UBC_ERS0_SPACE_SIZE;
     cfg1_basic->ers_space_size[1] = UBC_ERS1_SPACE_SIZE;
     cfg1_basic->ers_space_size[2] = UBC_ERS2_SPACE_SIZE;
@@ -320,6 +330,25 @@ static void ub_bus_controller_space_cfg1_init(UBDevice *ub_dev)
     cfg1_basic->ers_start_addr[2] = UBC_ERS2_SPACE_ADDR;
     cfg1_basic->eid_upi_ten = UBC_EID_UPI_TEN_DEFAULT_VAL;
     cfg1_basic->class_code = UBC_CLASS_CODE;
+    /*
+     * Keep the raw config image aligned with the guest-visible register layout.
+     * Some packed struct fields in the current tree do not land on the exact
+     * offsets the Linux UB driver reads.
+     */
+    *(uint32_t *)(cfg1_raw + 0x24) = support_feature_l;
+    *(uint32_t *)(cfg1_raw + 0x34) = UBC_ERS0_SPACE_SIZE;
+    *(uint32_t *)(cfg1_raw + 0x38) = UBC_ERS1_SPACE_SIZE;
+    *(uint32_t *)(cfg1_raw + 0x3c) = UBC_ERS2_SPACE_SIZE;
+    *(uint32_t *)(cfg1_raw + 0x40) = (uint32_t)(UBC_ERS0_SPACE_ADDR & UINT32_MAX);
+    *(uint32_t *)(cfg1_raw + 0x44) = (uint32_t)(UBC_ERS0_SPACE_ADDR >> 32);
+    *(uint32_t *)(cfg1_raw + 0x48) = (uint32_t)(UBC_ERS1_SPACE_ADDR & UINT32_MAX);
+    *(uint32_t *)(cfg1_raw + 0x4c) = (uint32_t)(UBC_ERS1_SPACE_ADDR >> 32);
+    *(uint32_t *)(cfg1_raw + 0x50) = (uint32_t)(UBC_ERS2_SPACE_ADDR & UINT32_MAX);
+    *(uint32_t *)(cfg1_raw + 0x54) = (uint32_t)(UBC_ERS2_SPACE_ADDR >> 32);
+    *(uint32_t *)(cfg1_raw + 0x90) = UBC_EID_UPI_TEN_DEFAULT_VAL;
+    *(uint32_t *)(cfg1_raw + 0xa4) = UBC_CLASS_CODE;
+    cfg1_raw[0x04 + (CFG1_INT_CAP_INDEX / BITS_PER_BYTE)] |=
+        1 << (CFG1_INT_CAP_INDEX % BITS_PER_BYTE);
     /* decoder cap */
     emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG1_CAP1_DECODER, true);
     dec_cap = (UbCfg1DecoderCap *)(ub_dev->config + emulated_offset);
@@ -328,6 +357,11 @@ static void ub_bus_controller_space_cfg1_init(UBDevice *ub_dev)
     dec_cap->decoder.event_size_sup = DECODER_CAP_EVENT_SIZE;
     dec_cap->decoder.cmd_size_sup = DECODER_CAP_CMD_SIZE;
     dec_cap->decoder.mmio_size_sup = DECODER_CAP_MMIO_SIZE;
+
+    emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG1_CAP3_INT_TYPE1, true);
+    int_type1_raw = ub_dev->config + emulated_offset;
+    *(uint32_t *)(int_type1_raw + 0x0) = UB_SLICE_VERSION | (sizeof(UbCfg1IntType1Cap) / DWORD_SIZE) << 16;
+    *(uint16_t *)(int_type1_raw + 0x8) = 1;
 }
 
 static void ub_bus_controller_wmask_init(UBDevice *ub_dev)
@@ -335,6 +369,8 @@ static void ub_bus_controller_wmask_init(UBDevice *ub_dev)
     UbCfg1DecoderCap *dec_cap_mask;
     UbCfg0ShpCap *cfg0_shp_wmask, *cfg0_shp;
     uint64_t emulated_offset;
+    uint8_t *cfg1_wmask_raw;
+    uint8_t *int_type1_wmask_raw;
 
     /* cfg0 cap */
     emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_CAP2_SHP_START, true);
@@ -371,6 +407,22 @@ static void ub_bus_controller_wmask_init(UBDevice *ub_dev)
     dec_cap_mask->decoder_evtq_prod.evtq_wr_idx = ~0;
     dec_cap_mask->decoder_evtq_cons.evtq_rd_idx = ~0;
     dec_cap_mask->decoder_evtq_ba.evtq_ba = ~0;
+
+    emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG1_BASIC_START, true);
+    cfg1_wmask_raw = ub_dev->wmask + emulated_offset;
+    *(uint32_t *)(cfg1_wmask_raw + 0x88) = ~0U;
+    *(uint32_t *)(cfg1_wmask_raw + 0x8c) = ~0U;
+    *(uint32_t *)(cfg1_wmask_raw + 0xb4) = ~0U;
+
+    emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG1_CAP3_INT_TYPE1, true);
+    int_type1_wmask_raw = ub_dev->wmask + emulated_offset;
+    *(uint8_t *)(int_type1_wmask_raw + 0x4) = 0x1;
+    *(uint32_t *)(int_type1_wmask_raw + 0xc) = ~0U;
+    *(uint32_t *)(int_type1_wmask_raw + 0x10) = ~0U;
+    *(uint32_t *)(int_type1_wmask_raw + 0x14) = ~0U;
+    *(uint32_t *)(int_type1_wmask_raw + 0x18) = ~0U;
+    *(uint32_t *)(int_type1_wmask_raw + 0x1c) = ~0U;
+    *(uint32_t *)(int_type1_wmask_raw + 0x20) = ~0U;
 }
 
 static void ub_bus_controller_w1cmask_init(UBDevice *ub_dev)
@@ -408,13 +460,23 @@ static bool ub_ubc_is_empty(UBBus *bus)
     return true;
 }
 
+#ifdef __APPLE__
+#define UB_BUSINSTANCE_GUID_LOCK_DIR "/tmp/ub-qemu"
+#else
 #define UB_BUSINSTANCE_GUID_LOCK_DIR "/run/libvirt/qemu"
+#endif
 
 static int ub_bus_instance_guid_lock(UbGuid *guid)
 {
     char path[256] = {0};
     char guid_str[UB_DEV_GUID_STRING_LENGTH + 1] = {0};
     int lock_fd;
+
+    if (g_mkdir_with_parents(UB_BUSINSTANCE_GUID_LOCK_DIR, 0755) < 0) {
+        qemu_log("failed to create bus instance lock dir %s: %s\n",
+                 UB_BUSINSTANCE_GUID_LOCK_DIR, strerror(errno));
+        return -1;
+    }
 
     ub_device_get_str_from_guid(guid, guid_str, UB_DEV_GUID_STRING_LENGTH + 1);
     snprintf(path, sizeof(path), "%s/ub-bus-instance-%s.lock",  UB_BUSINSTANCE_GUID_LOCK_DIR, guid_str);

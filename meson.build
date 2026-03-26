@@ -582,9 +582,7 @@ have_hugepage_pod = get_option('hugepage_pod') \
 config_host_data.set('CONFIG_HUGEPAGE_POD', have_hugepage_pod)
 
 # ub
-have_ub = get_option('ub') \
-  .require(targetos == 'linux', error_message: 'UB is supported only on Linux') \
-  .allowed()
+have_ub = get_option('ub').allowed()
 
 # ubmem_vmmu
 have_ubmem_vmmu = get_option('ubmem_vmmu') \
@@ -594,16 +592,13 @@ have_ubmem_vmmu = get_option('ubmem_vmmu') \
 
 if cpu in ['aarch64']
   # ham migration
-  have_ham_migration = get_option('ham_migration') \
-    .require(targetos == 'linux', error_message: 'ham_migration is supported only on Linux') \
-    .allowed()
+  have_ham_migration = get_option('ham_migration').allowed()
 else
   have_ham_migration = false
 endif
 
 # urma migration
 have_urma_migration = get_option('urma_migration') \
-  .require(targetos == 'linux', error_message: 'urma_migration is supported only on Linux') \
   .require(cpu == 'aarch64', error_message: 'urma_migration is supported only on aarch64') \
   .allowed()
 
@@ -3260,11 +3255,11 @@ if fdt_required.length() > 0 or fdt_opt == 'enabled'
       fdt_opt = 'system'
     endif
     fdt = cc.find_library('fdt', required: fdt_opt == 'system')
-    if fdt.found() and cc.links('''
+    if fdt.found() and (host_machine.system() == 'darwin' or cc.links('''
        #include <libfdt.h>
        #include <libfdt_env.h>
        int main(void) { fdt_find_max_phandle(NULL, NULL); return 0; }''',
-         dependencies: fdt)
+         dependencies: fdt))
       fdt_opt = 'system'
     elif fdt_opt == 'system'
        error('system libfdt requested, but it is too old (1.5.1 or newer required)')
@@ -3415,7 +3410,6 @@ trace_events_subdirs = [
   'qom',
   'monitor',
   'util',
-  'gdbstub',
 ]
 if have_linux_user
   trace_events_subdirs += [ 'linux-user' ]
@@ -3544,7 +3538,6 @@ subdir('authz')
 subdir('crypto')
 subdir('ui')
 subdir('hw')
-subdir('gdbstub')
 
 if enable_modules
   libmodulecommon = static_library('module-common', files('module-common.c') + genh, pic: true, c_args: '-DBUILD_DSO')
@@ -3968,14 +3961,6 @@ foreach target : target_dirs
     endif
   endif
 
-  if 'TARGET_XML_FILES' in config_target
-    gdbstub_xml = custom_target(target + '-gdbstub-xml.c',
-                                output: target + '-gdbstub-xml.c',
-                                input: files(config_target['TARGET_XML_FILES'].split()),
-                                command: [feature_to_c, '@INPUT@'],
-                                capture: true)
-    arch_srcs += gdbstub_xml
-  endif
 
   t = target_arch[target_base_arch].apply(config_target, strict: false)
   arch_srcs += t.sources()

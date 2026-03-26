@@ -19,7 +19,33 @@
 
 #include "exec/memory.h"
 #include "hw/ub/ub.h"
+#ifdef __linux__
 #include "hw/vfio/vfio-common.h"
+#else
+typedef struct VFIORegion {
+    size_t size;
+    uint32_t nr_mmaps;
+    struct {
+        void *mmap;
+        size_t size;
+        off_t offset;
+        MemoryRegion mem;
+    } *mmaps;
+    off_t fd_offset;
+} VFIORegion;
+
+typedef struct VFIOERS {
+    VFIORegion region;
+    MemoryRegion *mr;
+    size_t size;
+} VFIOERS;
+
+typedef struct VFIODevice {
+    char *sysfsdev;
+    int fd;
+    int devid;
+} VFIODevice;
+#endif
 #include "qemu/event_notifier.h"
 #include "qemu/queue.h"
 #include "qemu/timer.h"
@@ -27,18 +53,21 @@
 #include "sysemu/kvm.h"
 
 #define UB_ANY_ID (~0)
+#define VFIO_UB_REGION2_INDEX 2
 
 #define TYPE_VFIO_UB "vfio-ub"
 OBJECT_DECLARE_SIMPLE_TYPE(VFIOUBDevice, VFIO_UB)
 #define VFIO_UB_SAFE(UBDevice) \
  ((UBDevice)->host_dev ? VFIO_UB(UBDevice) : NULL)
 
+#ifdef __linux__
 typedef struct VFIOERS {
     VFIORegion region;
     MemoryRegion *mr;
     size_t size;
     QLIST_HEAD(, VFIOQuirk) quirks;
 } VFIOERS;
+#endif
 
 typedef struct VFIOUSIVector {
     EventNotifier interrupt;

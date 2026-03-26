@@ -305,6 +305,9 @@ static uint64_t ummu_reg_readl(UMMUState *u, hwaddr offset)
         case A_GLB_ERR_INT_USI_ATTR:
             val = u->glb_err.usi_attr;
             break;
+        case A_MAPT_CMDQ_CTXT_MATTR:
+            val = u->mapt_cmdq_ctxt_mattr;
+            break;
         case A_RELEASE_UM_QUEUE_ID:
             val = u->release_um_queue_id;
             break;
@@ -1236,6 +1239,9 @@ static void ummu_reg_writel(UMMUState *u, hwaddr offset, uint64_t data)
         case A_GLB_ERR_RESP:
              update_reg32_by_wmask(&u->glb_err.glb_err_resp, data, UMMU_GLB_ERR_RESP_WMASK);
              break;
+        case A_MAPT_CMDQ_CTXT_MATTR:
+            update_reg32_by_wmask(&u->mapt_cmdq_ctxt_mattr, data, MAPT_CMDQ_CTXT_MATTR_WMASK);
+            break;
         case A_RELEASE_UM_QUEUE:
             /* release_um_queue reg set 1 to release um_queue */
             if ((data & RELEASE_UM_QUEUE_WMASK) != 1) {
@@ -1500,6 +1506,7 @@ static void ummu_registers_init(UMMUState *u)
 
     /* mapt cmdq ctxt base addr init */
     u->mapt_cmdq_ctxt_base = 0;
+    u->mapt_cmdq_ctxt_mattr = 0;
 
     /* umcmdq default page set to 4K */
     u->ucmdq_page_sel = MAPT_CMDQ_CTRLR_PAGE_SIZE_4K;

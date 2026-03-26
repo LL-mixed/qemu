@@ -32,6 +32,7 @@
 
 size_t qemu_fd_getfiletype(int fd)
 {
+#ifdef CONFIG_LINUX
     struct statfs fs;
     int ret;
 
@@ -50,6 +51,9 @@ size_t qemu_fd_getfiletype(int fd)
         fprintf(stderr, "fd is invalid \n");
         return -1;
     }
+#else
+    return (size_t)-1;
+#endif
 }
 
 QemuFsType qemu_fd_getfs(int fd)

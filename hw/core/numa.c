@@ -43,7 +43,6 @@
 #include "qemu/config-file.h"
 #include "qemu/cutils.h"
 #include "exec/address-spaces.h"
-#include "sysemu/kvm.h"
 
 QemuOptsList qemu_numa_opts = {
     .name = "numa",
@@ -728,10 +727,12 @@ void numa_complete_configuration(MachineState *ms)
             memory_region_init(ms->ram, OBJECT(ms), mc->default_ram_id,
                                ms->ram_size);
             numa_init_memdev_container(ms, ms->ram);
+#ifdef __linux__
             if (virtcca_cvm_enabled() && virtcca_shared_hugepage &&
                 virtcca_shared_hugepage->ram_block) {
                 virtcca_shared_memory_configuration(ms);
             }
+#endif
         }
         /* QEMU needs at least all unique node pair distances to build
          * the whole NUMA distance table. QEMU treats the distance table

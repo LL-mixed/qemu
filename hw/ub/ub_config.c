@@ -268,7 +268,10 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
         emulated_offset = ub_cfg_offset_to_emulated_offset(cfg_offset, false);
         if (emulated_offset != UINT64_MAX && !*((uint32_t *)(&ub_dev->wmask[emulated_offset]))) {
             rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_REG_ATTR_MISMATCH;
-            qemu_log("register cannot be written.\n");
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "register cannot be written: dev=%s eid=0x%x dev_type=%u guid_type=%u cfg_offset=0x%" PRIx64 " emu=0x%" PRIx64 "\n",
+                          ub_dev->qdev.id ? ub_dev->qdev.id : "(null)", ub_dev->eid, ub_dev->dev_type,
+                          ub_dev->guid.type, cfg_offset, emulated_offset);
             goto fill_rq_cq;
         }
         if (ub_dev->config_write) {

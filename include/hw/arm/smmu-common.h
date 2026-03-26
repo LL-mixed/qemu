@@ -23,7 +23,9 @@
 #include "hw/pci/pci.h"
 #include "qom/object.h"
 #include "sysemu/iommufd.h"
+#ifdef __linux__
 #include <linux/iommufd.h>
+#endif
 #include "hw/arm/mmu-translate-common.h"
 
 #define SMMU_PCI_BUS_MAX                    256

@@ -40,7 +40,7 @@
 #include "hw/acpi/aml-build.h"
 #include "hw/ub/ub_common.h"
 #define UBIOS_VERSION 1
-#define DTS_SIG_UBCTL "bus controller"
+#define DTS_SIG_UBCTL "ubc"
 #define DTS_SIG_UMMU "ummu"
 #define DTS_SIG_RSV_MEM "rsv_mem"
 
@@ -159,6 +159,11 @@ static void ub_init_ubc_node(uint16_t ubc_count, UbcNode *ubc, VirtMachineState 
         */
         (ubc + i)->msg_queue_interrupt_attr = 0x0;
         memset(&(ubc + i)->ubc_info, 0, sizeof(UbGuid));
+        (ubc + i)->ubc_info.vendor = VENDER_ID_HUAWEI;
+        (ubc + i)->ubc_info.device_id = 0x0541;
+        (ubc + i)->ubc_info.version = 0;
+        (ubc + i)->ubc_info.type = UB_GUID_TYPE_BUS_CONTROLLER;
+        (ubc + i)->ubc_info.seq_num = i + 1;
         ub_init_vendor_info((UbcVendorInfo *)&(ubc + i)->vendor_info, vms);
         qemu_log("init ubc_table[%d]=0x%lx, interrupt_id=[0x%x-0x%x]\n",
                  i, (ubc + i)->gpa_base, (ubc + i)->interrupt_id_start,

@@ -12,7 +12,7 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
-#include <libfdt.h>
+#include "libfdt.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/linux-boot-if.h"
 #include "sysemu/kvm.h"
@@ -1210,7 +1210,11 @@ static void arm_setup_direct_kernel_boot(ARMCPU *cpu,
         ARM_CPU(cs)->env.boot_info = info;
     }
 
-    if (kvm_enabled() && virtcca_cvm_enabled()) {
+    if (
+#ifdef __linux__
+        kvm_enabled() &&
+#endif
+        virtcca_cvm_enabled()) {
         if (info->dtb_limit == 0) {
             info->dtb_limit = info->dtb_start + DTB_MAX;
         }
@@ -1228,7 +1232,15 @@ static void arm_setup_confidential_firmware_boot(ARMCPU *cpu,
     uint64_t tmi_version = 0;
     int ret = -1;
 
-    if (kvm_enabled() && virtcca_cvm_enabled()) {
+    if (
+#ifdef __linux__
+        kvm_enabled() &&
+#endif
+        virtcca_cvm_enabled()) {
+#ifndef __linux__
+        ret = 0;
+        tmi_version = UINT64_MAX;
+#else
         ret = kvm_ioctl(kvm_state, KVM_GET_TMI_VERSION, &tmi_version);
         if (ret < 0) {
             error_report("please check the kernel version!");
@@ -1238,6 +1250,7 @@ static void arm_setup_confidential_firmware_boot(ARMCPU *cpu,
             error_report("please check the tmi version!");
             exit(EXIT_FAILURE);
         }
+#endif
     }
 
     ssize_t fw_size;
@@ -1319,9 +1332,11 @@ static void arm_setup_firmware_boot(ARMCPU *cpu, struct arm_boot_info *info, con
     if (info->confidential) {
         arm_setup_confidential_firmware_boot(cpu, info, firmware_filename);
         if (virtcca_cvm_enabled()) {
+#ifdef __linux__
             virtcca_kvm_get_mmio_addr(&mmio_start, &mmio_size);
             kvm_load_user_data(info->loader_start, DTB_MAX, mmio_start, mmio_size, info->ram_size,
                 (struct kvm_numa_info *)info->numa_info);
+#endif
         }
     }
     /*
@@ -1364,7 +1379,12 @@ void arm_load_kernel(ARMCPU *cpu, MachineState *ms, struct arm_boot_info *info)
     info->initrd_filename = ms->initrd_filename;
     info->dtb_filename = ms->dtb;
     info->dtb_limit = 0;
-    if (kvm_enabled() && virtcca_cvm_enabled()) {
+    if (
+#ifdef __linux__
+        kvm_enabled() &&
+#endif
+        virtcca_cvm_enabled()) {
+#ifdef __linux__
         info->ram_size = ms->ram_size;
         info->numa_info = g_malloc(sizeof(struct kvm_numa_info));
         struct kvm_numa_info *numa_info = (struct kvm_numa_info *) info->numa_info;
@@ -1396,6 +1416,10 @@ void arm_load_kernel(ARMCPU *cpu, MachineState *ms, struct arm_boot_info *info)
                 node_id = ms->possible_cpus->cpus[local_cs->cpu_index].props.node_id;
             bitmap_set((unsigned long *)numa_info->numa_nodes[node_id].cpu_id, cpu_idx, 1);
         }
+#else
+        info->ram_size = ms->ram_size;
+        info->numa_info = NULL;
+#endif
     }
 
     /* Mark all Realm memory as RAM */

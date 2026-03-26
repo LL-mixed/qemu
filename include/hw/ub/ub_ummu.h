@@ -104,6 +104,7 @@ struct UMMUState {
     UMMUEventQueue eventq;
     UMMUGlbErr glb_err;
     uint64_t mapt_cmdq_ctxt_base;
+    uint32_t mapt_cmdq_ctxt_mattr;
     uint32_t release_um_queue;
     uint32_t release_um_queue_id;
     uint32_t ucmdq_page_sel;

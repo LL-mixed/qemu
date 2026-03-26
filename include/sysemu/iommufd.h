@@ -18,7 +18,137 @@
 #include "exec/hwaddr.h"
 #include "exec/cpu-common.h"
 #include "sysemu/host_iommu_device.h"
+#ifdef __linux__
 #include <linux/iommufd.h>
+#else
+enum iommu_hw_info_type {
+    IOMMU_HW_INFO_TYPE_NONE = 0,
+    IOMMU_HW_INFO_TYPE_ARM_SMMUV3 = 1,
+    IOMMU_HW_INFO_TYPE_UMMU = 2,
+};
+
+struct iommu_hwpt_pgfault {
+    uint32_t argsz;
+    uint32_t flags;
+    uint32_t pasid;
+    uint32_t grpid;
+    uint32_t perm;
+    uint32_t cookie;
+    uint64_t addr;
+};
+
+struct iommu_hwpt_page_response {
+    uint32_t argsz;
+    uint32_t cookie;
+    uint32_t code;
+};
+
+struct iommu_hw_info_arm_smmuv3 {
+    uint32_t argsz;
+    uint32_t idr[8];
+};
+
+struct iommu_hw_info_ummu {
+    uint32_t argsz;
+    uint32_t flags;
+    uint32_t iidr;
+    uint32_t aidr;
+};
+
+struct iommu_hwpt_arm_smmuv3 {
+    uint64_t ste[2];
+};
+
+struct iommu_hwpt_ummu {
+    uint64_t tecte[2];
+};
+
+struct io_uring {
+    int dummy;
+};
+
+struct io_uring_sqe {
+    int dummy;
+};
+
+struct io_uring_cqe {
+    int res;
+    void *user_data;
+};
+
+struct __kernel_timespec {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+};
+
+#define IOMMU_HWPT_ALLOC_NEST_PARENT 1U
+#define IOMMU_HWPT_DATA_NONE 0U
+#define IOMMU_HWPT_DATA_ARM_SMMUV3 1U
+#define IOMMU_HWPT_DATA_UMMU 2U
+#define IOMMU_VIOMMU_TYPE_ARM_SMMUV3 1U
+#define IOMMU_VIOMMU_TYPE_UMMU 2U
+#define IOMMU_VIOMMU_INVALIDATE_DATA_ARM_SMMUV3 2U
+#define IOMMU_VIOMMU_INVALIDATE_DATA_UMMU 1U
+#define IOMMU_HWPT_FAULT_ID_VALID (1U << 0)
+#define IOMMU_PGFAULT_FLAGS_PASID_VALID (1U << 0)
+#define IOMMU_PGFAULT_PERM_READ (1U << 0)
+#define IOMMU_PGFAULT_PERM_PRIV (1U << 1)
+#define IOMMU_PGFAULT_PERM_EXEC (1U << 2)
+#define IOMMUFD_PAGE_RESP_INVALID 0U
+#define IOMMUFD_PAGE_RESP_SUCCESS 1U
+
+static inline struct io_uring_sqe *io_uring_get_sqe(struct io_uring *ring)
+{
+    return NULL;
+}
+
+static inline void io_uring_prep_timeout(struct io_uring_sqe *sqe,
+                                         const struct __kernel_timespec *ts,
+                                         unsigned count, unsigned flags)
+{
+}
+
+static inline int io_uring_submit(struct io_uring *ring)
+{
+    return 0;
+}
+
+static inline void io_uring_prep_read(struct io_uring_sqe *sqe, int fd,
+                                      void *buf, unsigned nbytes,
+                                      uint64_t offset)
+{
+}
+
+static inline void io_uring_sqe_set_data(struct io_uring_sqe *sqe, void *data)
+{
+}
+
+static inline int io_uring_wait_cqe(struct io_uring *ring,
+                                    struct io_uring_cqe **cqe_ptr)
+{
+    return -1;
+}
+
+static inline void *io_uring_cqe_get_data(const struct io_uring_cqe *cqe)
+{
+    return cqe ? cqe->user_data : NULL;
+}
+
+static inline void io_uring_cqe_seen(struct io_uring *ring,
+                                     struct io_uring_cqe *cqe)
+{
+}
+
+static inline int io_uring_queue_init(unsigned entries, struct io_uring *ring,
+                                      unsigned flags)
+{
+    return 0;
+}
+
+static inline void io_uring_queue_exit(struct io_uring *ring)
+{
+}
+#endif
 
 #define TYPE_IOMMUFD_BACKEND "iommufd"
 OBJECT_DECLARE_TYPE(IOMMUFDBackend, IOMMUFDBackendClass, IOMMUFD_BACKEND)

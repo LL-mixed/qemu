@@ -20,7 +20,33 @@
 #include "exec/hwaddr.h"
 #include "qemu/accel.h"
 #include "qom/object.h"
+#ifdef __linux__
 #include "linux-headers/linux/kvm.h"
+#else
+#include "qemu/bitops.h"
+
+#ifndef MAX_NODES
+#define MAX_NODES 128
+#endif
+#define MAX_NUMA_NODE 8
+#define MAX_CPU_BIT_MAP 4
+#define MAX_NODE_BIT_MAP (MAX_NODES / BITS_PER_LONG)
+#define KVM_GET_TMI_VERSION 0
+#define MIN_TMI_VERSION_FOR_UEFI_BOOTED_CVM 0x20001
+
+struct kvm_numa_node {
+    uint64_t numa_id;
+    uint64_t ipa_start;
+    uint64_t ipa_size;
+    uint64_t host_numa_nodes[MAX_NODE_BIT_MAP];
+    uint64_t cpu_id[MAX_CPU_BIT_MAP];
+};
+
+struct kvm_numa_info {
+    uint64_t numa_cnt;
+    struct kvm_numa_node numa_nodes[MAX_NUMA_NODE];
+};
+#endif
 
 #ifdef NEED_CPU_H
 # ifdef CONFIG_KVM

@@ -333,7 +333,11 @@ struct HiMsgQueue {
     uint8_t ci;
     uint8_t pi;
 
+#ifdef __APPLE__
+    pthread_mutex_t lock;
+#else
     pthread_spinlock_t lock;
+#endif
 };
 
 #define UB_MSG_CODE_ENUM 0x8 /* hisi private */

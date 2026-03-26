@@ -31,7 +31,7 @@
 #include "qapi/qmp/qdict.h"
 #include "monitor/hmp.h"
 
-#include <libfdt.h>
+#include "libfdt.h"
 
 #define FDT_MAX_SIZE  0x100000
 

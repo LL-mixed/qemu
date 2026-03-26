@@ -23,7 +23,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include <libfdt.h>
+#include "libfdt.h"
 #ifdef CONFIG_LINUX
 #include <linux/vfio.h>
 #endif
@@ -32,9 +32,6 @@
 #include "sysemu/device_tree.h"
 #include "sysemu/tpm.h"
 #include "hw/platform-bus.h"
-#include "hw/vfio/vfio-platform.h"
-#include "hw/vfio/vfio-calxeda-xgmac.h"
-#include "hw/vfio/vfio-amd-xgbe.h"
 #ifdef CONFIG_PAS_EXPANSION
 #include "hw/vfio/vfio-hisi-mmcd.h"
 #endif
