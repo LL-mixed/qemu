@@ -1871,6 +1871,20 @@ static void create_ub(VirtMachineState *vms)
                                 vms->memmap[VIRT_UB_IDEV_ERS].base, mmio_alias);
 
     ubc_state = BUS_CONTROLLER(ubc);
+
+    if (vms->ummu) {
+        ummu = qdev_new(TYPE_UB_UMMU);
+        object_property_set_link(OBJECT(ummu), "primary-bus", OBJECT(ubc_state->bus), &error_abort);
+        /* default set ummu nested */
+        object_property_set_bool(OBJECT(ummu), "nested", true, &error_abort);
+        qdev_prop_set_uint64(ummu, "ub-ummu-reg-size", UMMU_REG_SIZE);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ummu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(ummu), 0,
+                        vms->memmap[VIRT_UBC_BASE_REG].base + UMMU_REG_OFFSET);
+    } else {
+        qemu_log("ummu disabled.\n");
+    }
+
     ubc_dev = qdev_new(TYPE_BUS_CONTROLLER_DEV);
     ubc_dev_state = BUS_CONTROLLER_DEV(ubc_dev);
     ubc_dev_state->parent.eid = 1;
@@ -1886,19 +1900,6 @@ static void create_ub(VirtMachineState *vms)
     ubc_dev_state->bus_instance_guid.type = UB_GUID_TYPE_BUS_INSTANCE;
     ubc_dev_state->bus_instance_guid.seq_num = 1;
     qdev_realize_and_unref(ubc_dev, BUS(ubc_state->bus), &error_fatal);
-
-    if (vms->ummu) {
-        ummu = qdev_new(TYPE_UB_UMMU);
-        object_property_set_link(OBJECT(ummu), "primary-bus", OBJECT(ubc_state->bus), &error_abort);
-        /* default set ummu nested */
-        object_property_set_bool(OBJECT(ummu), "nested", true, &error_abort);
-        qdev_prop_set_uint64(ummu, "ub-ummu-reg-size", UMMU_REG_SIZE);
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(ummu), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(ummu), 0,
-                        vms->memmap[VIRT_UBC_BASE_REG].base + UMMU_REG_OFFSET);
-    } else {
-        qemu_log("ummu disabled.\n");
-    }
 }
 #endif // CONFIG_UB
 static void create_pcie(VirtMachineState *vms)
