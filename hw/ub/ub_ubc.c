@@ -241,10 +241,15 @@ static void ub_bus_controller_cfg0_route_table_init(UBDevice *ub_dev)
 {
     uint64_t emulated_offset = ub_cfg_offset_to_emulated_offset(UB_ROUTE_TABLE_START, true);
     UbRouteTable *route_table = (UbRouteTable *)(ub_dev->config + emulated_offset);
+    uint32_t port_num = MAX(ub_dev->port.port_num, 1);
 
-    /* The prerequisite is that each device uses only one port.
-     * The Ub controller own a CNA, each port own a CNA, and each device own a CNA. */
-    route_table->entry_num = UB_DEV_MAX_NUM_OF_PORT * 2 + 1;
+    /*
+     * The route-table shape needs to follow the guest-visible port topology of the
+     * controller. Keep the controller entry plus one local and one remote-facing
+     * entry per visible port so multi-port UBC models can scale without reworking
+     * the cfg0 contract again when inter-node links are added later.
+     */
+    route_table->entry_num = port_num * 2 + 1;
     route_table->ers = 1;  /* support exact route */
 }
 
@@ -285,7 +290,7 @@ static void ub_bus_controller_space_cfg0_init(UBDevice *ub_dev)
         slot_info->pdss = 1;
         slot_info->pwcs = 1;
         slot_info->start_port_idx = 0;
-        slot_info->end_port_idx = cfg0_basic->total_num_of_port - 1;
+        slot_info->end_port_idx = 0;
         slot_info->pp_ctrl = 1;
         slot_info->ms_ctrl = 1;
         slot_info->pd_ctrl = 1;

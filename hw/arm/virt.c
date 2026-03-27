@@ -1889,7 +1889,7 @@ static void create_ub(VirtMachineState *vms)
     ubc_dev = qdev_new(TYPE_BUS_CONTROLLER_DEV);
     ubc_dev_state = BUS_CONTROLLER_DEV(ubc_dev);
     ubc_dev_state->parent.eid = 1;
-    ubc_dev_state->parent.port.port_num = 1;
+    ubc_dev_state->parent.port.port_num = 2;
     ubc_dev_state->parent.guid.vendor = VENDER_ID_HUAWEI;
     ubc_dev_state->parent.guid.device_id = 0x0541;
     ubc_dev_state->parent.guid.version = 0;
