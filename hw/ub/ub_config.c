@@ -26,6 +26,10 @@
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 
+#define UB_CFG0_EID_0_OFFSET  0x48
+#define UB_CFG0_UPI_OFFSET    0x7c
+#define UB_CFG0_FM_CNA_OFFSET 0x98
+
 UbCfgAddrMapEntry *g_ub_cfg_addr_map_table = NULL;
 uint32_t g_emulated_ub_cfg_size;
 
@@ -225,6 +229,8 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
     uint32_t entity = 0;
     uint32_t dcna = header->nth.dcna;
     UBDevice *ub_dev = NULL;
+    UBRemoteDeviceSnapshot remote_snapshot = { 0 };
+    bool use_remote_snapshot = false;
     uint32_t dw_mask;
     uint64_t emulated_offset;
 
@@ -258,7 +264,13 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
         }
     } else {
         ub_dev = ub_find_device_by_cna(s->bus, dcna);
-        if (!ub_dev) {
+        if (!ub_dev &&
+            header->msgetah.sub_msg_code != UB_CFG0_WRITE &&
+            header->msgetah.sub_msg_code != UB_CFG1_WRITE &&
+            ub_load_remote_device_snapshot_by_cna(dcna, &remote_snapshot, NULL)) {
+            use_remote_snapshot = true;
+        }
+        if (!ub_dev && !use_remote_snapshot) {
             qemu_log("device not found. dcna %u\n", dcna);
             return;
         }
@@ -273,7 +285,25 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
     switch (header->msgetah.sub_msg_code) {
     case UB_CFG0_READ:
     case UB_CFG1_READ:
-        if (ub_dev->config_read) {
+        if (use_remote_snapshot) {
+            switch (cfg_offset) {
+            case UB_CFG0_BASIC_NA_INFO_START:
+                rsp_pkt.pld.rsp.read_data = remote_snapshot.primary_cna;
+                break;
+            case UB_CFG0_EID_0_OFFSET:
+                rsp_pkt.pld.rsp.read_data = remote_snapshot.eid;
+                break;
+            case UB_CFG0_UPI_OFFSET:
+                rsp_pkt.pld.rsp.read_data = remote_snapshot.upi;
+                break;
+            case UB_CFG0_FM_CNA_OFFSET:
+                rsp_pkt.pld.rsp.read_data = remote_snapshot.fm_cna;
+                break;
+            default:
+                rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_INVALID_ADDR;
+                break;
+            }
+        } else if (ub_dev->config_read) {
             ub_dev->config_read(ub_dev, cfg_offset, &rsp_pkt.pld.rsp.read_data, dw_mask);
         } else {
             qemu_log("dev: %s read config func NULL\n", ub_dev->qdev.id);

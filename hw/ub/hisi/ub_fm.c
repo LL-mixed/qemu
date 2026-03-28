@@ -17,7 +17,918 @@
 
 #include "qemu/osdep.h"
 #include "hw/ub/hisi/ub_fm.h"
+#include "hw/ub/ub.h"
+#include "hw/ub/ub_link.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+
+static GPtrArray *ub_fm_declared_links;
+static GPtrArray *ub_fm_active_links;
+static char *ub_fm_topology_source_name;
+static UBFMTopologyPopulateFn ub_fm_topology_populate;
+static void *ub_fm_topology_populate_opaque;
+static GPtrArray *ub_fm_snapshot_source_links;
+static QEMUTimer *ub_fm_pending_refresh_timer;
+
+static const char *ub_fm_get_local_node_id(void)
+{
+    const char *local_node_id = g_getenv("UB_FM_NODE_ID");
+
+    return (local_node_id && local_node_id[0]) ? local_node_id : NULL;
+}
+
+static bool ub_fm_device_id_is_local_node_scoped(const char *device_id)
+{
+    const char *local_node_id = ub_fm_get_local_node_id();
+    const char *dot;
+
+    if (!local_node_id || !device_id) {
+        return false;
+    }
+
+    dot = strchr(device_id, '.');
+    if (!dot) {
+        return false;
+    }
+
+    return (size_t)(dot - device_id) == strlen(local_node_id) &&
+           !strncmp(device_id, local_node_id, dot - device_id);
+}
+
+static bool ub_fm_link_desc_is_relevant_to_local_node(const UBFMTopologyLinkDesc *desc)
+{
+    const char *local_node_id = ub_fm_get_local_node_id();
+    bool a_is_scoped;
+    bool b_is_scoped;
+
+    if (!desc || !local_node_id) {
+        return true;
+    }
+
+    a_is_scoped = desc->a.device_id && strchr(desc->a.device_id, '.');
+    b_is_scoped = desc->b.device_id && strchr(desc->b.device_id, '.');
+    if (!a_is_scoped && !b_is_scoped) {
+        return true;
+    }
+
+    return ub_fm_device_id_is_local_node_scoped(desc->a.device_id) ||
+           ub_fm_device_id_is_local_node_scoped(desc->b.device_id);
+}
+
+static bool ub_fm_raw_device_id_matches_local_node(const char *device_id)
+{
+    const char *local_node_id = ub_fm_get_local_node_id();
+    const char *dot;
+
+    if (!local_node_id || !device_id) {
+        return false;
+    }
+
+    dot = strchr(device_id, '.');
+    if (!dot) {
+        return false;
+    }
+
+    return (size_t)(dot - device_id) == strlen(local_node_id) &&
+           !strncmp(device_id, local_node_id, dot - device_id);
+}
+
+static bool ub_fm_raw_link_is_relevant_to_local_node(const char *a_device_id,
+                                                     const char *b_device_id)
+{
+    const char *local_node_id = ub_fm_get_local_node_id();
+    bool a_is_scoped;
+    bool b_is_scoped;
+
+    if (!local_node_id) {
+        return true;
+    }
+
+    a_is_scoped = a_device_id && strchr(a_device_id, '.');
+    b_is_scoped = b_device_id && strchr(b_device_id, '.');
+    if (!a_is_scoped && !b_is_scoped) {
+        return true;
+    }
+
+    return ub_fm_raw_device_id_matches_local_node(a_device_id) ||
+           ub_fm_raw_device_id_matches_local_node(b_device_id);
+}
+
+static char *ub_fm_resolve_device_id_for_local_node(const char *device_id)
+{
+    const char *dot;
+    const char *local_node_id = ub_fm_get_local_node_id();
+
+    if (!device_id || !device_id[0]) {
+        return NULL;
+    }
+
+    if (!local_node_id || !local_node_id[0]) {
+        return g_strdup(device_id);
+    }
+
+    dot = strchr(device_id, '.');
+    if (!dot) {
+        return g_strdup(device_id);
+    }
+
+    if ((size_t)(dot - device_id) == strlen(local_node_id) &&
+        !strncmp(device_id, local_node_id, dot - device_id) &&
+        dot[1] != '\0') {
+        return g_strdup(dot + 1);
+    }
+
+    return g_strdup(device_id);
+}
+
+static bool ub_fm_desc_matches_device(UBFMTopologyLinkDesc *desc, UBDevice *dev)
+{
+    if (!desc || !dev || !dev->qdev.id) {
+        return false;
+    }
+
+    return (desc->a.device_id &&
+            !strcmp(desc->a.device_id, dev->qdev.id)) ||
+           (desc->b.device_id &&
+            !strcmp(desc->b.device_id, dev->qdev.id));
+}
+
+void ub_fm_controller_register(BusControllerState *s)
+{
+    Error *local_err = NULL;
+
+    if (!s || !s->ubc_dev) {
+        return;
+    }
+
+    qemu_log("ub_fm register controller eid=%u guid=%04x-%04x port_num=%u\n",
+             s->ubc_dev->parent.eid,
+             s->ubc_dev->parent.guid.vendor,
+             s->ubc_dev->parent.guid.device_id,
+             s->ubc_dev->parent.port.port_num);
+
+    if (ub_fm_refresh_topology(&local_err) < 0) {
+        error_report_err(local_err);
+    }
+}
+
+void ub_fm_controller_unregister(BusControllerState *s)
+{
+    guint i;
+
+    if (!s || !s->ubc_dev) {
+        return;
+    }
+
+    qemu_log("ub_fm unregister controller eid=%u guid=%04x-%04x\n",
+             s->ubc_dev->parent.eid,
+             s->ubc_dev->parent.guid.vendor,
+             s->ubc_dev->parent.guid.device_id);
+
+    if (!ub_fm_active_links) {
+        return;
+    }
+
+    for (i = 0; i < ub_fm_active_links->len; i++) {
+        UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+
+        if (!link->runtime) {
+            continue;
+        }
+        if (ub_fm_desc_matches_device(&link->desc, &s->ubc_dev->parent)) {
+            Error *local_err = NULL;
+
+            if (ub_link_deactivate(link->runtime, &local_err) < 0) {
+                error_report_err(local_err);
+            }
+            ub_link_detach_endpoints(link->runtime);
+        }
+    }
+}
+
+void ub_fm_set_topology_source(const char *name,
+                               UBFMTopologyPopulateFn populate,
+                               void *opaque)
+{
+    g_free(ub_fm_topology_source_name);
+    ub_fm_topology_source_name = g_strdup(name);
+    ub_fm_topology_populate = populate;
+    ub_fm_topology_populate_opaque = opaque;
+}
+
+void ub_fm_clear_topology_source(void)
+{
+    g_clear_pointer(&ub_fm_topology_source_name, g_free);
+    ub_fm_topology_populate = NULL;
+    ub_fm_topology_populate_opaque = NULL;
+    g_clear_pointer(&ub_fm_snapshot_source_links, g_ptr_array_unref);
+}
+
+const char *ub_fm_get_topology_source_name(void)
+{
+    return ub_fm_topology_source_name;
+}
+
+static void ub_fm_free_link_desc_fields(UBFMTopologyLinkDesc *desc)
+{
+    if (!desc) {
+        return;
+    }
+    g_free(desc->a.device_id);
+    g_free(desc->b.device_id);
+}
+
+static void ub_fm_free_link_desc(gpointer data)
+{
+    UBFMTopologyLinkDesc *desc = data;
+
+    if (!desc) {
+        return;
+    }
+    ub_fm_free_link_desc_fields(desc);
+    g_free(desc);
+}
+
+static void ub_fm_free_managed_link(gpointer data)
+{
+    UBFMManagedLink *link = data;
+
+    if (!link) {
+        return;
+    }
+    if (link->runtime) {
+        object_unref(OBJECT(link->runtime));
+    }
+    ub_fm_free_link_desc_fields(&link->desc);
+    g_free(link);
+}
+
+static UBFMTopologyLinkDesc *ub_fm_link_desc_dup(const UBFMTopologyLinkDesc *src)
+{
+    UBFMTopologyLinkDesc *dst;
+
+    if (!src) {
+        return NULL;
+    }
+
+    dst = g_new0(UBFMTopologyLinkDesc, 1);
+    dst->a.device_id = g_strdup(src->a.device_id);
+    dst->a.port_idx = src->a.port_idx;
+    dst->b.device_id = g_strdup(src->b.device_id);
+    dst->b.port_idx = src->b.port_idx;
+    dst->link_up = src->link_up;
+    return dst;
+}
+
+static bool ub_fm_same_endpoint(const UBFMEndpointDesc *a,
+                                const UBFMEndpointDesc *b)
+{
+    return a && b &&
+           a->device_id && b->device_id &&
+           a->port_idx == b->port_idx &&
+           !strcmp(a->device_id, b->device_id);
+}
+
+static bool ub_fm_endpoint_is_valid(const UBFMEndpointDesc *ep)
+{
+    return ep && ep->device_id && ep->device_id[0];
+}
+
+static bool ub_fm_same_topology_pair(const UBFMTopologyLinkDesc *a,
+                                     const UBFMTopologyLinkDesc *b)
+{
+    if (!a || !b) {
+        return false;
+    }
+
+    return (ub_fm_same_endpoint(&a->a, &b->a) &&
+            ub_fm_same_endpoint(&a->b, &b->b)) ||
+           (ub_fm_same_endpoint(&a->a, &b->b) &&
+            ub_fm_same_endpoint(&a->b, &b->a));
+}
+
+static bool ub_fm_link_desc_identical(const UBFMTopologyLinkDesc *a,
+                                      const UBFMTopologyLinkDesc *b)
+{
+    return ub_fm_same_topology_pair(a, b) && a->link_up == b->link_up;
+}
+
+static int ub_fm_validate_local_endpoint(const UBFMEndpointDesc *ep, Error **errp)
+{
+    UBDevice *dev;
+
+    if (!ub_fm_endpoint_is_valid(ep)) {
+        error_setg(errp, "ub_fm: endpoint is missing device_id");
+        return -1;
+    }
+
+    dev = ub_find_device_by_id(ep->device_id);
+    if (!dev) {
+        return 0;
+    }
+
+    if (ep->port_idx >= dev->port.port_num) {
+        error_setg(errp,
+                   "ub_fm: endpoint %s:%u exceeds local port count %u",
+                   ep->device_id, ep->port_idx, dev->port.port_num);
+        return -1;
+    }
+
+    return 0;
+}
+
+int ub_fm_validate_topology_links(const UBFMTopologyLinkDesc *links,
+                                  size_t nr_links,
+                                  Error **errp)
+{
+    size_t i, j;
+
+    for (i = 0; i < nr_links; i++) {
+        const UBFMTopologyLinkDesc *desc = &links[i];
+
+        if (!ub_fm_link_desc_is_relevant_to_local_node(desc)) {
+            continue;
+        }
+
+        if (!ub_fm_endpoint_is_valid(&desc->a) ||
+            !ub_fm_endpoint_is_valid(&desc->b)) {
+            error_setg(errp, "ub_fm: topology link %zu is missing endpoint ids", i);
+            return -1;
+        }
+
+        if (ub_fm_same_endpoint(&desc->a, &desc->b)) {
+            error_setg(errp,
+                       "ub_fm: topology link %zu connects endpoint %s:%u to itself",
+                       i, desc->a.device_id, desc->a.port_idx);
+            return -1;
+        }
+
+        if (ub_fm_validate_local_endpoint(&desc->a, errp) < 0 ||
+            ub_fm_validate_local_endpoint(&desc->b, errp) < 0) {
+            return -1;
+        }
+
+        for (j = i + 1; j < nr_links; j++) {
+            const UBFMTopologyLinkDesc *other = &links[j];
+
+            if (!ub_fm_link_desc_is_relevant_to_local_node(other)) {
+                continue;
+            }
+
+            if (ub_fm_same_topology_pair(desc, other) &&
+                !ub_fm_link_desc_identical(desc, other)) {
+                error_setg(errp,
+                           "ub_fm: conflicting duplicate links for %s:%u <-> %s:%u",
+                           desc->a.device_id, desc->a.port_idx,
+                           desc->b.device_id, desc->b.port_idx);
+                return -1;
+            }
+
+            if ((ub_fm_same_endpoint(&desc->a, &other->a) &&
+                 !ub_fm_same_endpoint(&desc->b, &other->b)) ||
+                (ub_fm_same_endpoint(&desc->a, &other->b) &&
+                 !ub_fm_same_endpoint(&desc->b, &other->a)) ||
+                (ub_fm_same_endpoint(&desc->b, &other->a) &&
+                 !ub_fm_same_endpoint(&desc->a, &other->b)) ||
+                (ub_fm_same_endpoint(&desc->b, &other->b) &&
+                 !ub_fm_same_endpoint(&desc->a, &other->a))) {
+                error_setg(errp,
+                           "ub_fm: endpoint reuse conflict for %s:%u",
+                           ub_fm_same_endpoint(&desc->a, &other->a) ||
+                           ub_fm_same_endpoint(&desc->a, &other->b) ?
+                           desc->a.device_id : desc->b.device_id,
+                           ub_fm_same_endpoint(&desc->a, &other->a) ||
+                           ub_fm_same_endpoint(&desc->a, &other->b) ?
+                           desc->a.port_idx : desc->b.port_idx);
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int ub_fm_validate_declared_topology(Error **errp)
+{
+    guint i;
+    g_autofree UBFMTopologyLinkDesc *links = NULL;
+
+    if (!ub_fm_declared_links || ub_fm_declared_links->len == 0) {
+        return 0;
+    }
+
+    links = g_new0(UBFMTopologyLinkDesc, ub_fm_declared_links->len);
+    for (i = 0; i < ub_fm_declared_links->len; i++) {
+        UBFMTopologyLinkDesc *src = g_ptr_array_index(ub_fm_declared_links, i);
+
+        links[i] = *src;
+    }
+
+    return ub_fm_validate_topology_links(links, ub_fm_declared_links->len, errp);
+}
+
+static int ub_fm_validate_link_ptr_array(GPtrArray *links_array, Error **errp)
+{
+    guint i;
+    g_autofree UBFMTopologyLinkDesc *links = NULL;
+
+    if (!links_array || links_array->len == 0) {
+        return 0;
+    }
+
+    links = g_new0(UBFMTopologyLinkDesc, links_array->len);
+    for (i = 0; i < links_array->len; i++) {
+        UBFMTopologyLinkDesc *src = g_ptr_array_index(links_array, i);
+
+        links[i] = *src;
+    }
+
+    return ub_fm_validate_topology_links(links, links_array->len, errp);
+}
+
+static bool ub_fm_has_declared_active_link(const UBFMTopologyLinkDesc *desc)
+{
+    guint i;
+
+    if (!ub_fm_declared_links || !desc) {
+        return false;
+    }
+
+    for (i = 0; i < ub_fm_declared_links->len; i++) {
+        UBFMTopologyLinkDesc *declared = g_ptr_array_index(ub_fm_declared_links, i);
+
+        if (declared->link_up && ub_fm_same_topology_pair(desc, declared)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static UBFMManagedLink *ub_fm_find_active_link(const UBFMTopologyLinkDesc *desc)
+{
+    guint i;
+
+    if (!ub_fm_active_links) {
+        return NULL;
+    }
+
+    for (i = 0; i < ub_fm_active_links->len; i++) {
+        UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+
+        if (ub_fm_same_topology_pair(&link->desc, desc)) {
+            return link;
+        }
+    }
+    return NULL;
+}
+
+static UBFMTopologyLinkDesc *ub_fm_find_declared_link(const UBFMTopologyLinkDesc *desc)
+{
+    guint i;
+
+    if (!ub_fm_declared_links) {
+        return NULL;
+    }
+
+    for (i = 0; i < ub_fm_declared_links->len; i++) {
+        UBFMTopologyLinkDesc *declared = g_ptr_array_index(ub_fm_declared_links, i);
+
+        if (ub_fm_same_topology_pair(declared, desc)) {
+            return declared;
+        }
+    }
+
+    return NULL;
+}
+
+static int ub_fm_prune_inactive_links(Error **errp)
+{
+    guint i = 0;
+
+    if (!ub_fm_active_links) {
+        return 0;
+    }
+
+    while (i < ub_fm_active_links->len) {
+        UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+
+        if (ub_fm_has_declared_active_link(&link->desc)) {
+            i++;
+            continue;
+        }
+
+        if (link->runtime && ub_link_deactivate(link->runtime, errp) < 0) {
+            return -1;
+        }
+        g_ptr_array_remove_index(ub_fm_active_links, i);
+    }
+
+    return 0;
+}
+
+static bool ub_fm_has_pending_links(void)
+{
+    guint i;
+
+    if (!ub_fm_active_links) {
+        return false;
+    }
+
+    for (i = 0; i < ub_fm_active_links->len; i++) {
+        UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+
+        if (link->runtime && ub_link_is_pending(link->runtime)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void ub_fm_schedule_pending_refresh(bool needed);
+
+static void ub_fm_pending_refresh_cb(void *opaque)
+{
+    Error *local_err = NULL;
+
+    if (ub_fm_refresh_topology(&local_err) < 0) {
+        error_report_err(local_err);
+    }
+    ub_fm_schedule_pending_refresh(ub_fm_has_pending_links());
+}
+
+static void ub_fm_schedule_pending_refresh(bool needed)
+{
+    if (!ub_fm_pending_refresh_timer) {
+        ub_fm_pending_refresh_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                                   ub_fm_pending_refresh_cb,
+                                                   NULL);
+    }
+
+    if (needed) {
+        timer_mod(ub_fm_pending_refresh_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 500);
+    } else {
+        timer_del(ub_fm_pending_refresh_timer);
+    }
+}
+
+void ub_fm_set_topology_link(const char *a_device_id, uint32_t a_port_idx,
+                             const char *b_device_id, uint32_t b_port_idx,
+                             bool link_up)
+{
+    UBFMTopologyLinkDesc *desc = NULL;
+    UBFMTopologyLinkDesc key = { 0 };
+
+    if (!a_device_id || !b_device_id) {
+        return;
+    }
+    if (!ub_fm_declared_links) {
+        ub_fm_declared_links = g_ptr_array_new_with_free_func(ub_fm_free_link_desc);
+    }
+
+    key.a.device_id = (char *)a_device_id;
+    key.a.port_idx = a_port_idx;
+    key.b.device_id = (char *)b_device_id;
+    key.b.port_idx = b_port_idx;
+
+    desc = ub_fm_find_declared_link(&key);
+    if (desc) {
+        desc->link_up = link_up;
+        return;
+    }
+
+    desc = g_new0(UBFMTopologyLinkDesc, 1);
+    desc->a.device_id = g_strdup(a_device_id);
+    desc->a.port_idx = a_port_idx;
+    desc->b.device_id = g_strdup(b_device_id);
+    desc->b.port_idx = b_port_idx;
+    desc->link_up = link_up;
+    g_ptr_array_add(ub_fm_declared_links, desc);
+}
+
+int ub_fm_install_topology_links(const UBFMTopologyLinkDesc *links,
+                                 size_t nr_links, Error **errp)
+{
+    size_t i;
+
+    if (ub_fm_validate_topology_links(links, nr_links, errp) < 0) {
+        return -1;
+    }
+
+    ub_fm_clear_declared_topology();
+    for (i = 0; i < nr_links; i++) {
+        const UBFMTopologyLinkDesc *desc = &links[i];
+
+        if (!desc->a.device_id || !desc->b.device_id) {
+            error_setg(errp, "ub_fm: topology link %zu is missing endpoint ids", i);
+            return -1;
+        }
+        ub_fm_set_topology_link(desc->a.device_id, desc->a.port_idx,
+                                desc->b.device_id, desc->b.port_idx,
+                                desc->link_up);
+    }
+
+    return ub_fm_apply_declared_topology(errp);
+}
+
+static int ub_fm_populate_snapshot_source(void *opaque, Error **errp)
+{
+    GPtrArray *links = opaque;
+    guint i;
+
+    if (!links) {
+        return 0;
+    }
+
+    for (i = 0; i < links->len; i++) {
+        const UBFMTopologyLinkDesc *desc = g_ptr_array_index(links, i);
+
+        if (!desc->a.device_id || !desc->b.device_id) {
+            error_setg(errp, "ub_fm: snapshot topology link %u is missing endpoint ids", i);
+            return -1;
+        }
+        ub_fm_set_topology_link(desc->a.device_id, desc->a.port_idx,
+                                desc->b.device_id, desc->b.port_idx,
+                                desc->link_up);
+    }
+
+    return 0;
+}
+
+int ub_fm_refresh_topology(Error **errp)
+{
+    if (!ub_fm_topology_populate) {
+        return ub_fm_apply_declared_topology(errp);
+    }
+
+    ub_fm_clear_declared_topology();
+    if (ub_fm_topology_populate(ub_fm_topology_populate_opaque, errp) < 0) {
+        return -1;
+    }
+
+    return ub_fm_apply_declared_topology(errp);
+}
+
+int ub_fm_set_snapshot_topology_source(const char *name,
+                                       const UBFMTopologyLinkDesc *links,
+                                       size_t nr_links,
+                                       Error **errp)
+{
+    GPtrArray *snapshot;
+    size_t i;
+
+    if (ub_fm_validate_topology_links(links, nr_links, errp) < 0) {
+        return -1;
+    }
+
+    snapshot = g_ptr_array_new_with_free_func(ub_fm_free_link_desc);
+    for (i = 0; i < nr_links; i++) {
+        const UBFMTopologyLinkDesc *desc = &links[i];
+
+        if (!desc->a.device_id || !desc->b.device_id) {
+            g_ptr_array_unref(snapshot);
+            error_setg(errp, "ub_fm: snapshot topology link %zu is missing endpoint ids", i);
+            return -1;
+        }
+        g_ptr_array_add(snapshot, ub_fm_link_desc_dup(desc));
+    }
+
+    g_clear_pointer(&ub_fm_snapshot_source_links, g_ptr_array_unref);
+    ub_fm_snapshot_source_links = snapshot;
+    ub_fm_set_topology_source(name, ub_fm_populate_snapshot_source,
+                              ub_fm_snapshot_source_links);
+    return ub_fm_refresh_topology(errp);
+}
+
+int ub_fm_load_topology_snapshot_from_file(const char *path, Error **errp)
+{
+    g_autoptr(GKeyFile) keyfile = NULL;
+    g_auto(GStrv) groups = NULL;
+    GPtrArray *snapshot;
+    GError *gerr = NULL;
+    gsize i;
+
+    if (!path || !path[0]) {
+        error_setg(errp, "ub_fm: topology file path is empty");
+        return -1;
+    }
+
+    keyfile = g_key_file_new();
+    if (!g_key_file_load_from_file(keyfile, path, G_KEY_FILE_NONE, &gerr)) {
+        error_setg(errp, "ub_fm: failed to load topology file %s: %s",
+                   path, gerr->message);
+        g_error_free(gerr);
+        return -1;
+    }
+
+    snapshot = g_ptr_array_new_with_free_func(ub_fm_free_link_desc);
+    groups = g_key_file_get_groups(keyfile, NULL);
+    for (i = 0; groups && groups[i]; i++) {
+        const char *group = groups[i];
+        UBFMTopologyLinkDesc *desc;
+        g_autofree char *raw_a_device_id = NULL;
+        g_autofree char *raw_b_device_id = NULL;
+
+        if (!g_str_has_prefix(group, "link ")) {
+            continue;
+        }
+
+        desc = g_new0(UBFMTopologyLinkDesc, 1);
+        raw_a_device_id = g_key_file_get_string(keyfile, group,
+                                                "a_device_id", &gerr);
+        if (!gerr) {
+            desc->a.device_id = ub_fm_resolve_device_id_for_local_node(raw_a_device_id);
+        }
+        if (gerr) {
+            error_setg(errp, "ub_fm: %s missing a_device_id: %s",
+                       group, gerr->message);
+            g_error_free(gerr);
+            g_free(desc);
+            g_ptr_array_unref(snapshot);
+            return -1;
+        }
+        desc->a.port_idx = g_key_file_get_uint64(keyfile, group,
+                                                 "a_port_idx", &gerr);
+        if (gerr) {
+            error_setg(errp, "ub_fm: %s missing a_port_idx: %s",
+                       group, gerr->message);
+            g_error_free(gerr);
+            ub_fm_free_link_desc(desc);
+            g_ptr_array_unref(snapshot);
+            return -1;
+        }
+        raw_b_device_id = g_key_file_get_string(keyfile, group,
+                                                "b_device_id", &gerr);
+        if (!gerr) {
+            desc->b.device_id = ub_fm_resolve_device_id_for_local_node(raw_b_device_id);
+        }
+        if (gerr) {
+            error_setg(errp, "ub_fm: %s missing b_device_id: %s",
+                       group, gerr->message);
+            g_error_free(gerr);
+            ub_fm_free_link_desc(desc);
+            g_ptr_array_unref(snapshot);
+            return -1;
+        }
+        desc->b.port_idx = g_key_file_get_uint64(keyfile, group,
+                                                 "b_port_idx", &gerr);
+        if (gerr) {
+            error_setg(errp, "ub_fm: %s missing b_port_idx: %s",
+                       group, gerr->message);
+            g_error_free(gerr);
+            ub_fm_free_link_desc(desc);
+            g_ptr_array_unref(snapshot);
+            return -1;
+        }
+        desc->link_up = g_key_file_get_boolean(keyfile, group,
+                                               "link_up", &gerr);
+        if (gerr) {
+            error_setg(errp, "ub_fm: %s missing link_up: %s",
+                       group, gerr->message);
+            g_error_free(gerr);
+            ub_fm_free_link_desc(desc);
+            g_ptr_array_unref(snapshot);
+            return -1;
+        }
+
+        if (!ub_fm_raw_link_is_relevant_to_local_node(raw_a_device_id,
+                                                      raw_b_device_id)) {
+            qemu_log("ub_fm: skip non-local link %s:%u <-> %s:%u\n",
+                     raw_a_device_id, desc->a.port_idx,
+                     raw_b_device_id, desc->b.port_idx);
+            ub_fm_free_link_desc(desc);
+            continue;
+        }
+
+        qemu_log("ub_fm: accept topology file link %s:%u -> %s:%u (resolved %s:%u -> %s:%u up=%d)\n",
+                 raw_a_device_id, desc->a.port_idx,
+                 raw_b_device_id, desc->b.port_idx,
+                 desc->a.device_id, desc->a.port_idx,
+                 desc->b.device_id, desc->b.port_idx,
+                 desc->link_up);
+        g_ptr_array_add(snapshot, desc);
+    }
+
+    if (snapshot->len == 0) {
+        g_ptr_array_unref(snapshot);
+        error_setg(errp, "ub_fm: topology file %s defines no [link ...] groups", path);
+        return -1;
+    }
+
+    if (ub_fm_validate_link_ptr_array(snapshot, errp) < 0) {
+        g_ptr_array_unref(snapshot);
+        return -1;
+    }
+
+    g_clear_pointer(&ub_fm_snapshot_source_links, g_ptr_array_unref);
+    ub_fm_snapshot_source_links = snapshot;
+    ub_fm_set_topology_source(path, ub_fm_populate_snapshot_source,
+                              ub_fm_snapshot_source_links);
+    return ub_fm_refresh_topology(errp);
+}
+
+void ub_fm_remove_topology_link(const char *a_device_id, uint32_t a_port_idx,
+                                const char *b_device_id, uint32_t b_port_idx)
+{
+    UBFMTopologyLinkDesc key = { 0 };
+    UBFMTopologyLinkDesc *desc = NULL;
+    guint i;
+
+    if (!ub_fm_declared_links || !a_device_id || !b_device_id) {
+        return;
+    }
+
+    key.a.device_id = (char *)a_device_id;
+    key.a.port_idx = a_port_idx;
+    key.b.device_id = (char *)b_device_id;
+    key.b.port_idx = b_port_idx;
+    desc = ub_fm_find_declared_link(&key);
+    if (!desc) {
+        return;
+    }
+
+    for (i = 0; i < ub_fm_declared_links->len; i++) {
+        UBFMTopologyLinkDesc *declared = g_ptr_array_index(ub_fm_declared_links, i);
+
+        if (declared == desc) {
+            g_ptr_array_remove_index(ub_fm_declared_links, i);
+            return;
+        }
+    }
+}
+
+void ub_fm_clear_declared_topology(void)
+{
+    if (!ub_fm_declared_links) {
+        return;
+    }
+
+    g_ptr_array_set_size(ub_fm_declared_links, 0);
+}
+
+int ub_fm_apply_declared_topology(Error **errp)
+{
+    guint i;
+    bool has_pending = false;
+
+    if (!ub_fm_declared_links) {
+        return 0;
+    }
+    if (ub_fm_validate_declared_topology(errp) < 0) {
+        return -1;
+    }
+    if (!ub_fm_active_links) {
+        ub_fm_active_links = g_ptr_array_new_with_free_func(ub_fm_free_managed_link);
+    }
+    if (ub_fm_prune_inactive_links(errp) < 0) {
+        return -1;
+    }
+
+    for (i = 0; i < ub_fm_declared_links->len; i++) {
+        UBFMTopologyLinkDesc *desc = g_ptr_array_index(ub_fm_declared_links, i);
+        UBFMManagedLink *link = NULL;
+
+        if (!desc->link_up) {
+            qemu_log("ub_fm: declared link down %s:%u <-> %s:%u\n",
+                     desc->a.device_id, desc->a.port_idx,
+                     desc->b.device_id, desc->b.port_idx);
+            continue;
+        }
+        qemu_log("ub_fm: apply declared link %s:%u <-> %s:%u\n",
+                 desc->a.device_id, desc->a.port_idx,
+                 desc->b.device_id, desc->b.port_idx);
+        link = ub_fm_find_active_link(desc);
+        if (!link) {
+            link = g_new0(UBFMManagedLink, 1);
+            link->desc.a.device_id = g_strdup(desc->a.device_id);
+            link->desc.a.port_idx = desc->a.port_idx;
+            link->desc.b.device_id = g_strdup(desc->b.device_id);
+            link->desc.b.port_idx = desc->b.port_idx;
+            link->desc.link_up = desc->link_up;
+            link->runtime = UB_LINK(object_new(TYPE_UB_LINK));
+            ub_link_configure(link->runtime,
+                              desc->a.device_id, desc->a.port_idx,
+                              desc->b.device_id, desc->b.port_idx,
+                              desc->link_up);
+            g_ptr_array_add(ub_fm_active_links, link);
+        }
+        {
+            int ret = ub_link_apply(link->runtime, errp);
+
+            if (ret < 0) {
+                return -1;
+            }
+            if (ret > 0) {
+                has_pending = true;
+                continue;
+            }
+        }
+    }
+    ub_fm_schedule_pending_refresh(has_pending || ub_fm_has_pending_links());
+    return 0;
+}
 
 uint64_t ub_fm_msgq_reg_read(void *opaque, hwaddr addr, unsigned len)
 {

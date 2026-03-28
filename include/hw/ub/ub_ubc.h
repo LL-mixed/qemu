@@ -73,4 +73,8 @@ struct BusControllerClass {
 
 void ub_save_ubc_list(BusControllerState *s);
 BusControllerState *container_of_ubbus(UBBus *bus);
+int ub_inject_remote_cfg_cpl_notify(BusControllerState *s,
+                                    const UbGuid *remote_bi_guid,
+                                    Error **errp);
+void ub_try_inject_remote_cfg_notifies(BusControllerState *s);
 #endif

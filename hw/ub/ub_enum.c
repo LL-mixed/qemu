@@ -65,6 +65,27 @@ static void enum_get_port_info_from_config_space(UBDevice *dev, uint16_t port_id
     }
 }
 
+static void enum_get_port_info_from_remote_snapshot(const UBRemoteDeviceSnapshot *snapshot,
+                                                    uint16_t port_idx,
+                                                    EnumTlvPortInfo *port_info)
+{
+    const UBRemotePortSnapshot *remote_port;
+
+    memset(port_info, 0, sizeof(*port_info));
+    if (!snapshot || port_idx >= snapshot->port_num) {
+        return;
+    }
+
+    remote_port = &snapshot->ports[port_idx];
+    port_info->bits0.len = sizeof(EnumTlvPortInfo);
+    port_info->bits0.type = TLV_PORT_INFO;
+    port_info->bits0.w = 1;
+    port_info->bits0.s = remote_port->link_up ? UB_PORT_STATUS_UP : UB_PORT_STATUS_DOWN;
+    port_info->local_port_idx = remote_port->local_port_idx;
+    port_info->remote_port_idx = remote_port->neighbor_port_idx;
+    port_info->remote_guid = remote_port->neighbor_guid;
+}
+
 static void enum_query_set_rsp_port_info(EnumTopoQueryRspPdu *rsp_pdu, uint16_t num_ports,
                                          uint16_t start_port_idx, UBDevice *dev)
 {
@@ -73,6 +94,23 @@ static void enum_query_set_rsp_port_info(EnumTopoQueryRspPdu *rsp_pdu, uint16_t 
     for (uint32_t idx = 0; idx < num_ports; ++idx) {
         uint8_t *dst_port_info_ptr = (uint8_t *)rsp_pdu->port_info + idx * sizeof(EnumTlvPortInfo);
         enum_get_port_info_from_config_space(dev, port_idx, &port_info);
+        memcpy(dst_port_info_ptr, &port_info, sizeof(EnumTlvPortInfo));
+        port_idx++;
+    }
+}
+
+static void enum_query_set_rsp_port_info_remote(EnumTopoQueryRspPdu *rsp_pdu,
+                                                uint16_t num_ports,
+                                                uint16_t start_port_idx,
+                                                const UBRemoteDeviceSnapshot *snapshot)
+{
+    EnumTlvPortInfo port_info;
+    uint32_t port_idx = start_port_idx;
+
+    for (uint32_t idx = 0; idx < num_ports; ++idx) {
+        uint8_t *dst_port_info_ptr = (uint8_t *)rsp_pdu->port_info +
+                                     idx * sizeof(EnumTlvPortInfo);
+        enum_get_port_info_from_remote_snapshot(snapshot, port_idx, &port_info);
         memcpy(dst_port_info_ptr, &port_info, sizeof(EnumTlvPortInfo));
         port_idx++;
     }
@@ -133,6 +171,19 @@ static void enum_query_set_rsp_port_num(EnumTopoQueryRspPdu *rsp_pdu, uint16_t r
     trace_enum_query_set_rsp_port_num(tlv_port_num->total_num_ports);
 }
 
+static void enum_query_set_rsp_port_num_remote(EnumTopoQueryRspPdu *rsp_pdu,
+                                               uint16_t rsp_num_ports,
+                                               const UBRemoteDeviceSnapshot *snapshot)
+{
+    EnumTlvPortNum *tlv_port_num = NULL;
+
+    tlv_port_num = (EnumTlvPortNum *)((uint8_t *)rsp_pdu + ENUM_PLD_SCAN_PDU_COMMON_SIZE +
+                                       rsp_num_ports * sizeof(EnumTlvPortInfo));
+    tlv_port_num->type = TLV_PORT_NUM;
+    tlv_port_num->len = sizeof(EnumTlvPortNum);
+    tlv_port_num->total_num_ports = snapshot->port_num;
+}
+
 static void enum_query_set_rsp_slice_info(EnumTopoQueryRspPdu *rsp_pdu, uint16_t rsp_num_ports, uint8_t total_slice)
 {
     EnumTlvSliceInfo *tlv_slice_info = NULL;
@@ -161,6 +212,20 @@ static void enum_query_set_rsp_cap_info(EnumTopoQueryRspPdu *rsp_pdu, uint16_t r
     /* now cap add nothing */
 }
 
+static void enum_query_set_rsp_cap_info_remote(EnumTopoQueryRspPdu *rsp_pdu,
+                                               uint16_t rsp_num_ports,
+                                               const UBRemoteDeviceSnapshot *snapshot)
+{
+    EnumTlvCapInfo *tlv_cap_info = NULL;
+
+    tlv_cap_info = (EnumTlvCapInfo *)((uint8_t *)rsp_pdu + ENUM_PLD_SCAN_PDU_COMMON_SIZE +
+                                      rsp_num_ports * sizeof(EnumTlvPortInfo) + sizeof(EnumTlvPortNum) +
+                                      sizeof(EnumTlvSliceInfo));
+    tlv_cap_info->type = TLV_CAP_INFO;
+    tlv_cap_info->len = sizeof(EnumTlvCapInfo);
+    tlv_cap_info->class_code = snapshot->class_code;
+}
+
 // #pragma GCC push_options
 // #pragma GCC optimize ("O0")
 static void handle_enum_query_request(BusControllerState *s, HiMsgSqe *sqe,
@@ -178,6 +243,8 @@ static void handle_enum_query_request(BusControllerState *s, HiMsgSqe *sqe,
     EnumTopoQueryReq *scan_pdu;
     EnumPldScanPduCommon *scan_pdu_com;
     UBDevice *dev;
+    UBRemoteDeviceSnapshot remote_snapshot;
+    bool use_remote_snapshot = false;
     uint16_t port_idx_start, remain_num_ports, max_num_ports, rsp_num_ports;
     uint8_t slice_id, total_slice;
     /* rsp  message */
@@ -241,16 +308,20 @@ static void handle_enum_query_request(BusControllerState *s, HiMsgSqe *sqe,
     ub_device_get_str_from_guid(&scan_pdu_com->guid, guid_str, UB_DEV_GUID_STRING_LENGTH + 1);
     dev = ub_find_device_by_guid(&scan_pdu_com->guid);
     if (!dev) {
-        qemu_log("can not find device by guid %s\n", guid_str);
-        g_free(payload);
-        return;
+        if (!ub_load_remote_device_snapshot_by_guid(&scan_pdu_com->guid,
+                                                    &remote_snapshot, NULL)) {
+            qemu_log("can not find device by guid %s\n", guid_str);
+            g_free(payload);
+            return;
+        }
+        use_remote_snapshot = true;
     }
 
     slice_id = scan_pdu->common.bits.slice_id;
     max_num_ports = enum_query_get_max_num_ports();
     port_idx_start = slice_id * max_num_ports;
-
-    remain_num_ports = dev->port.port_num - port_idx_start;
+    remain_num_ports = (use_remote_snapshot ? remote_snapshot.port_num : dev->port.port_num) -
+                       port_idx_start;
     rsp_num_ports = remain_num_ports > max_num_ports ? max_num_ports : remain_num_ports;
     trace_handle_enum_query_request(scan_header->bits.hops, scan_pdu_com->bits.opcode,
                                     port_idx_start, rsp_num_ports, max_num_ports, guid_str);
@@ -271,16 +342,30 @@ static void handle_enum_query_request(BusControllerState *s, HiMsgSqe *sqe,
     rsp_pdu->common.bits.status = 0;
 
     /* set tlv port info */
-    enum_query_set_rsp_port_info(rsp_pdu, rsp_num_ports, port_idx_start, dev);
+    if (use_remote_snapshot) {
+        enum_query_set_rsp_port_info_remote(rsp_pdu, rsp_num_ports, port_idx_start,
+                                            &remote_snapshot);
+    } else {
+        enum_query_set_rsp_port_info(rsp_pdu, rsp_num_ports, port_idx_start, dev);
+    }
 
     if (slice_id == 0) {
         /* set tlv port num info */
-        enum_query_set_rsp_port_num(rsp_pdu, rsp_num_ports, dev);
+        if (use_remote_snapshot) {
+            enum_query_set_rsp_port_num_remote(rsp_pdu, rsp_num_ports, &remote_snapshot);
+        } else {
+            enum_query_set_rsp_port_num(rsp_pdu, rsp_num_ports, dev);
+        }
         /* set tlv slice info */
-        total_slice = (dev->port.port_num + max_num_ports - 1) / max_num_ports;
+        total_slice = ((use_remote_snapshot ? remote_snapshot.port_num : dev->port.port_num) +
+                       max_num_ports - 1) / max_num_ports;
         enum_query_set_rsp_slice_info(rsp_pdu, rsp_num_ports, total_slice);
         /* set tlv cap info */
-        enum_query_set_rsp_cap_info(rsp_pdu, rsp_num_ports, dev);
+        if (use_remote_snapshot) {
+            enum_query_set_rsp_cap_info_remote(rsp_pdu, rsp_num_ports, &remote_snapshot);
+        } else {
+            enum_query_set_rsp_cap_info(rsp_pdu, rsp_num_ports, dev);
+        }
     }
     /* set pdu_len */
     rsp_pdu->common.pdu_len = enum_query_get_rsp_pdu_len(rsp_num_ports, slice_id);

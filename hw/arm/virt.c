@@ -103,6 +103,31 @@
 #include "hw/ub/ub_common.h"
 #include "hw/ub/ub_config.h"
 #define TYPE_UB_SWITCH_DEV "ub-switch-dev"
+
+static uint64_t virt_ub_node_seq_base(void)
+{
+    const char *node_id = g_getenv("UB_FM_NODE_ID");
+    uint64_t seq;
+
+    if (!node_id || !node_id[0]) {
+        return 1;
+    }
+
+    /*
+     * Keep per-node device/bus-instance GUIDs stable across restarts while
+     * avoiding cross-instance collisions on the same host.
+     */
+    seq = g_str_hash(node_id);
+    if (!seq) {
+        seq = 1;
+    }
+    return seq;
+}
+
+static uint64_t virt_ub_node_seq(uint64_t offset)
+{
+    return virt_ub_node_seq_base() + offset;
+}
 #endif // CONFIG_UB
 #ifdef CONFIG_UBMEM_VMMU
 #include "hw/misc/ubmem_vmmu.h"
@@ -1894,13 +1919,13 @@ static void create_ub(VirtMachineState *vms)
     ubc_dev_state->parent.guid.device_id = 0x0541;
     ubc_dev_state->parent.guid.version = 0;
     ubc_dev_state->parent.guid.type = UB_GUID_TYPE_IBUS_CONTROLLER;
-    ubc_dev_state->parent.guid.seq_num = 1;
+    ubc_dev_state->parent.guid.seq_num = virt_ub_node_seq(0);
     ubc_dev_state->bus_instance_guid.vendor = VENDER_ID_HUAWEI;
     ubc_dev_state->bus_instance_guid.device_id = 0x0541;
     ubc_dev_state->bus_instance_guid.version = 0;
     ubc_dev_state->bus_instance_guid.type = UB_GUID_TYPE_BUS_INSTANCE;
-    ubc_dev_state->bus_instance_guid.seq_num = 1;
-    ubc_dev_state->parent.port.neighbors_cmd = g_strdup("0:ubsw0:0");
+    ubc_dev_state->bus_instance_guid.seq_num = virt_ub_node_seq(0);
+    qdev_set_id(ubc_dev, g_strdup("ubcdev0"), &error_fatal);
     qdev_realize_and_unref(ubc_dev, BUS(ubc_state->bus), &error_fatal);
 
     DeviceState *ubsw_dev = qdev_new(TYPE_UB_SWITCH_DEV);
@@ -1912,8 +1937,44 @@ static void create_ub(VirtMachineState *vms)
     ubsw->guid.device_id = 0x0542;
     ubsw->guid.version = 0;
     ubsw->guid.type = UB_GUID_TYPE_SWITCH;
-    ubsw->guid.seq_num = 2;
+    ubsw->guid.seq_num = virt_ub_node_seq(1);
     qdev_realize_and_unref(ubsw_dev, BUS(ubc_state->bus), &error_fatal);
+    {
+        static const UBFMTopologyLinkDesc single_node_links[] = {
+            {
+                .a = { .device_id = (char *)"ubcdev0", .port_idx = 0 },
+                .b = { .device_id = (char *)"ubsw0", .port_idx = 0 },
+                .link_up = true,
+            },
+            {
+                /*
+                 * Reserve port1 for the future inter-node UBC<->UBC link
+                 * shape. In the single-node machine this endpoint stays
+                 * unresolved, so UBLink keeps it in a pending state and the
+                 * guest still observes an empty, link-down port.
+                 */
+                .a = { .device_id = (char *)"ubcdev0", .port_idx = 1 },
+                .b = { .device_id = (char *)"remote-ubc0", .port_idx = 1 },
+                .link_up = true,
+            },
+        };
+        const char *topology_file = g_getenv("UB_FM_TOPOLOGY_FILE");
+        Error *local_err = NULL;
+
+        if (topology_file && topology_file[0]) {
+            if (ub_fm_load_topology_snapshot_from_file(topology_file,
+                                                       &local_err) < 0) {
+                error_report_err(local_err);
+                exit(1);
+            }
+        } else if (ub_fm_set_snapshot_topology_source("virt-single-node",
+                                                      single_node_links,
+                                                      ARRAY_SIZE(single_node_links),
+                                                      &local_err) < 0) {
+            error_report_err(local_err);
+            exit(1);
+        }
+    }
 }
 #endif // CONFIG_UB
 static void create_pcie(VirtMachineState *vms)

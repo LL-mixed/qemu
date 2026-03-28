@@ -1,6 +1,7 @@
 ub_ss = ss.source_set()
 ub_ss.add(files(
   'ub.c',
+  'ub_link.c',
   'ub_ubc.c',
   'ub_ummu.c',
   'ub_config.c',

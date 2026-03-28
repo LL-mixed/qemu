@@ -29,6 +29,8 @@
 #include "trace.h"
 #include "sysemu/dma.h"
 #include "hw/ub/ub_cna_mgmt.h"
+#include "hw/ub/ub_common.h"
+#include "hw/ub/hisi/ub_fm.h"
 
 static void (*msgq_pool_handlers[])(BusControllerState *s, HiMsgSqe *sqe,
                                     MsgPktHeader *header) = {
@@ -38,6 +40,117 @@ static void (*msgq_pool_handlers[])(BusControllerState *s, HiMsgSqe *sqe,
     [UB_BI_DESTROY]      = NULL,
     [UB_CFG_CPL_NOTIFY]  = NULL, /* only send from CFM */
 };
+
+typedef struct UBCfgCplNotifyPld {
+    uint32_t flag : 1;
+    uint32_t rsvd : 31;
+    uint32_t guid[4];
+    uint32_t eid[4];
+} UBCfgCplNotifyPld;
+
+typedef struct UBPoolNotifyPkt {
+    MsgPktHeader header;
+    UBCfgCplNotifyPld notify;
+} UBPoolNotifyPkt;
+
+static uint32_t ub_remote_cluster_eid(const UbGuid *guid)
+{
+    uint32_t span = UB_SUPPORT_MAX_EID - 0x10000;
+    uint32_t offset = span ? (uint32_t)(guid->seq_num % span) : 0;
+
+    return 0x10000 + offset;
+}
+
+void ub_try_inject_remote_cfg_notifies(BusControllerState *s)
+{
+    UBDevice *udev;
+    uint32_t i;
+    Error *local_err = NULL;
+
+    /*
+     * Cross-instance links may start as pending if the peer endpoint file is
+     * published after this controller realizes. Reconcile again from a hot
+     * path that guest bring-up is guaranteed to hit.
+     */
+    if (ub_fm_refresh_topology(&local_err) < 0) {
+        error_report_err(local_err);
+    }
+
+    if (!s || !s->ubc_dev || !s->msgq.rq_inited || !s->msgq.cq_inited) {
+        return;
+    }
+
+    udev = UB_DEVICE(s->ubc_dev);
+    for (i = 0; i < udev->port.port_num; i++) {
+        NeighborInfo *neighbor = &udev->port.neighbors[i];
+
+        if (!neighbor->neighbor_id[0] ||
+            !neighbor->remote_bus_instance_guid_valid ||
+            neighbor->remote_cfg_notify_sent) {
+            continue;
+        }
+        qemu_log("ub_cfg_cpl_notify: retry inject for %s port%u -> %s:%u\n",
+                 s->ubc_dev ? s->ubc_dev->parent.qdev.id : "<unknown>",
+                 i, neighbor->neighbor_id, neighbor->neighbor_port_idx);
+        if (ub_inject_remote_cfg_cpl_notify(s, &neighbor->remote_bus_instance_guid,
+                                            NULL) == 0) {
+            neighbor->remote_cfg_notify_sent = true;
+        }
+    }
+}
+
+int ub_inject_remote_cfg_cpl_notify(BusControllerState *s,
+                                    const UbGuid *remote_bi_guid,
+                                    Error **errp)
+{
+    static uint16_t msn_seed = 1;
+    UBPoolNotifyPkt pkt = { 0 };
+    HiMsgCqe cqe = { 0 };
+    uint32_t pi;
+
+    if (!s || !remote_bi_guid) {
+        error_setg(errp, "ub_cfg_cpl_notify: invalid arguments");
+        return -1;
+    }
+    if (!s->msgq.rq_inited || !s->msgq.cq_inited) {
+        qemu_log("ub_cfg_cpl_notify: skip inject before rq/cq init for %s\n",
+                 s->ubc_dev ? s->ubc_dev->parent.qdev.id : "<unknown>");
+        return 1;
+    }
+
+    pkt.header.ta_opcode = TAH_OPCODE_MSG;
+    pkt.header.msgetah.plen = sizeof(pkt.notify);
+    pkt.header.msgetah.type = MSG_REQ;
+    pkt.header.msgetah.msg_code = UB_MSG_CODE_POOL;
+    pkt.header.msgetah.sub_msg_code = UB_CFG_CPL_NOTIFY;
+    pkt.notify.flag = 1;
+    memcpy(pkt.notify.guid, remote_bi_guid, sizeof(pkt.notify.guid));
+    pkt.notify.eid[0] = ub_remote_cluster_eid(remote_bi_guid);
+
+    pi = fill_rq(s, &pkt, sizeof(pkt));
+    if (pi == UINT32_MAX) {
+        error_setg(errp, "ub_cfg_cpl_notify: fill_rq failed");
+        return -1;
+    }
+
+    cqe.task_type = PROTOCOL_MSG;
+    cqe.type = MSG_REQ;
+    cqe.msg_code = UB_MSG_CODE_POOL;
+    cqe.sub_msg_code = UB_CFG_CPL_NOTIFY;
+    cqe.p_len = sizeof(pkt);
+    cqe.msn = msn_seed++;
+    cqe.rq_pi = pi;
+    cqe.status = CQE_SUCCESS;
+    if (fill_cq(s, &cqe) == UINT32_MAX) {
+        error_setg(errp, "ub_cfg_cpl_notify: fill_cq failed");
+        return -1;
+    }
+
+    qemu_log("ub_cfg_cpl_notify: injected remote bus instance guid for %s eid=%#x\n",
+             s->ubc_dev ? s->ubc_dev->parent.qdev.id : "<unknown>",
+             pkt.notify.eid[0]);
+    return 0;
+}
 
 static void handle_msg_pool(void *opaque, HiMsgSqe *sqe, void *payload)
 {
@@ -411,6 +524,7 @@ void msgq_cq_init(void *opaque)
     s->msgq.cq_base_addr_gpa = cq_base_addr_gpa;
     s->msgq.cq_inited = true;
     trace_msgq_cq_init(cq_base_addr_gpa, depth, size);
+    ub_try_inject_remote_cfg_notifies(s);
 }
 
 void msgq_rq_init(void *opaque)
@@ -445,6 +559,7 @@ void msgq_rq_init(void *opaque)
     s->msgq.rq_base_addr_gpa = rq_base_addr_gpa;
     s->msgq.rq_inited = true;
     trace_msgq_rq_init(rq_base_addr_gpa, depth, size);
+    ub_try_inject_remote_cfg_notifies(s);
 }
 
 void msgq_handle_rst(void *opaque)

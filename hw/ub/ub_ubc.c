@@ -81,6 +81,7 @@ static void ub_msgq_reg_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
     /* only support 1 queue */
     switch (addr) {
     case SQ_PI:
+        ub_try_inject_remote_cfg_notifies(s);
         msgq_process_task(s, val);
         break;
     case SQ_ADDR_H:
@@ -164,6 +165,7 @@ static void ub_bus_controller_unrealize(DeviceState *dev)
     BusControllerState *s = BUS_CONTROLLER(dev);
     SysBusDevice *sysdev = SYS_BUS_DEVICE(dev);
     g_free(sysdev->parent_obj.id);
+    ub_fm_controller_unregister(s);
     QLIST_REMOVE(s, node);
     ub_unregister_root_bus(s->bus);
     ub_reg_free(dev);
@@ -577,6 +579,7 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
         qemu_log("ub bus instance process failed\n");
         return;
     }
+    ub_fm_controller_register(ubc);
 }
 
 static Property ub_bus_controller_dev_properties[] = {

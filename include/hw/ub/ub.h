@@ -134,6 +134,9 @@ typedef struct NeighborInfo {
     };
     uint32_t local_port_idx;
     uint32_t neighbor_port_idx;
+    bool remote_bus_instance_guid_valid;
+    bool remote_cfg_notify_sent;
+    UbGuid remote_bus_instance_guid;
 } NeighborInfo;
 
 typedef struct UbPortInfo {
@@ -142,6 +145,25 @@ typedef struct UbPortInfo {
     NeighborInfo *neighbors;
     bool port_info_exist;
 } UbPortInfo;
+
+typedef struct UBRemotePortSnapshot {
+    bool link_up;
+    uint16_t local_port_idx;
+    uint16_t neighbor_port_idx;
+    UbGuid neighbor_guid;
+} UBRemotePortSnapshot;
+
+typedef struct UBRemoteDeviceSnapshot {
+    char device_id[UB_DEV_ID_LEN];
+    UbGuid guid;
+    uint16_t port_num;
+    uint16_t class_code;
+    uint32_t primary_cna;
+    uint32_t eid;
+    uint32_t fm_cna;
+    uint16_t upi;
+    UBRemotePortSnapshot ports[UB_DEV_MAX_NUM_OF_PORT];
+} UBRemoteDeviceSnapshot;
 
 typedef void UBConfigReadFunc(UBDevice *dev, uint64_t offset,
                               uint32_t *val, uint32_t dw_mask);
@@ -282,6 +304,28 @@ int ub_device_set_iommu_device(UBDevice *dev, HostIOMMUDevice *hoid, Error **err
 void ub_device_unset_iommu_device(UBDevice *dev);
 bool ub_device_check_ummu_is_nested(UBDevice *dev);
 UBDevice *ub_find_device_by_id(const char *id);
+int ub_connect_device_ports(UBDevice *local_dev, uint32_t local_port_idx,
+                            UBDevice *neighbor_dev, uint32_t neighbor_port_idx,
+                            Error **errp);
+int ub_connect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
+                                  const char *neighbor_id,
+                                  const UbGuid *neighbor_guid,
+                                  uint32_t neighbor_port_idx,
+                                  Error **errp);
+int ub_disconnect_device_ports(UBDevice *local_dev, uint32_t local_port_idx,
+                               UBDevice *neighbor_dev, uint32_t neighbor_port_idx,
+                               Error **errp);
+int ub_disconnect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
+                                     const char *neighbor_id,
+                                     uint32_t neighbor_port_idx,
+                                     Error **errp);
+int ub_publish_device_snapshot(UBDevice *dev, Error **errp);
+bool ub_load_remote_device_snapshot_by_guid(const UbGuid *guid,
+                                            UBRemoteDeviceSnapshot *snapshot,
+                                            Error **errp);
+bool ub_load_remote_device_snapshot_by_cna(uint32_t cna,
+                                           UBRemoteDeviceSnapshot *snapshot,
+                                           Error **errp);
 void ub_register_ers(UBDevice *dev, uint8_t region_num,
                       MemoryRegion *memory);
 uint32_t ub_interrupt_id(UBDevice *udev);
