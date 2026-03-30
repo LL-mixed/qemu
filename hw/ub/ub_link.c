@@ -284,6 +284,8 @@ static int ub_link_apply_remote_bridge(UBLinkState *s, Error **errp)
         neighbor->remote_bus_instance_guid = remote_state.bus_instance_guid;
         neighbor->remote_bus_instance_guid_valid = true;
         neighbor->remote_cfg_notify_sent = false;
+        neighbor->remote_cfg_notify_attempts = 0;
+        neighbor->remote_cfg_notify_next_retry_ms = 0;
         qemu_log("ub_link: remote bus instance guid captured for %s:%u\n",
                  local->device_id, local->port_idx);
     }

@@ -31,6 +31,10 @@
 #include "hw/ub/ub_cna_mgmt.h"
 #include "hw/ub/ub_common.h"
 #include "hw/ub/hisi/ub_fm.h"
+#include "qemu/timer.h"
+
+#define UB_CFG_CPL_NOTIFY_MAX_ATTEMPTS 64
+#define UB_CFG_CPL_NOTIFY_RETRY_MS 100
 
 static void (*msgq_pool_handlers[])(BusControllerState *s, HiMsgSqe *sqe,
                                     MsgPktHeader *header) = {
@@ -65,11 +69,13 @@ void ub_try_inject_remote_cfg_notifies(BusControllerState *s)
 {
     UBDevice *udev;
     uint32_t i;
+    uint64_t now_ms;
 
     if (!s || !s->ubc_dev || !s->msgq.rq_inited || !s->msgq.cq_inited) {
         return;
     }
 
+    now_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     udev = UB_DEVICE(s->ubc_dev);
     for (i = 0; i < udev->port.port_num; i++) {
         NeighborInfo *neighbor = &udev->port.neighbors[i];
@@ -79,12 +85,31 @@ void ub_try_inject_remote_cfg_notifies(BusControllerState *s)
             neighbor->remote_cfg_notify_sent) {
             continue;
         }
+        if (neighbor->remote_cfg_notify_attempts >=
+            UB_CFG_CPL_NOTIFY_MAX_ATTEMPTS) {
+            qemu_log("ub_cfg_cpl_notify: stop retry after %u attempts for %s port%u -> %s:%u\n",
+                     neighbor->remote_cfg_notify_attempts,
+                     s->ubc_dev ? s->ubc_dev->parent.qdev.id : "<unknown>",
+                     i, neighbor->neighbor_id, neighbor->neighbor_port_idx);
+            neighbor->remote_cfg_notify_sent = true;
+            continue;
+        }
+        if (neighbor->remote_cfg_notify_next_retry_ms &&
+            now_ms < neighbor->remote_cfg_notify_next_retry_ms) {
+            continue;
+        }
         qemu_log("ub_cfg_cpl_notify: retry inject for %s port%u -> %s:%u\n",
                  s->ubc_dev ? s->ubc_dev->parent.qdev.id : "<unknown>",
                  i, neighbor->neighbor_id, neighbor->neighbor_port_idx);
         if (ub_inject_remote_cfg_cpl_notify(s, &neighbor->remote_bus_instance_guid,
                                             NULL) == 0) {
-            neighbor->remote_cfg_notify_sent = true;
+            neighbor->remote_cfg_notify_attempts++;
+            neighbor->remote_cfg_notify_next_retry_ms =
+                now_ms + UB_CFG_CPL_NOTIFY_RETRY_MS;
+            qemu_log("ub_cfg_cpl_notify: queued notify attempt %u for %s port%u\n",
+                     neighbor->remote_cfg_notify_attempts,
+                     s->ubc_dev ? s->ubc_dev->parent.qdev.id : "<unknown>",
+                     i);
         }
     }
 }
@@ -392,7 +417,7 @@ static void handle_task_type_hisi_private(BusControllerState *s, HiMsgSqe *sqe)
     g_free(payload);
 }
 
-void msgq_process_task(void *opaque, uint64_t val)
+bool msgq_process_task(void *opaque, uint64_t val)
 {
     BusControllerState *s = opaque;
     HiMsgSqe *sqe = NULL;
@@ -404,12 +429,12 @@ void msgq_process_task(void *opaque, uint64_t val)
 
     if (!s->msgq.sq_base_addr_gpa) {
         /* not ready */
-        return;
+        return false;
     }
 
     if (ci >= depth || pi >= depth) {
         qemu_log("Invalid arguments: ci=%u pi=%u depth=%u\n", ci, pi, depth);
-        return;
+        return false;
     }
 
     sqe = g_malloc0(sizeof(HiMsgSqe));
@@ -419,13 +444,13 @@ void msgq_process_task(void *opaque, uint64_t val)
                             sqe, sizeof(HiMsgSqe), MEMTXATTRS_MEMORY)) {
             qemu_log("Failed to read sq_base_addr_gpa entry\n");
             g_free(sqe);
-            return;
+            return false;
         }
         if (sqe->msg_code >= (ARRAY_SIZE(msgq_handlers))) {
             qemu_log("invalid msg code %u, array size %lu\n",
                      sqe->msg_code, ARRAY_SIZE(msgq_handlers));
             g_free(sqe);
-            return;
+            return false;
         }
 
         switch (sqe->task_type) {
@@ -446,6 +471,7 @@ void msgq_process_task(void *opaque, uint64_t val)
     }
     ub_set_long(s->msgq_reg + SQ_CI, ci);
     g_free(sqe);
+    return cnt > 0;
 }
 
 void msgq_sq_init(void *opaque)

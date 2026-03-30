@@ -140,8 +140,9 @@ static void ub_msgq_reg_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
                      s->msgq.sq_inited, s->msgq.rq_inited, s->msgq.cq_inited, val);
             break;
         }
-        ub_try_inject_remote_cfg_notifies(s);
-        msgq_process_task(s, val);
+        if (msgq_process_task(s, val)) {
+            ub_try_inject_remote_cfg_notifies(s);
+        }
         break;
     case SQ_ADDR_H:
         msgq_sq_init(s);

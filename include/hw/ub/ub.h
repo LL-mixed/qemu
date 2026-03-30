@@ -137,6 +137,8 @@ typedef struct NeighborInfo {
     uint32_t neighbor_port_idx;
     bool remote_bus_instance_guid_valid;
     bool remote_cfg_notify_sent;
+    uint8_t remote_cfg_notify_attempts;
+    uint64_t remote_cfg_notify_next_retry_ms;
     UbGuid remote_bus_instance_guid;
 } NeighborInfo;
 

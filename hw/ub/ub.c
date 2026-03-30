@@ -1671,6 +1671,8 @@ int ub_connect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
     local->neighbor_port_idx = neighbor_port_idx;
     local->remote_bus_instance_guid_valid = false;
     local->remote_cfg_notify_sent = false;
+    local->remote_cfg_notify_attempts = 0;
+    local->remote_cfg_notify_next_retry_ms = 0;
     dev->port.port_info_exist = true;
     ub_config_set_port_basic_remote(local, neighbor_guid, dev);
     ub_device_get_str_from_guid((UbGuid *)neighbor_guid, guid_str,
