@@ -18,6 +18,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
+#include "hw/irq.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
 #include "hw/arm/virt.h"
@@ -34,10 +35,33 @@
 #include "migration/vmstate.h"
 #include "hw/ub/ubus_instance.h"
 
+static uint32_t ub_msgq_cq_int_ro(BusControllerState *s)
+{
+    uint32_t status = ub_get_long(s->msgq_reg + CQ_INT_STATUS) & 0x1;
+    uint32_t mask = ub_get_long(s->msgq_reg + CQ_INT_MASK) & 0x1;
+
+    return status & ~mask;
+}
+
+static void ub_msgq_update_irq(BusControllerState *s)
+{
+    uint32_t ro = ub_msgq_cq_int_ro(s);
+    qemu_log("ub_msgq_update_irq %s ro=%u mask=%u status=%u\n",
+             s->ubc_dev ? s->ubc_dev->parent.qdev.id : "<unknown>",
+             ro,
+             ub_get_long(s->msgq_reg + CQ_INT_MASK) & 0x1,
+             ub_get_long(s->msgq_reg + CQ_INT_STATUS) & 0x1);
+    qemu_set_irq(s->irq, ro ? 1 : 0);
+}
+
 static uint64_t ub_msgq_reg_read(void *opaque, hwaddr addr, unsigned len)
 {
     BusControllerState *s = opaque;
     uint64_t val;
+
+    if (addr == CQ_INT_RO) {
+        return ub_msgq_cq_int_ro(s);
+    }
 
     switch (len) {
     case BYTE_SIZE:
@@ -62,25 +86,60 @@ static void ub_msgq_reg_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
 {
     BusControllerState *s = opaque;
 
+    if (len != DWORD_SIZE) {
+        switch (len) {
+        case BYTE_SIZE:
+            ub_set_byte(s->msgq_reg + addr, val);
+            break;
+        case WORD_SIZE:
+            ub_set_word(s->msgq_reg + addr, val);
+            break;
+        default:
+            qemu_log("invalid argument len 0x%x val 0x%" PRIx64 "\n", len, val);
+            return;
+        }
+        return;
+    }
+
+    switch (addr) {
+    case CQ_INT_MASK:
+        ub_set_long(s->msgq_reg + addr, val & 0x1);
+        ub_msgq_update_irq(s);
+        return;
+    case CQ_INT_STATUS:
+        if (val & 0x1) {
+            ub_set_long(s->msgq_reg + addr, 0);
+        }
+        ub_msgq_update_irq(s);
+        return;
+    case CQ_INT_SET:
+        if (val & 0x1) {
+            ub_set_long(s->msgq_reg + CQ_INT_STATUS, 0x1);
+        }
+        ub_msgq_update_irq(s);
+        return;
+    default:
+        break;
+    }
+
     switch (len) {
-    case BYTE_SIZE:
-        ub_set_byte(s->msgq_reg + addr, val);
-        break;
-    case WORD_SIZE:
-        ub_set_word(s->msgq_reg + addr, val);
-        break;
     case DWORD_SIZE:
         ub_set_long(s->msgq_reg + addr, val);
         break;
     default:
         /* As length is under guest control, handle illegal values. */
-        qemu_log("invalid argument len 0x%x val 0x%lx\n", len, val);
+        qemu_log("invalid argument len 0x%x val 0x%" PRIx64 "\n", len, val);
         return;
     }
 
     /* only support 1 queue */
     switch (addr) {
     case SQ_PI:
+        if (!s->msgq.sq_inited || !s->msgq.rq_inited || !s->msgq.cq_inited) {
+            qemu_log("skip SQ_PI processing before msgq fully initialized: sq=%d rq=%d cq=%d pi=%" PRIu64 "\n",
+                     s->msgq.sq_inited, s->msgq.rq_inited, s->msgq.cq_inited, val);
+            break;
+        }
         ub_try_inject_remote_cfg_notifies(s);
         msgq_process_task(s, val);
         break;
@@ -145,6 +204,7 @@ static void ub_bus_controller_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->msgq_reg_mem, OBJECT(s), &ub_msgq_reg_ops,
                           s, TYPE_BUS_CONTROLLER, s->msgq_reg_size);
     sysbus_init_mmio(sysdev, &s->msgq_reg_mem);
+    sysbus_init_irq(sysdev, &s->irq);
     /* for fm msgq reg */
     memory_region_init_io(&s->fm_msgq_reg_mem, OBJECT(s), &ub_fm_msgq_reg_ops,
                           s, TYPE_BUS_CONTROLLER, s->fm_msgq_reg_size);

@@ -16,6 +16,7 @@
  */
 #include "qemu/osdep.h"
 #include "hw/arm/virt.h"
+#include "hw/irq.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "hw/ub/ub_common.h"
@@ -88,6 +89,12 @@ uint32_t fill_cq(BusControllerState *s, HiMsgCqe *cqe)
     dma_memory_write(&address_space_memory, dst_cqe, cqe,
                      sizeof(HiMsgCqe), MEMTXATTRS_MEMORY);
     ub_set_long(s->msgq_reg + CQ_PI, ++pi % depth);
+    ub_set_long(s->msgq_reg + CQ_INT_STATUS, 0x1);
+    qemu_log("fill_cq %s task=%u type=%u msg=%u sub=%u rq_pi=%u cq_pi=%u\n",
+             s->ubc_dev ? s->ubc_dev->parent.qdev.id : "<unknown>",
+             cqe->task_type, cqe->type, cqe->msg_code, cqe->sub_msg_code,
+             cqe->rq_pi, pi);
+    qemu_set_irq(s->irq, !(ub_get_long(s->msgq_reg + CQ_INT_MASK) & 0x1));
 
     return pi;
 }

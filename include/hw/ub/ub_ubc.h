@@ -42,6 +42,7 @@ OBJECT_DECLARE_TYPE(BusControllerState, BusControllerClass, BUS_CONTROLLER)
 typedef struct BusControllerState BusControllerState;
 struct BusControllerState {
     SysBusDevice busdev;
+    qemu_irq irq;
 
     MemoryRegion msgq_reg_mem; /* ubc msgq */
     uint32_t msgq_reg_size;

@@ -39,6 +39,13 @@ static void enum_set_cna_config_space(uint8_t opcode, EnumCnaCfgReq *cna_cfg_req
         return;
     }
 
+    /*
+     * The compact network header only transports 16-bit CNA values. Keep CNA
+     * writes canonicalized to that width so later cfg/message requests route
+     * back to the same target instead of a silently truncated alias.
+     */
+    cna_cfg_req->cna &= 0x0000ffffU;
+
     if (opcode == UB_ENUM_CNA_MGMT_PORT) {
         uint16_t port_idx = cna_cfg_req->port_idx;
         uint64_t offset;

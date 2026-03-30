@@ -1867,6 +1867,8 @@ static void create_ub(VirtMachineState *vms)
     qdev_prop_set_uint32(ubc, "ub-msgq-reg-size", UBC_MSGQ_REG_SIZE);
     qdev_prop_set_uint32(ubc, "ub-fm-msgq-reg-size", FM_MSGQ_REG_SIZE);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(ubc), &error_fatal);
+    sysbus_connect_irq(SYS_BUS_DEVICE(ubc), 0,
+                       qdev_get_gpio_in(vms->gic, vms->irqmap[VIRT_PLATFORM_BUS]));
 
     /* in ub_bus_controller_realize will call sysbus_init_mmio init memory_region in order,
      * 0: msgq_reg_mem

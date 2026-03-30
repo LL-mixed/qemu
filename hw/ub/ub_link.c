@@ -146,6 +146,7 @@ static int ub_link_read_remote_endpoint(const UBLinkEndpointDesc *ep,
     g_autofree char *path = NULL;
     g_autofree char *guid_str = NULL;
     GError *gerr = NULL;
+    unsigned int attempt;
 
     if (!ep || !state) {
         error_setg(errp, "ub_link: invalid remote endpoint read arguments");
@@ -153,8 +154,18 @@ static int ub_link_read_remote_endpoint(const UBLinkEndpointDesc *ep,
     }
 
     path = ub_link_endpoint_state_path(ep);
+    for (attempt = 0; attempt < 20; attempt++) {
+        if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+            break;
+        }
+        if (attempt == 0) {
+            qemu_log("ub_link: remote endpoint file not found for %s:%u (%s), retrying\n",
+                     ep->device_id, ep->port_idx, path);
+        }
+        g_usleep(100 * 1000);
+    }
     if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
-        qemu_log("ub_link: remote endpoint file not found for %s:%u (%s)\n",
+        qemu_log("ub_link: remote endpoint still missing for %s:%u (%s)\n",
                  ep->device_id, ep->port_idx, path);
         return 1;
     }
@@ -200,35 +211,6 @@ static int ub_link_read_remote_endpoint(const UBLinkEndpointDesc *ep,
     return 0;
 }
 
-static int ub_link_wait_remote_endpoint(const UBLinkEndpointDesc *ep,
-                                        UBLinkPublishedState *state,
-                                        Error **errp)
-{
-    const int retry_sleep_us = 100 * 1000;
-    const int max_retries = 25;
-    int ret;
-    int attempt;
-
-    ret = ub_link_read_remote_endpoint(ep, state, errp);
-    if (ret <= 0) {
-        return ret;
-    }
-
-    for (attempt = 0; attempt < max_retries; attempt++) {
-        g_usleep(retry_sleep_us);
-        ret = ub_link_read_remote_endpoint(ep, state, errp);
-        if (ret <= 0) {
-            if (ret == 0) {
-                qemu_log("ub_link: resolved remote endpoint after %d retries for %s:%u\n",
-                         attempt + 1, ep->device_id, ep->port_idx);
-            }
-            return ret;
-        }
-    }
-
-    return ret;
-}
-
 static void ub_link_published_state_clear(UBLinkPublishedState *state)
 {
     if (!state) {
@@ -264,7 +246,7 @@ static int ub_link_apply_remote_bridge(UBLinkState *s, Error **errp)
         return -1;
     }
 
-    ret = ub_link_wait_remote_endpoint(remote, &remote_state, errp);
+    ret = ub_link_read_remote_endpoint(remote, &remote_state, errp);
     if (ret < 0) {
         return -1;
     }
@@ -293,22 +275,48 @@ static int ub_link_apply_remote_bridge(UBLinkState *s, Error **errp)
         ub_link_published_state_clear(&remote_state);
         return -1;
     }
+    qemu_log("ub_link: remote cfg path after connect %s:%u <-> %s:%u\n",
+             local->device_id, local->port_idx,
+             remote->device_id, remote->port_idx);
     if (remote_state.has_bus_instance_guid) {
         NeighborInfo *neighbor = &local->device->port.neighbors[local->port_idx];
 
         neighbor->remote_bus_instance_guid = remote_state.bus_instance_guid;
         neighbor->remote_bus_instance_guid_valid = true;
         neighbor->remote_cfg_notify_sent = false;
+        qemu_log("ub_link: remote bus instance guid captured for %s:%u\n",
+                 local->device_id, local->port_idx);
     }
-    if (BUS_CONTROLLER_DEV(local->device) && remote_state.has_bus_instance_guid) {
+    if (object_dynamic_cast(OBJECT(local->device), TYPE_BUS_CONTROLLER_DEV)) {
+        UBRemoteDeviceSnapshot remote_snapshot = { 0 };
+
+        qemu_log("ub_link: remote snapshot load start for %s:%u\n",
+                 local->device_id, local->port_idx);
+        if (ub_load_remote_device_snapshot_by_guid(&remote_state.guid,
+                                                   &remote_snapshot, NULL)) {
+            ub_set_cluster_peer_cfg(local->device, remote_snapshot.eid,
+                                    remote_snapshot.upi,
+                                    remote_snapshot.fm_cna);
+            qemu_log("ub_link: remote snapshot load done for %s:%u eid=%u upi=%u fm_cna=%#x\n",
+                     local->device_id, local->port_idx,
+                     remote_snapshot.eid, remote_snapshot.upi,
+                     remote_snapshot.fm_cna);
+        }
+    }
+    if (object_dynamic_cast(OBJECT(local->device), TYPE_BUS_CONTROLLER_DEV) &&
+        remote_state.has_bus_instance_guid) {
         BusControllerState *ubc = container_of_ubbus(
             UB_BUS(qdev_get_parent_bus(DEVICE(local->device))));
 
+        qemu_log("ub_link: remote cfg notify start for %s:%u\n",
+                 local->device_id, local->port_idx);
         if (ub_inject_remote_cfg_cpl_notify(ubc, &remote_state.bus_instance_guid,
                                             errp) < 0) {
             ub_link_published_state_clear(&remote_state);
             return -1;
         }
+        qemu_log("ub_link: remote cfg notify done for %s:%u\n",
+                 local->device_id, local->port_idx);
     }
 
     s->remote_applied = true;

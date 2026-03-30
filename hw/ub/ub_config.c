@@ -242,6 +242,15 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
     payload = (CfgMsgPldReq *)header->payload;
     cfg_offset = (uint64_t)payload->req_addr * DWORD_SIZE;
     entity = payload->entity_idx;
+    if (cfg_offset == UB_CFG0_EID_0_OFFSET ||
+        cfg_offset == UB_CFG0_UPI_OFFSET ||
+        cfg_offset == UB_CFG0_FM_CNA_OFFSET ||
+        cfg_offset == UB_CFG0_BASIC_NA_INFO_START) {
+        qemu_log("ub_cfg_rw enter local=%u dcna=%#x offset=%#" PRIx64
+                 " sub=%u entity=%u be=%#x write=%#x\n",
+                 local, dcna, cfg_offset, header->msgetah.sub_msg_code,
+                 entity, payload->byte_enable, payload->write_data);
+    }
     memset(&rsp_pkt, 0, sizeof(CfgMsgPkt));
     memcpy(&rsp_pkt.header, header, sizeof(MsgPktHeader));
 
@@ -289,15 +298,31 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
             switch (cfg_offset) {
             case UB_CFG0_BASIC_NA_INFO_START:
                 rsp_pkt.pld.rsp.read_data = remote_snapshot.primary_cna;
+                qemu_log("ub_cfg_rw snapshot read dev=%s dcna=%#x offset=%#" PRIx64
+                         " primary_cna=%#x\n",
+                         remote_snapshot.device_id, dcna, cfg_offset,
+                         remote_snapshot.primary_cna);
                 break;
             case UB_CFG0_EID_0_OFFSET:
                 rsp_pkt.pld.rsp.read_data = remote_snapshot.eid;
+                qemu_log("ub_cfg_rw snapshot read dev=%s dcna=%#x offset=%#" PRIx64
+                         " eid=%#x\n",
+                         remote_snapshot.device_id, dcna, cfg_offset,
+                         remote_snapshot.eid);
                 break;
             case UB_CFG0_UPI_OFFSET:
                 rsp_pkt.pld.rsp.read_data = remote_snapshot.upi;
+                qemu_log("ub_cfg_rw snapshot read dev=%s dcna=%#x offset=%#" PRIx64
+                         " upi=%#x\n",
+                         remote_snapshot.device_id, dcna, cfg_offset,
+                         remote_snapshot.upi);
                 break;
             case UB_CFG0_FM_CNA_OFFSET:
                 rsp_pkt.pld.rsp.read_data = remote_snapshot.fm_cna;
+                qemu_log("ub_cfg_rw snapshot read dev=%s dcna=%#x offset=%#" PRIx64
+                         " fm_cna=%#x\n",
+                         remote_snapshot.device_id, dcna, cfg_offset,
+                         remote_snapshot.fm_cna);
                 break;
             default:
                 rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_INVALID_ADDR;
@@ -305,6 +330,15 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
             }
         } else if (ub_dev->config_read) {
             ub_dev->config_read(ub_dev, cfg_offset, &rsp_pkt.pld.rsp.read_data, dw_mask);
+            if (cfg_offset == UB_CFG0_EID_0_OFFSET ||
+                cfg_offset == UB_CFG0_UPI_OFFSET ||
+                cfg_offset == UB_CFG0_FM_CNA_OFFSET ||
+                cfg_offset == UB_CFG0_BASIC_NA_INFO_START) {
+                qemu_log("ub_cfg_rw local read dev=%s local=%u dcna=%#x offset=%#" PRIx64
+                         " data=%#x\n",
+                         ub_dev->qdev.id ? ub_dev->qdev.id : "<unknown>",
+                         local, dcna, cfg_offset, rsp_pkt.pld.rsp.read_data);
+            }
         } else {
             qemu_log("dev: %s read config func NULL\n", ub_dev->qdev.id);
         }
@@ -346,6 +380,9 @@ void handle_msg_cfg(void *opaque, HiMsgSqe *sqe, void *payload)
                  msgetah->msg_code, msgetah->sub_msg_code);
         return;
     }
+
+    qemu_log("handle_msg_cfg local=%u msn=%u sub=%u code=%u\n",
+             sqe->local, sqe->msn, msgetah->sub_msg_code, msgetah->code);
 
     ub_cfg_rw(s, sqe, header);
 }

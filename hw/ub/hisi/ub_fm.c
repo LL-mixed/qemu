@@ -548,6 +548,58 @@ static bool ub_fm_has_pending_links(void)
 
 static void ub_fm_schedule_pending_refresh(bool needed);
 
+static void ub_fm_collect_local_device(GPtrArray *devices, UBDevice *dev)
+{
+    guint i;
+
+    if (!devices || !dev) {
+        return;
+    }
+
+    for (i = 0; i < devices->len; i++) {
+        if (g_ptr_array_index(devices, i) == dev) {
+            return;
+        }
+    }
+
+    g_ptr_array_add(devices, dev);
+}
+
+static void ub_fm_reconcile_local_fabric_config(void)
+{
+    g_autoptr(GPtrArray) devices = g_ptr_array_new();
+    guint i;
+
+    if (!ub_fm_active_links) {
+        return;
+    }
+
+    for (i = 0; i < ub_fm_active_links->len; i++) {
+        UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+
+        if (!link->runtime) {
+            continue;
+        }
+        ub_fm_collect_local_device(devices, link->runtime->a.device);
+        ub_fm_collect_local_device(devices, link->runtime->b.device);
+    }
+
+    for (i = 0; i < devices->len; i++) {
+        UBDevice *dev = g_ptr_array_index(devices, i);
+
+        ub_set_device_cna(dev, ub_default_cna_for_device(dev));
+        if (!ub_device_has_remote_only_neighbor(dev)) {
+            ub_program_route_table(dev);
+        } else {
+            qemu_log("ub_fm: defer route program for %s while remote-only neighbors exist\n",
+                     dev->qdev.id);
+        }
+        (void)ub_publish_device_snapshot(dev, NULL);
+        qemu_log("ub_fm: reconciled local fabric config for %s cna=%#x ports=%u\n",
+                 dev->qdev.id, dev->cna, dev->port.port_num);
+    }
+}
+
 static void ub_fm_pending_refresh_cb(void *opaque)
 {
     Error *local_err = NULL;
@@ -568,7 +620,7 @@ static void ub_fm_schedule_pending_refresh(bool needed)
 
     if (needed) {
         timer_mod(ub_fm_pending_refresh_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 500);
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
     } else {
         timer_del(ub_fm_pending_refresh_timer);
     }
@@ -926,6 +978,7 @@ int ub_fm_apply_declared_topology(Error **errp)
             }
         }
     }
+    ub_fm_reconcile_local_fabric_config();
     ub_fm_schedule_pending_refresh(has_pending || ub_fm_has_pending_links());
     return 0;
 }

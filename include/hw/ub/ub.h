@@ -132,6 +132,7 @@ typedef struct NeighborInfo {
         char neighbor_id[UB_DEV_ID_LEN];
         UBDevice *neighbor_dev;
     };
+    bool is_remote_neighbor;
     uint32_t local_port_idx;
     uint32_t neighbor_port_idx;
     bool remote_bus_instance_guid_valid;
@@ -326,12 +327,18 @@ bool ub_load_remote_device_snapshot_by_guid(const UbGuid *guid,
 bool ub_load_remote_device_snapshot_by_cna(uint32_t cna,
                                            UBRemoteDeviceSnapshot *snapshot,
                                            Error **errp);
+uint32_t ub_default_cna_for_device(UBDevice *dev);
+void ub_set_device_cna(UBDevice *dev, uint32_t cna);
+bool ub_device_has_remote_only_neighbor(UBDevice *dev);
+void ub_program_route_table(UBDevice *dev);
 void ub_register_ers(UBDevice *dev, uint8_t region_num,
                       MemoryRegion *memory);
 uint32_t ub_interrupt_id(UBDevice *udev);
 void ub_setup_iommu(UBBus *bus, const UBIOMMUOps *ops, void *opaque);
 uint32_t ub_dev_get_token_id(UBDevice *udev);
 uint32_t ub_dev_get_ueid(UBDevice *udev);
+void ub_set_cluster_peer_cfg(UBDevice *dev, uint32_t eid, uint16_t upi,
+                             uint32_t fm_cna);
 enum UbDeviceType ub_dev_get_type(UBDevice *udev);
 int ub_dev_dump_config(const char *id, uint64_t offset, uint64_t len,
                        char *buff, int buff_size);

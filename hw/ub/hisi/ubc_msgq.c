@@ -65,16 +65,6 @@ void ub_try_inject_remote_cfg_notifies(BusControllerState *s)
 {
     UBDevice *udev;
     uint32_t i;
-    Error *local_err = NULL;
-
-    /*
-     * Cross-instance links may start as pending if the peer endpoint file is
-     * published after this controller realizes. Reconcile again from a hot
-     * path that guest bring-up is guaranteed to hit.
-     */
-    if (ub_fm_refresh_topology(&local_err) < 0) {
-        error_report_err(local_err);
-    }
 
     if (!s || !s->ubc_dev || !s->msgq.rq_inited || !s->msgq.cq_inited) {
         return;
@@ -524,7 +514,6 @@ void msgq_cq_init(void *opaque)
     s->msgq.cq_base_addr_gpa = cq_base_addr_gpa;
     s->msgq.cq_inited = true;
     trace_msgq_cq_init(cq_base_addr_gpa, depth, size);
-    ub_try_inject_remote_cfg_notifies(s);
 }
 
 void msgq_rq_init(void *opaque)
@@ -559,7 +548,6 @@ void msgq_rq_init(void *opaque)
     s->msgq.rq_base_addr_gpa = rq_base_addr_gpa;
     s->msgq.rq_inited = true;
     trace_msgq_rq_init(rq_base_addr_gpa, depth, size);
-    ub_try_inject_remote_cfg_notifies(s);
 }
 
 void msgq_handle_rst(void *opaque)

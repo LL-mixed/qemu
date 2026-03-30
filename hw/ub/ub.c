@@ -29,6 +29,7 @@
 #include "hw/ub/ub_ubc.h"
 #include "hw/ub/ub_ummu.h"
 #include "hw/ub/ub_usi.h"
+#include "hw/ub/ub_enum.h"
 #include "hw/ub/ub_acpi.h"
 #include "hw/vfio/ub.h"
 #include "ub_ummu_internal.h"
@@ -57,6 +58,44 @@ static const char *ub_shared_dir(void)
     const char *dir = g_getenv("UB_FM_SHARED_DIR");
 
     return (dir && dir[0]) ? dir : "/tmp/ub-qemu-links";
+}
+
+static uint32_t ub_cluster_eid_from_bus_instance_guid(const UbGuid *guid)
+{
+    uint32_t span = UB_SUPPORT_MAX_EID - 0x10000;
+    uint32_t offset;
+
+    if (!guid) {
+        return 0;
+    }
+    offset = span ? (uint32_t)(guid->seq_num % span) : 0;
+    return 0x10000 + offset;
+}
+
+static void ub_seed_local_cluster_identity(UBDevice *dev)
+{
+    Object *obj;
+    BusControllerDev *ubc_dev;
+    uint32_t eid;
+
+    if (!dev) {
+        return;
+    }
+    obj = object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV);
+    if (!obj) {
+        return;
+    }
+
+    ubc_dev = BUS_CONTROLLER_DEV(obj);
+    eid = dev->bus_instance_eid;
+    if (eid == UINT32_MAX || eid == 0) {
+        eid = ub_cluster_eid_from_bus_instance_guid(&ubc_dev->bus_instance_guid);
+    }
+    if (!eid) {
+        return;
+    }
+
+    ub_set_cluster_peer_cfg(dev, eid, UB_CP_UPI, dev->cna);
 }
 
 static char *ub_snapshot_guid_path(const UbGuid *guid)
@@ -127,6 +166,8 @@ int ub_publish_device_snapshot(UBDevice *dev, Error **errp)
         return -1;
     }
 
+    ub_seed_local_cluster_identity(dev);
+
     keyfile = g_key_file_new();
     path = ub_snapshot_guid_path(&dev->guid);
     tmp_path = g_strdup_printf("%s.tmp-%d", path, (int)getpid());
@@ -161,6 +202,11 @@ int ub_publish_device_snapshot(UBDevice *dev, Error **errp)
         ub_device_get_str_from_guid(&port.neighbor_guid, neighbor_guid_str,
                                     UB_DEV_GUID_STRING_LENGTH + 1);
         g_key_file_set_string(keyfile, section, "neighbor_guid", neighbor_guid_str);
+        if (object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV) && i == 1) {
+            qemu_log("ub snapshot %s:%u link_up=%u neighbor_port_idx=%u neighbor_guid=%s\n",
+                     dev->qdev.id, i, port.link_up ? 1 : 0,
+                     port.neighbor_port_idx, neighbor_guid_str);
+        }
     }
 
     data = g_key_file_to_data(keyfile, &data_len, &gerr);
@@ -447,6 +493,25 @@ static void ub_dev_clear_cfg1(UBDevice *dev)
     cfg1_basic->dev_rs_access_en = 0;
 }
 
+void ub_set_cluster_peer_cfg(UBDevice *dev, uint32_t eid, uint16_t upi,
+                             uint32_t fm_cna)
+{
+    uint64_t offset;
+    UbCfg0Basic *cfg0_basic;
+
+    if (!dev) {
+        return;
+    }
+
+    offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_BASIC_START, true);
+    cfg0_basic = (UbCfg0Basic *)(dev->config + offset);
+    cfg0_basic->eid.dw0 = eid & 0x000fffffU;
+    cfg0_basic->fm_eid.dw0 = eid & 0x000fffffU;
+    cfg0_basic->upi = upi & 0x7fffU;
+    cfg0_basic->fm_cna = fm_cna & 0x00ffffffU;
+    cfg0_basic->ueid_low = eid & 0x000fffffU;
+}
+
 static void ub_reset_regions(UBDevice *dev)
 {
     UbCfg1Basic *cfg1_basic;
@@ -570,35 +635,159 @@ static void ub_config_set_guid(UBDevice *ub_dev)
     memcpy(ub_config_guid_ptr, &ub_dev->guid, sizeof(UbGuid));
 }
 
-static uint32_t ub_default_cna_for_device(UBDevice *dev)
+uint32_t ub_default_cna_for_device(UBDevice *dev)
 {
     uint32_t cna;
 
     /*
-     * Keep CNA stable and non-zero across restarts for a given node/device
-     * while staying within the 24-bit CNA field.
+     * The control-plane compact network header only carries 16-bit SCNA/DCNA.
+     * Keep the canonical allocator within that transport-visible width so
+     * synchronous cfg/message routing does not silently truncate the target CNA.
      */
-    cna = ((uint32_t)(dev->guid.seq_num & 0x000fffffU) << 4) |
+    cna = ((uint32_t)(dev->guid.seq_num & 0x00000fffU) << 4) |
           (dev->guid.type & 0x0fU);
-    cna &= 0x00ffffffU;
+    cna &= 0x0000ffffU;
     if (!cna) {
         cna = 1;
     }
     return cna;
 }
 
-static void ub_config_seed_net_addr_info(UBDevice *ub_dev)
+void ub_set_device_cna(UBDevice *dev, uint32_t cna)
 {
     UbCfg0Basic *cfg0_basic;
     uint64_t emulated_offset;
+    uint32_t i;
 
+    if (!dev) {
+        return;
+    }
+
+    cna &= 0x00ffffffU;
+    if (!cna) {
+        cna = 1;
+    }
+
+    dev->cna = cna;
+    emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_BASIC_START, true);
+    cfg0_basic = (UbCfg0Basic *)(dev->config + emulated_offset);
+    cfg0_basic->net_addr_info.primary_cna = cna;
+
+    for (i = 0; i < dev->port.port_num; i++) {
+        uint64_t port_offset = ub_cfg_offset_to_emulated_offset(UB_PORT_SLICE_START +
+                                                                i * UB_PORT_SZ, true);
+        ConfigPortBasic *port_basic = (ConfigPortBasic *)(dev->config + port_offset);
+
+        port_basic->port_cna = cna;
+    }
+}
+
+static uint32_t ub_route_entry_for_port(UBDevice *dev, uint32_t port_idx)
+{
+    NeighborInfo *info;
+    uint32_t remote_cna = 0;
+
+    if (!dev || port_idx >= dev->port.port_num) {
+        return 0;
+    }
+
+    info = &dev->port.neighbors[port_idx];
+    if (!info->neighbor_dev && !info->is_remote_neighbor) {
+        return 0;
+    }
+
+    if (info->neighbor_dev) {
+        remote_cna = info->neighbor_dev->cna;
+    } else if (info->is_remote_neighbor) {
+        qemu_log("ub route entry %s:%u keep remote entry conservative neighbor_id=%s neighbor_port_idx=%u\n",
+                 dev->qdev.id, port_idx, info->neighbor_id, info->neighbor_port_idx);
+        remote_cna = 0;
+    }
+
+    return ((info->neighbor_port_idx & 0xffU) << 24) |
+           (remote_cna & 0x00ffffffU);
+}
+
+bool ub_device_has_remote_only_neighbor(UBDevice *dev)
+{
+    uint32_t i;
+
+    if (!dev) {
+        return false;
+    }
+
+    for (i = 0; i < dev->port.port_num; i++) {
+        NeighborInfo *info = &dev->port.neighbors[i];
+
+        if (info->is_remote_neighbor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ub_program_route_table(UBDevice *dev)
+{
+    UbRouteTable *route_table;
+    uint64_t emulated_offset;
+    uint32_t port_num;
+    uint32_t entry_capacity;
+    uint32_t entry_num;
+    uint32_t i;
+
+    if (!dev) {
+        return;
+    }
+
+    qemu_log("ub route table start %s port_num=%u cna=%#x\n",
+             dev->qdev.id, dev->port.port_num, dev->cna);
+
+    emulated_offset = ub_cfg_offset_to_emulated_offset(UB_ROUTE_TABLE_START, true);
+    route_table = (UbRouteTable *)(dev->config + emulated_offset);
+    port_num = MAX(dev->port.port_num, 1);
+    entry_capacity = (UB_CFG_SLICE_SIZE - sizeof(*route_table)) /
+                     sizeof(route_table->entry[0]);
+    entry_num = MIN(port_num * 2 + 1, entry_capacity);
+
+    route_table->header.slice_version = UB_SLICE_VERSION;
+    route_table->header.slice_used_size = sizeof(*route_table) / DWORD_SIZE + entry_num;
+    route_table->entry_num = entry_num;
+    route_table->ers = 1;
+    route_table->er_en = 1;
+    memset(route_table->entry, 0, entry_capacity * sizeof(route_table->entry[0]));
+    route_table->entry[0] = dev->cna & 0x00ffffffU;
+
+    for (i = 0; i < dev->port.port_num; i++) {
+        uint32_t local_entry_idx = 1 + i * 2;
+        uint32_t remote_entry_idx = local_entry_idx + 1;
+
+        if (local_entry_idx >= entry_num) {
+            break;
+        }
+        route_table->entry[local_entry_idx] =
+            ((i & 0xffU) << 24) | (dev->cna & 0x00ffffffU);
+        if (remote_entry_idx < entry_num) {
+            NeighborInfo *info = &dev->port.neighbors[i];
+
+            if (info->is_remote_neighbor) {
+                qemu_log("ub route table %s skip remote-only entry for port%u neighbor=%s\n",
+                         dev->qdev.id, i, info->neighbor_id);
+                route_table->entry[remote_entry_idx] = 0;
+            } else {
+                route_table->entry[remote_entry_idx] = ub_route_entry_for_port(dev, i);
+            }
+        }
+    }
+
+    qemu_log("ub route table done %s entry_num=%u\n", dev->qdev.id, entry_num);
+}
+
+static void ub_config_seed_net_addr_info(UBDevice *ub_dev)
+{
     if (!ub_dev->cna) {
         ub_dev->cna = ub_default_cna_for_device(ub_dev);
     }
-
-    emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_BASIC_START, true);
-    cfg0_basic = (UbCfg0Basic *)(ub_dev->config + emulated_offset);
-    cfg0_basic->net_addr_info.primary_cna = ub_dev->cna & 0x00ffffffU;
+    ub_set_device_cna(ub_dev, ub_dev->cna);
 }
 
 static void ub_init_wmask(UBDevice *ub_dev)
@@ -1223,6 +1412,14 @@ static void ub_config_set_port_basic(NeighborInfo *info, UBDevice *dev)
     port_basic->port_reset = 0;
     port_basic_raw[UB_PORT_PHYSICAL_PORT_LINK_STATUS] = 0x1;
 
+    if (object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV) && port_idx == 1) {
+        qemu_log("ub port basic local set %s:%u -> %s:%u link_up=1 boundary=%u\n",
+                 dev->qdev.id, port_idx,
+                 info->neighbor_dev ? info->neighbor_dev->qdev.id : "<null>",
+                 info->neighbor_port_idx,
+                 port_basic->port_info.enum_boundary);
+    }
+
     /* set wmask */
     port_basic_wmask->port_cna = ~0;
     port_basic_w1cmask->port_reset = ~0;
@@ -1251,7 +1448,7 @@ static void ub_config_set_port_basic_remote(const NeighborInfo *info,
     port_basic->header.slice_used_size = UB_PORT_BASIC_SLICE_USED_SIZE;
     port_basic->port_info.port_type = 0;
     port_basic->port_info.port_idx = port_idx & UINT16_MASK;
-    if (BUS_CONTROLLER_DEV(dev)) {
+    if (object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV)) {
         port_basic->port_info.enum_boundary = 1;
     }
     port_basic->neighbor_port_info.neighbor_port_idx = info->neighbor_port_idx & UINT16_MASK;
@@ -1261,6 +1458,14 @@ static void ub_config_set_port_basic_remote(const NeighborInfo *info,
     port_basic->port_cna = dev->cna & 0x00ffffffU;
     port_basic->port_reset = 0;
     port_basic_raw[UB_PORT_PHYSICAL_PORT_LINK_STATUS] = 0x1;
+
+    if (object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV) && port_idx == 1) {
+        qemu_log("ub port basic remote set %s:%u -> %s:%u link_up=1 boundary=%u\n",
+                 dev->qdev.id, port_idx,
+                 info->neighbor_id[0] ? info->neighbor_id : "<none>",
+                 info->neighbor_port_idx,
+                 port_basic->port_info.enum_boundary);
+    }
 
     port_basic_wmask->port_cna = ~0;
     port_basic_w1cmask->port_reset = ~0;
@@ -1291,6 +1496,10 @@ static void ub_config_clear_port_basic(UBDevice *dev, uint32_t port_idx)
     port_basic->port_info.port_idx = port_idx & UINT16_MASK;
     port_basic->port_reset = 0;
     port_basic_raw[UB_PORT_PHYSICAL_PORT_LINK_STATUS] = 0x0;
+
+    if (object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV) && port_idx == 1) {
+        qemu_log("ub port basic clear %s:%u link_up=0\n", dev->qdev.id, port_idx);
+    }
 
     port_basic_wmask->port_cna = ~0;
     port_basic_w1cmask->port_reset = ~0;
@@ -1395,12 +1604,15 @@ int ub_connect_device_ports(UBDevice *dev, uint32_t local_port_idx,
     dev->port.neighbors[local_port_idx].local_port_idx = local_port_idx;
     dev->port.neighbors[local_port_idx].neighbor_port_idx = neighbor_port_idx;
     dev->port.neighbors[local_port_idx].neighbor_dev = neighbor_dev;
+    dev->port.neighbors[local_port_idx].is_remote_neighbor = false;
     dev->port.port_info_exist = true;
     if (ub_dev_set_neighbor_dev_neighbor_info(local_port_idx, neighbor_port_idx, dev,
                                               neighbor_dev, errp) < 0) {
         return -1;
     }
     ub_config_set_port_basic(&dev->port.neighbors[local_port_idx], dev);
+    ub_program_route_table(dev);
+    ub_program_route_table(neighbor_dev);
     (void)ub_publish_device_snapshot(dev, NULL);
     (void)ub_publish_device_snapshot(neighbor_dev, NULL);
     return 0;
@@ -1431,7 +1643,7 @@ int ub_connect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
                    dev->qdev.id, local_port_idx, local->neighbor_dev->qdev.id);
         return -1;
     }
-    if (local->neighbor_id[0]) {
+    if (local->is_remote_neighbor && local->neighbor_id[0]) {
         if (strcmp(local->neighbor_id, neighbor_id) ||
             local->neighbor_port_idx != neighbor_port_idx ||
             local->local_port_idx != local_port_idx) {
@@ -1447,12 +1659,14 @@ int ub_connect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
         qemu_log("ub remote link reuse %s:%u -> %s:%u guid=%s\n",
                  dev->qdev.id, local_port_idx, neighbor_id, neighbor_port_idx,
                  guid_str);
+        ub_program_route_table(dev);
         (void)ub_publish_device_snapshot(dev, NULL);
         return 0;
     }
 
     memset(local, 0, sizeof(*local));
     pstrcpy(local->neighbor_id, sizeof(local->neighbor_id), neighbor_id);
+    local->is_remote_neighbor = true;
     local->local_port_idx = local_port_idx;
     local->neighbor_port_idx = neighbor_port_idx;
     local->remote_bus_instance_guid_valid = false;
@@ -1464,7 +1678,21 @@ int ub_connect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
     qemu_log("ub remote link set %s:%u -> %s:%u guid=%s\n",
              dev->qdev.id, local_port_idx, neighbor_id, neighbor_port_idx,
              guid_str);
+    if (ub_device_has_remote_only_neighbor(dev)) {
+        qemu_log("ub remote link %s:%u defer route program for remote-only neighbor\n",
+                 dev->qdev.id, local_port_idx);
+    } else {
+        qemu_log("ub remote link %s:%u route program start\n",
+                 dev->qdev.id, local_port_idx);
+        ub_program_route_table(dev);
+        qemu_log("ub remote link %s:%u route program done\n",
+                 dev->qdev.id, local_port_idx);
+    }
+    qemu_log("ub remote link %s:%u snapshot publish start\n",
+             dev->qdev.id, local_port_idx);
     (void)ub_publish_device_snapshot(dev, NULL);
+    qemu_log("ub remote link %s:%u snapshot publish done\n",
+             dev->qdev.id, local_port_idx);
     return 0;
 }
 
@@ -1496,6 +1724,8 @@ int ub_disconnect_device_ports(UBDevice *dev, uint32_t local_port_idx,
     if (!local->neighbor_dev && !remote->neighbor_dev) {
         ub_config_clear_port_basic(dev, local_port_idx);
         ub_config_clear_port_basic(neighbor_dev, neighbor_port_idx);
+        ub_program_route_table(dev);
+        ub_program_route_table(neighbor_dev);
         (void)ub_publish_device_snapshot(dev, NULL);
         (void)ub_publish_device_snapshot(neighbor_dev, NULL);
         return 0;
@@ -1514,6 +1744,8 @@ int ub_disconnect_device_ports(UBDevice *dev, uint32_t local_port_idx,
     memset(remote, 0, sizeof(*remote));
     ub_config_clear_port_basic(dev, local_port_idx);
     ub_config_clear_port_basic(neighbor_dev, neighbor_port_idx);
+    ub_program_route_table(dev);
+    ub_program_route_table(neighbor_dev);
     (void)ub_publish_device_snapshot(dev, NULL);
     (void)ub_publish_device_snapshot(neighbor_dev, NULL);
     return 0;
@@ -1537,12 +1769,13 @@ int ub_disconnect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
     }
 
     local = &dev->port.neighbors[local_port_idx];
-    if (!local->neighbor_dev && !local->neighbor_id[0]) {
+    if (!local->neighbor_dev && !local->is_remote_neighbor) {
         ub_config_clear_port_basic(dev, local_port_idx);
+        ub_program_route_table(dev);
         (void)ub_publish_device_snapshot(dev, NULL);
         return 0;
     }
-    if (local->neighbor_dev ||
+    if (!local->is_remote_neighbor || local->neighbor_dev ||
         strcmp(local->neighbor_id, neighbor_id) ||
         local->neighbor_port_idx != neighbor_port_idx) {
         error_setg(errp, "ub remote link disconnect mismatch %s:%u <-> %s:%u\n",
@@ -1552,6 +1785,7 @@ int ub_disconnect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
 
     memset(local, 0, sizeof(*local));
     ub_config_clear_port_basic(dev, local_port_idx);
+    ub_program_route_table(dev);
     (void)ub_publish_device_snapshot(dev, NULL);
     return 0;
 }
