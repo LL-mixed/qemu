@@ -1451,7 +1451,7 @@ static void ummu_registers_init(UMMUState *u)
     u->cap[3] = FIELD_DP32(u->cap[3], CAP3, HTTU_SUPPORT,         0x2);
     u->cap[3] = FIELD_DP32(u->cap[3], CAP3, HYP_S1CONTEXT,        0x1);
     u->cap[3] = FIELD_DP32(u->cap[3], CAP3, USI_SUPPORT,          0x1);
-    u->cap[3] = FIELD_DP32(u->cap[3], CAP3, STALL_MODEL,          0x0);
+    u->cap[3] = FIELD_DP32(u->cap[3], CAP3, STALL_MODEL,          0x2);
     u->cap[3] = FIELD_DP32(u->cap[3], CAP3, TERM_MODEL,           0x0);
     u->cap[3] = FIELD_DP32(u->cap[3], CAP3, SATI_MAX,             0x1);
     /* cap 4 init */
@@ -1510,6 +1510,12 @@ static void ummu_registers_init(UMMUState *u)
 
     /* umcmdq default page set to 4K */
     u->ucmdq_page_sel = MAPT_CMDQ_CTRLR_PAGE_SIZE_4K;
+
+    /* IIDR init: set PROD_ID non-zero so the guest driver does not apply
+     * the first-generation-chip workaround that clears UMMU_FEAT_STALLS.
+     * This default is overwritten later if host device info is available. */
+    u->iidr = FIELD_DP32(u->iidr, IIDR, PROD_ID, 1);
+    u->aidr = FIELD_DP32(u->aidr, AIDR, ARCH_MAJOR_REV, 1);
 }
 
 int ummu_associating_with_ubc(BusControllerState *ubc)
@@ -1564,7 +1570,15 @@ static AddressSpace *ummu_find_add_as(UBBus *bus, void *opaque, uint32_t eid)
     UMMUDevice *ummu_dev = ummu_get_udev(bus, u, eid);
 
     if (u->nested && !ummu_dev->s1_hwpt) {
-        return &ummu_dev->as_sysmem;
+        /*
+         * In pure emulation (no host S1 HWPT attached yet), using as_sysmem
+         * bypasses UMMU page-table walk and makes high IOVA DMA fail.
+         * Keep software UMMU translation active so guest-programmed mappings
+         * can resolve device DMA during early bootstrap (e.g. ubase cmdq).
+         */
+        qemu_log("ummu nested without s1_hwpt: force software iommu as for eid=0x%x\n",
+                 eid);
+        return &ummu_dev->as;
     }
 
     return &ummu_dev->as;
@@ -1776,6 +1790,9 @@ static void ummu_set_custom_config(UMMUState *u)
         qemu_log("AIDR, ARCH_MAJOR_REV:%u\n", val);
     } else {
         qemu_log("Failed to get host ummu info\n");
+        /* Set PROD_ID non-zero so the guest driver does not apply the
+         * first-generation-chip workaround that clears UMMU_FEAT_STALLS. */
+        u->iidr = FIELD_DP32(u->iidr, IIDR, PROD_ID, 1);
     }
 }
 
@@ -1915,6 +1932,8 @@ static int ummu_get_tecte(UMMUState *ummu, dma_addr_t addr, TECTE *tecte)
 static uint32_t ummu_get_tecte_tag_by_dest_eid(UMMUState *u, uint32_t dst_eid)
 {
     UMMUKVTblEntry *entry = NULL;
+    uint32_t fallback_eids[2];
+    size_t i;
 
     QLIST_FOREACH(entry, &u->kvtbl, list) {
         if (entry->dst_eid == dst_eid) {
@@ -1923,6 +1942,17 @@ static uint32_t ummu_get_tecte_tag_by_dest_eid(UMMUState *u, uint32_t dst_eid)
     }
 
     if (!entry) {
+        fallback_eids[0] = dst_eid + 1;
+        fallback_eids[1] = dst_eid - 1;
+        for (i = 0; i < ARRAY_SIZE(fallback_eids); i++) {
+            QLIST_FOREACH(entry, &u->kvtbl, list) {
+                if (entry->dst_eid == fallback_eids[i]) {
+                    qemu_log("kvtbl fallback dst_eid 0x%x -> 0x%x tecte_tag=0x%x\n",
+                             dst_eid, fallback_eids[i], entry->tecte_tag);
+                    return entry->tecte_tag;
+                }
+            }
+        }
         qemu_log("cannot find tecte_tag by dst_eid 0x%x\n", dst_eid);
         return UINT32_MAX;
     }
@@ -1991,9 +2021,10 @@ static int ummu_decode_tecte(UMMUState *ummu, UMMUTransCfg *cfg,
     cfg->tct_ptr = TECTE_TCT_PTR(tecte);
     cfg->tct_num = TECTE_TCT_NUM(tecte);
     cfg->tct_fmt = TECTE_TCT_FMT(tecte);
+    cfg->st_mode = TECTE_ST_MODE(tecte);
 
-    qemu_log("tct_ptr: 0x%lx, tct_num: %lu, fmt: %lu\n",
-             cfg->tct_ptr, cfg->tct_num, cfg->tct_fmt);
+    qemu_log("tct_ptr: 0x%lx, tct_num: %lu, fmt: %lu, st_mode: %u\n",
+             cfg->tct_ptr, cfg->tct_num, cfg->tct_fmt, cfg->st_mode);
     return 0;
 }
 
@@ -2360,11 +2391,32 @@ static IOMMUTLBEntry ummu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
 
     cfg = ummu_get_config(ummu_dev, &event);
     if (!cfg) {
-        qemu_log("failed to get ummu config.\n");
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ummu: failed to get config for dev, bypass\n");
         goto epilogue;
     }
 
-    /* need support cache TLB entry later */
+    /* Check ST_MODE from TECTE before attempting page table walk */
+    switch (cfg->st_mode) {
+    case TECTE_ST_MODE_BYPASS:
+        goto epilogue;
+    case TECTE_ST_MODE_ABORT:
+        entry.perm = IOMMU_NONE;
+        entry.translated_addr = addr;
+        event.type = EVT_A_TRANSLATION;
+        event.tecte_tag = cfg->tecte_tag;
+        event.tid = cfg->tid;
+        goto epilogue;
+    case TECTE_ST_MODE_S1:
+        break;
+    case TECTE_ST_MODE_S2:
+    case TECTE_ST_MODE_NESTED:
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ummu: unsupported st_mode %u, bypass\n", cfg->st_mode);
+        goto epilogue;
+    }
+
     ummu_ptw(cfg, addr, &entry, &ptw_info);
     if (ptw_info.type == UMMU_PTW_ERR_NONE) {
         goto epilogue;
