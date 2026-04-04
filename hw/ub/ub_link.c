@@ -10,6 +10,19 @@
 #include "hw/ub/ub_link.h"
 #include "hw/ub/ub.h"
 #include "hw/ub/ub_ubc.h"
+#include "io/channel-socket.h"
+#include "io/net-listener.h"
+#include "qapi/qapi-types-sockets.h"
+#include "qapi/error.h"
+#include "qemu/main-loop.h"
+
+/* Forward declarations for static functions defined later */
+static void ub_link_rx_reset(UBLinkState *s);
+static void ub_link_init_rx(UBLinkState *s);
+static void ub_link_cleanup_rx(UBLinkState *s);
+static void ub_link_register_aio_watch(UBLinkState *s);
+static gboolean ub_link_socket_readable(QIOChannel *ioc, GIOCondition cond, gpointer opaque);
+static int ub_link_recv_frames(UBLinkState *s);
 
 typedef struct UBLinkPublishedState {
     char *device_id;
@@ -70,6 +83,380 @@ static char *ub_link_endpoint_state_path(const UBLinkEndpointDesc *ep)
                            ub_link_shared_dir(), sanitized, ep->port_idx);
 }
 
+static char *ub_link_kick_path(const UBLinkEndpointDesc *ep)
+{
+    g_autofree char *global_id = ub_link_global_device_id(ep->device_id);
+    g_autofree char *sanitized = ub_link_sanitize_token(global_id);
+
+    g_mkdir_with_parents(ub_link_shared_dir(), 0755);
+    return g_strdup_printf("%s/%s__%u.kick",
+                           ub_link_shared_dir(), sanitized, ep->port_idx);
+}
+
+static char *ub_link_socket_path(const UBLinkEndpointDesc *ep)
+{
+    g_autofree char *global_id = ub_link_global_device_id(ep->device_id);
+    g_autofree char *sanitized = ub_link_sanitize_token(global_id);
+
+    g_mkdir_with_parents(ub_link_shared_dir(), 0755);
+    return g_strdup_printf("%s/%s__%u.sock",
+                           ub_link_shared_dir(), sanitized, ep->port_idx);
+}
+
+static void ub_link_accept(QIONetListener *listener, QIOChannelSocket *cioc, gpointer opaque)
+{
+    UBLinkState *s = UB_LINK(opaque);
+    (void)listener;
+
+    /* Clean up previous connection state */
+    if (s->aio_watch_id) {
+        g_source_remove(s->aio_watch_id);
+        s->aio_watch_id = 0;
+    }
+    ub_link_cleanup_rx(s);
+
+    if (s->ioc) {
+        object_unref(OBJECT(s->ioc));
+    }
+    s->ioc = QIO_CHANNEL(cioc);
+    object_ref(OBJECT(s->ioc));
+    qio_channel_set_blocking(s->ioc, false, NULL);
+    qemu_log("ub_link: accepted incoming ulink connection\n");
+
+    ub_link_init_rx(s);
+    ub_link_register_aio_watch(s);
+}
+
+/* ---------- framed protocol: send ---------- */
+
+int ub_link_send_frame(UBLinkState *s, uint32_t flags,
+                       const void *payload, size_t len, Error **errp)
+{
+    UBLinkFrameHeader hdr;
+    struct iovec iov[2];
+    int ret;
+
+    if (!s || !s->ioc) {
+        error_setg(errp, "ub_link_send_frame: no connection");
+        return -1;
+    }
+
+    hdr.magic = cpu_to_be32(UB_LINK_FRAME_MAGIC);
+    hdr.version = cpu_to_be32(UB_LINK_FRAME_V1);
+    hdr.payload_len = cpu_to_be32((uint32_t)len);
+    hdr.flags = cpu_to_be32(flags);
+
+    iov[0].iov_base = &hdr;
+    iov[0].iov_len = UB_LINK_FRAME_HDR_SIZE;
+    iov[1].iov_base = (void *)payload;
+    iov[1].iov_len = len;
+
+    ret = qio_channel_writev_all(s->ioc, iov, ARRAY_SIZE(iov), errp);
+    if (ret < 0) {
+        return -1;
+    }
+
+    qemu_log("ub_link: frame tx len=%zu flags=0x%x\n", len, flags);
+    return 0;
+}
+
+/* ---------- framed protocol: receive state machine ---------- */
+
+/*
+ * Drain bytes from the socket into the rx buffer, then walk through
+ * complete frames and enqueue their payloads in rx_msgq.
+ * Returns: -1 on error, 0 on success (may have parsed zero or more frames).
+ */
+static int ub_link_recv_frames(UBLinkState *s)
+{
+    ssize_t nr;
+    size_t want;
+    Error *local_err = NULL;
+
+    if (!s || !s->ioc) {
+        return 0;
+    }
+
+    for (;;) {
+        /* Phase 1: read header */
+        if (!s->rx_header_done) {
+            size_t have = s->rx_buf_used;
+            if (have < UB_LINK_FRAME_HDR_SIZE) {
+                want = UB_LINK_FRAME_HDR_SIZE - have;
+                if (s->rx_buf_cap < UB_LINK_FRAME_HDR_SIZE) {
+                    s->rx_buf_cap = UB_LINK_FRAME_HDR_SIZE;
+                    s->rx_buf = g_realloc(s->rx_buf, s->rx_buf_cap);
+                }
+                nr = qio_channel_read(s->ioc,
+                                      (char *)s->rx_buf + have,
+                                      want, &local_err);
+                if (nr <= 0) {
+                    if (nr == 0) {
+                        /* EOF / no data */
+                        return 0;
+                    }
+                    if (nr == QIO_CHANNEL_ERR_BLOCK) {
+                        return 0;
+                    }
+                    qemu_log("ub_link: frame hdr read error: %s\n",
+                             error_get_pretty(local_err));
+                    error_free(local_err);
+                    return -1;
+                }
+                s->rx_buf_used += nr;
+                if (s->rx_buf_used < UB_LINK_FRAME_HDR_SIZE) {
+                    return 0; /* need more header bytes */
+                }
+            }
+
+            /* Validate header */
+            memcpy(&s->rx_hdr, s->rx_buf, UB_LINK_FRAME_HDR_SIZE);
+            s->rx_hdr.magic = be32_to_cpu(s->rx_hdr.magic);
+            s->rx_hdr.version = be32_to_cpu(s->rx_hdr.version);
+            s->rx_hdr.payload_len = be32_to_cpu(s->rx_hdr.payload_len);
+            s->rx_hdr.flags = be32_to_cpu(s->rx_hdr.flags);
+
+            if (s->rx_hdr.magic != UB_LINK_FRAME_MAGIC) {
+                qemu_log("ub_link: bad frame magic 0x%08x, dropping\n",
+                         s->rx_hdr.magic);
+                ub_link_rx_reset(s);
+                return -1;
+            }
+            if (s->rx_hdr.version != UB_LINK_FRAME_V1) {
+                qemu_log("ub_link: unsupported frame version %u\n",
+                         s->rx_hdr.version);
+                ub_link_rx_reset(s);
+                return -1;
+            }
+            if (s->rx_hdr.payload_len > UB_LINK_RX_BUF_MAX) {
+                qemu_log("ub_link: frame payload too large %u\n",
+                         s->rx_hdr.payload_len);
+                ub_link_rx_reset(s);
+                return -1;
+            }
+
+            s->rx_header_done = true;
+            s->rx_frame_remaining = s->rx_hdr.payload_len;
+
+            /* Shift past header if there are leftover bytes */
+            if (s->rx_buf_used > UB_LINK_FRAME_HDR_SIZE) {
+                size_t excess = s->rx_buf_used - UB_LINK_FRAME_HDR_SIZE;
+                memmove(s->rx_buf, s->rx_buf + UB_LINK_FRAME_HDR_SIZE, excess);
+                s->rx_buf_used = excess;
+            } else {
+                s->rx_buf_used = 0;
+            }
+        }
+
+        /* Phase 2: read payload */
+        if (s->rx_header_done && s->rx_frame_remaining > 0) {
+            /* Ensure capacity */
+            if (s->rx_buf_cap < s->rx_frame_remaining) {
+                s->rx_buf_cap = MIN(s->rx_frame_remaining * 2,
+                                    UB_LINK_RX_BUF_MAX);
+                s->rx_buf = g_realloc(s->rx_buf, s->rx_buf_cap);
+            }
+
+            want = s->rx_frame_remaining -
+                   (s->rx_buf_used > s->rx_frame_remaining
+                    ? s->rx_frame_remaining
+                    : s->rx_buf_used);
+            if (want > 0) {
+                nr = qio_channel_read(s->ioc,
+                                      (char *)s->rx_buf + s->rx_buf_used,
+                                      want, &local_err);
+                if (nr <= 0) {
+                    if (nr == QIO_CHANNEL_ERR_BLOCK) {
+                        return 0;
+                    }
+                    if (nr == 0) {
+                        return 0;
+                    }
+                    qemu_log("ub_link: frame payload read error: %s\n",
+                             error_get_pretty(local_err));
+                    error_free(local_err);
+                    return -1;
+                }
+                s->rx_buf_used += nr;
+            }
+
+            if (s->rx_buf_used < s->rx_frame_remaining) {
+                return 0; /* need more payload bytes */
+            }
+        }
+
+        /* Phase 3: complete frame — enqueue payload */
+        if (s->rx_header_done && s->rx_frame_remaining > 0 &&
+            s->rx_buf_used >= s->rx_frame_remaining) {
+            UBLinkRxMsg *msg = g_malloc(sizeof(*msg));
+            msg->flags = s->rx_hdr.flags;
+            msg->len = s->rx_frame_remaining;
+            msg->data = g_malloc(msg->len);
+            memcpy(msg->data, s->rx_buf, msg->len);
+            g_queue_push_tail(s->rx_msgq, msg);
+
+            qemu_log("ub_link: frame rx len=%zu flags=0x%x\n",
+                     msg->len, msg->flags);
+
+            /* Shift past this frame's payload */
+            {
+                size_t consumed = s->rx_frame_remaining;
+                size_t leftover = s->rx_buf_used - consumed;
+                if (leftover > 0) {
+                    memmove(s->rx_buf, s->rx_buf + consumed, leftover);
+                }
+                s->rx_buf_used = leftover;
+            }
+
+            /* Reset for next frame */
+            s->rx_header_done = false;
+            s->rx_frame_remaining = 0;
+            memset(&s->rx_hdr, 0, sizeof(s->rx_hdr));
+
+            /* Continue looping to parse more frames from remaining data */
+            continue;
+        }
+
+        break;
+    }
+    return 0;
+}
+
+/* ---------- AIO integration ---------- */
+
+static gboolean ub_link_socket_readable(QIOChannel *ioc,
+                                        GIOCondition cond,
+                                        gpointer opaque)
+{
+    UBLinkState *s = UB_LINK(opaque);
+
+    if (cond & (G_IO_HUP | G_IO_ERR)) {
+        qemu_log("ub_link: socket hangup/error\n");
+        s->aio_watch_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    if (ub_link_recv_frames(s) < 0) {
+        qemu_log("ub_link: recv error, disabling watch\n");
+        s->aio_watch_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
+static void ub_link_register_aio_watch(UBLinkState *s)
+{
+    if (!s || !s->ioc || s->aio_watch_id) {
+        return;
+    }
+    s->aio_watch_id = qio_channel_add_watch(
+        s->ioc, G_IO_IN | G_IO_HUP | G_IO_ERR,
+        ub_link_socket_readable, s, NULL);
+    qemu_log("ub_link: AIO watch registered\n");
+}
+
+static void ub_link_setup_socket(UBLinkState *s, bool is_server)
+{
+    /*
+     * Both sides must agree on the same socket path.
+     * Since is_server is determined by a_global < b_global, the server
+     * always listens on endpoint a's path. The client must connect to
+     * the same path (endpoint a's path), not its own endpoint's path.
+     */
+    SocketAddress addr = {
+        .type = SOCKET_ADDRESS_TYPE_UNIX,
+        .u.q_unix.path = ub_link_socket_path(&s->a),
+    };
+    Error *local_err = NULL;
+
+    if (is_server) {
+        QIONetListener *listener = qio_net_listener_new();
+        qio_net_listener_set_name(listener, "ub-link-listener");
+        if (qio_net_listener_open_sync(listener, &addr, 1, &local_err) < 0) {
+            qemu_log("ub_link: server listen failed: %s\n",
+                     error_get_pretty(local_err));
+            error_free(local_err);
+            object_unref(OBJECT(listener));
+            return;
+        }
+        s->lioc = listener;
+        qio_net_listener_set_client_func(listener, ub_link_accept, s, NULL);
+        qemu_log("ub_link: server listening on %s\n", addr.u.q_unix.path);
+    } else {
+        QIOChannelSocket *sioc = qio_channel_socket_new();
+        qio_channel_set_name(QIO_CHANNEL(sioc), "ub-link-client");
+        if (qio_channel_socket_connect_sync(sioc, &addr, &local_err) < 0) {
+            qemu_log("ub_link: client connect to %s failed: %s\n",
+                     addr.u.q_unix.path, error_get_pretty(local_err));
+            object_unref(OBJECT(sioc));
+            error_free(local_err);
+            return;
+        }
+        s->ioc = QIO_CHANNEL(sioc);
+        qio_channel_set_blocking(s->ioc, false, NULL);
+        ub_link_init_rx(s);
+        ub_link_register_aio_watch(s);
+        qemu_log("ub_link: client connected to %s\n", addr.u.q_unix.path);
+    }
+}
+
+int ub_link_kick_remote(UBLinkState *s, Error **errp)
+{
+    UBLinkEndpointDesc *remote = NULL;
+    g_autofree char *path = NULL;
+
+    if (!s || !s->remote_applied) {
+        return 0;
+    }
+
+    if (s->a.device && !s->b.device) {
+        remote = &s->b;
+    } else if (s->b.device && !s->a.device) {
+        remote = &s->a;
+    }
+
+    if (!remote) {
+        return 0;
+    }
+
+    path = ub_link_kick_path(remote);
+    if (!g_file_set_contents(path, "1", 1, NULL)) {
+        error_setg(errp, "ub_link: failed to write kick file %s", path);
+        return -1;
+    }
+
+    return 0;
+}
+
+int ub_link_poll_kick(UBLinkState *s)
+{
+    UBLinkEndpointDesc *local = NULL;
+    g_autofree char *path = NULL;
+
+    if (!s || !s->remote_applied) {
+        return 0;
+    }
+
+    if (s->a.device && !s->b.device) {
+        local = &s->a;
+    } else if (s->b.device && !s->a.device) {
+        local = &s->b;
+    }
+
+    if (!local) {
+        return 0;
+    }
+
+    path = ub_link_kick_path(local);
+    if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+        g_remove(path);
+        return 1;
+    }
+
+    return 0;
+}
+
 static int ub_link_publish_local_endpoint(const UBLinkEndpointDesc *ep, Error **errp)
 {
     g_autoptr(GKeyFile) keyfile = NULL;
@@ -96,7 +483,7 @@ static int ub_link_publish_local_endpoint(const UBLinkEndpointDesc *ep, Error **
                           ub_link_global_device_id(ep->device_id));
     g_key_file_set_uint64(keyfile, "endpoint", "port_idx", ep->port_idx);
     g_key_file_set_string(keyfile, "endpoint", "guid", guid_str);
-    if (BUS_CONTROLLER_DEV(ep->device)) {
+    if (object_dynamic_cast(OBJECT(ep->device), TYPE_BUS_CONTROLLER_DEV)) {
         g_autofree char *bi_guid_str = g_malloc0(UB_DEV_GUID_STRING_LENGTH + 1);
         BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(ep->device);
 
@@ -146,7 +533,6 @@ static int ub_link_read_remote_endpoint(const UBLinkEndpointDesc *ep,
     g_autofree char *path = NULL;
     g_autofree char *guid_str = NULL;
     GError *gerr = NULL;
-    unsigned int attempt;
 
     if (!ep || !state) {
         error_setg(errp, "ub_link: invalid remote endpoint read arguments");
@@ -154,18 +540,8 @@ static int ub_link_read_remote_endpoint(const UBLinkEndpointDesc *ep,
     }
 
     path = ub_link_endpoint_state_path(ep);
-    for (attempt = 0; attempt < 20; attempt++) {
-        if (g_file_test(path, G_FILE_TEST_EXISTS)) {
-            break;
-        }
-        if (attempt == 0) {
-            qemu_log("ub_link: remote endpoint file not found for %s:%u (%s), retrying\n",
-                     ep->device_id, ep->port_idx, path);
-        }
-        g_usleep(100 * 1000);
-    }
     if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
-        qemu_log("ub_link: remote endpoint still missing for %s:%u (%s)\n",
+        qemu_log("ub_link: remote endpoint file not found for %s:%u (%s), pending\n",
                  ep->device_id, ep->port_idx, path);
         return 1;
     }
@@ -286,19 +662,32 @@ static int ub_link_apply_remote_bridge(UBLinkState *s, Error **errp)
         neighbor->remote_cfg_notify_sent = false;
         neighbor->remote_cfg_notify_attempts = 0;
         neighbor->remote_cfg_notify_next_retry_ms = 0;
+        neighbor->remote_linkup_notify_sent = false;
+        neighbor->remote_linkup_notify_attempts = 0;
+        neighbor->remote_linkup_notify_next_retry_ms = 0;
         qemu_log("ub_link: remote bus instance guid captured for %s:%u\n",
                  local->device_id, local->port_idx);
     }
     if (object_dynamic_cast(OBJECT(local->device), TYPE_BUS_CONTROLLER_DEV)) {
         UBRemoteDeviceSnapshot remote_snapshot = { 0 };
+        NeighborInfo *neighbor = &local->device->port.neighbors[local->port_idx];
 
         qemu_log("ub_link: remote snapshot load start for %s:%u\n",
                  local->device_id, local->port_idx);
         if (ub_load_remote_device_snapshot_by_guid(&remote_state.guid,
                                                    &remote_snapshot, NULL)) {
+            neighbor->remote_primary_cna = remote_snapshot.primary_cna & 0x00ffffffU;
+            neighbor->remote_primary_cna_valid = true;
             ub_set_cluster_peer_cfg(local->device, remote_snapshot.eid,
                                     remote_snapshot.upi,
                                     remote_snapshot.fm_cna);
+            qemu_log("ub_link: remote route program start for %s:%u remote_cna=%#x\n",
+                     local->device_id, local->port_idx,
+                     neighbor->remote_primary_cna);
+            ub_program_route_table(local->device);
+            (void)ub_publish_device_snapshot(local->device, NULL);
+            qemu_log("ub_link: remote route program done for %s:%u\n",
+                     local->device_id, local->port_idx);
             qemu_log("ub_link: remote snapshot load done for %s:%u eid=%u upi=%u fm_cna=%#x\n",
                      local->device_id, local->port_idx,
                      remote_snapshot.eid, remote_snapshot.upi,
@@ -317,8 +706,24 @@ static int ub_link_apply_remote_bridge(UBLinkState *s, Error **errp)
             ub_link_published_state_clear(&remote_state);
             return -1;
         }
-        qemu_log("ub_link: remote cfg notify done for %s:%u\n",
-                 local->device_id, local->port_idx);
+    }
+
+    /* Setup high-performance data plane if not already done */
+    if (!s->ioc && !s->lioc) {
+        /*
+         * Deterministic server/client: use global IDs of both endpoints.
+         * Both nodes see the same a/b pair, so the comparison is identical
+         * on both sides. The node whose local endpoint matches endpoint 'a'
+         * becomes server if a_global < b_global, otherwise client.
+         */
+        g_autofree char *a_global = ub_link_global_device_id(s->a.device_id);
+        g_autofree char *b_global = ub_link_global_device_id(s->b.device_id);
+        bool local_is_a = (local == &s->a);
+        bool a_is_server = (strcmp(a_global, b_global) < 0);
+        bool is_server = local_is_a ? a_is_server : !a_is_server;
+        qemu_log("ub_link: socket setup local=%s a_global=%s b_global=%s is_server=%d\n",
+                 local->device_id, a_global, b_global, is_server);
+        ub_link_setup_socket(s, is_server);
     }
 
     s->remote_applied = true;
@@ -331,10 +736,59 @@ static int ub_link_apply_remote_bridge(UBLinkState *s, Error **errp)
     return 0;
 }
 
+static void ub_link_rx_reset(UBLinkState *s)
+{
+    s->rx_buf_used = 0;
+    s->rx_header_done = false;
+    s->rx_frame_remaining = 0;
+    memset(&s->rx_hdr, 0, sizeof(s->rx_hdr));
+}
+
+static void ub_link_init_rx(UBLinkState *s)
+{
+    s->rx_buf_cap = UB_LINK_RX_BUF_INITIAL;
+    s->rx_buf = g_malloc(s->rx_buf_cap);
+    ub_link_rx_reset(s);
+    s->rx_msgq = g_queue_new();
+}
+
+static void ub_link_cleanup_rx(UBLinkState *s)
+{
+    if (s->rx_msgq) {
+        while (!g_queue_is_empty(s->rx_msgq)) {
+            UBLinkRxMsg *msg = g_queue_pop_head(s->rx_msgq);
+            if (msg) {
+                g_free(msg->data);
+                g_free(msg);
+            }
+        }
+        g_queue_free(s->rx_msgq);
+        s->rx_msgq = NULL;
+    }
+    g_free(s->rx_buf);
+    s->rx_buf = NULL;
+    s->rx_buf_cap = 0;
+    s->rx_buf_used = 0;
+    s->rx_header_done = false;
+    s->rx_frame_remaining = 0;
+}
+
 static void ub_link_finalize(Object *obj)
 {
     UBLinkState *s = UB_LINK(obj);
 
+    if (s->aio_watch_id) {
+        g_source_remove(s->aio_watch_id);
+        s->aio_watch_id = 0;
+    }
+    ub_link_cleanup_rx(s);
+    if (s->ioc) {
+        object_unref(OBJECT(s->ioc));
+    }
+    if (s->lioc) {
+        object_unref(OBJECT(s->lioc));
+    }
+    g_free(s->socket_path);
     g_free(s->a.device_id);
     g_free(s->b.device_id);
 }
@@ -402,15 +856,24 @@ int ub_link_apply(UBLinkState *s, Error **errp)
     if (!s->link_up) {
         return 0;
     }
+
     if (!s->attached) {
         int ret = ub_link_attach_endpoints(s, errp);
-
         if (ret < 0) {
             return -1;
         }
         if (ret > 0) {
+            /* One side is remote, try to apply the bridge */
             return ub_link_apply_remote_bridge(s, errp);
         }
+    }
+
+    /* If we get here, both endpoints are local */
+    if (ub_link_publish_local_endpoint(&s->a, errp) < 0) {
+        return -1;
+    }
+    if (ub_link_publish_local_endpoint(&s->b, errp) < 0) {
+        return -1;
     }
 
     if (ub_connect_device_ports(s->a.device, s->a.port_idx,
@@ -483,6 +946,108 @@ void ub_link_detach_endpoints(UBLinkState *s)
     s->applied = false;
     s->pending = false;
     s->remote_applied = false;
+}
+
+static char *ub_link_message_path(const UBLinkEndpointDesc *ep)
+{
+    g_autofree char *global_id = ub_link_global_device_id(ep->device_id);
+    g_autofree char *sanitized = ub_link_sanitize_token(global_id);
+
+    g_mkdir_with_parents(ub_link_shared_dir(), 0755);
+    return g_strdup_printf("%s/%s__%u.msg",
+                           ub_link_shared_dir(), sanitized, ep->port_idx);
+}
+
+int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **errp)
+{
+    UBLinkEndpointDesc *remote = NULL;
+    g_autofree char *path = NULL;
+
+    if (!s || !s->remote_applied) {
+        return 0;
+    }
+
+    /* Try framed socket protocol first */
+    if (s->ioc) {
+        int ret = ub_link_send_frame(s, UB_LINK_FRAME_FLAG_CTRL, buf, len, errp);
+        if (ret >= 0) {
+            return 0;
+        }
+        /* Socket error, fallback to file */
+        qemu_log("ub_link: frame send failed, falling back to file: %s\n",
+                 *errp ? error_get_pretty(*errp) : "unknown");
+        if (*errp) {
+            error_free(*errp);
+            *errp = NULL;
+        }
+    }
+
+    if (s->a.device && !s->b.device) {
+        remote = &s->b;
+    } else if (s->b.device && !s->a.device) {
+        remote = &s->a;
+    }
+
+    if (!remote) {
+        return 0;
+    }
+
+    path = ub_link_message_path(remote);
+    if (!g_file_set_contents(path, buf, len, NULL)) {
+        error_setg(errp, "ub_link: failed to write message file %s", path);
+        return -1;
+    }
+
+    return 0;
+}
+
+int ub_link_read_message(UBLinkState *s, void **buf, size_t *len, Error **errp)
+{
+    UBLinkEndpointDesc *local = NULL;
+    g_autofree char *path = NULL;
+    gsize length = 0;
+    GError *gerr = NULL;
+
+    if (!s || !s->remote_applied || !buf || !len) {
+        return 0;
+    }
+
+    /* Dequeue from framed-protocol receive queue (filled by AIO) */
+    if (s->rx_msgq && !g_queue_is_empty(s->rx_msgq)) {
+        UBLinkRxMsg *msg = g_queue_pop_head(s->rx_msgq);
+        if (msg) {
+            *buf = msg->data;
+            *len = msg->len;
+            g_free(msg);
+            return 1;
+        }
+    }
+
+    if (s->a.device && !s->b.device) {
+        local = &s->a;
+    } else if (s->b.device && !s->a.device) {
+        local = &s->b;
+    }
+
+    if (!local) {
+        return 0;
+    }
+
+    path = ub_link_message_path(local);
+    if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+        return 0;
+    }
+
+    if (!g_file_get_contents(path, (char **)buf, &length, &gerr)) {
+        error_setg(errp, "ub_link: failed to read message file %s: %s",
+                   path, gerr->message);
+        g_error_free(gerr);
+        return -1;
+    }
+
+    *len = length;
+    g_remove(path);
+    return 1;
 }
 
 bool ub_link_is_pending(UBLinkState *s)
