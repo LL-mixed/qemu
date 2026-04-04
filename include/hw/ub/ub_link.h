@@ -6,12 +6,15 @@
  * so future multi-instance UBC<->UBC links can be represented without
  * embedding interconnect behavior inside a controller implementation.
  *
- * Data transport uses a simple framed protocol over a Unix domain socket:
+ * Data transport uses UB spec-aligned packets over a Unix domain socket.
+ * For cfg==6 (16-bit CNA, CTP) the wire format is:
  *
- *   [ UBLinkFrameHeader (16 bytes) ] [ payload (payload_len bytes) ]
+ *   [LPH 4B] [NTH 8B] [CTPH+UPIH+EIDH+BTAH 16B] [ExtHdr 4B] [Payload plen B]
+ *   = MsgPktHeader (32 bytes fixed) + plen bytes payload
  *
- * The header carries a magic value, protocol version, payload length and
- * flags that discriminate control messages from DMA / data frames.
+ * The LPH (UbLinkHeader) provides cfg and vl fields for packet type
+ * identification.  msgetah.plen in the fixed header determines the
+ * variable-length payload that follows.
  */
 
 #ifndef UB_LINK_H
@@ -26,39 +29,20 @@ typedef struct UBDevice UBDevice;
 #define TYPE_UB_LINK "ub-link"
 OBJECT_DECLARE_SIMPLE_TYPE(UBLinkState, UB_LINK)
 
-/* ---------- framed protocol definitions ---------- */
-
-#define UB_LINK_FRAME_MAGIC  0x554C4B46  /* "ULKF" */
-#define UB_LINK_FRAME_V1     1
-
 /*
- * Frame flags — carried in UBLinkFrameHeader.flags.
- * Low 16 bits: message class (control / DMA).
- * High 16 bits: reserved.
+ * UB spec-aligned constants used by the framing layer.
+ * These must match the definitions in ub_common.h.
  */
-#define UB_LINK_FRAME_FLAG_CTRL    0x0000  /* control message (MsgPktHeader + payload) */
-#define UB_LINK_FRAME_FLAG_DMA_REQ 0x0001  /* DMA request (metadata only) */
-#define UB_LINK_FRAME_FLAG_DMA_DAT 0x0002  /* DMA data payload */
-#define UB_LINK_FRAME_FLAG_DMA_CPL 0x0003  /* DMA completion */
+#define UB_LINK_PKT_HDR_SIZE    32   /* MSG_PKT_HEADER_SIZE */
+#define UB_LINK_CLAN_CFG        6    /* UB_CLAN_LINK_CFG */
 
-typedef struct UBLinkFrameHeader {
-    uint32_t magic;          /* UB_LINK_FRAME_MAGIC */
-    uint32_t version;        /* UB_LINK_FRAME_V1 */
-    uint32_t payload_len;    /* bytes following this header */
-    uint32_t flags;          /* UB_LINK_FRAME_FLAG_* */
-} UBLinkFrameHeader;
-
-#define UB_LINK_FRAME_HDR_SIZE  16
-
-/* Initial and maximum sizes for the receive buffer */
-#define UB_LINK_RX_BUF_INITIAL  4096
+/* Maximum sizes for the receive buffer */
 #define UB_LINK_RX_BUF_MAX      (1 << 20)  /* 1 MiB */
 
-/* A fully received message dequeued from the framing layer */
+/* A fully received spec-aligned UB packet */
 typedef struct UBLinkRxMsg {
-    uint32_t flags;      /* UB_LINK_FRAME_FLAG_* */
-    size_t len;          /* payload length */
-    void *data;          /* g_malloc'd payload */
+    size_t len;      /* total = UB_LINK_PKT_HDR_SIZE + plen */
+    void *data;      /* g_malloc'd: MsgPktHeader + payload */
 } UBLinkRxMsg;
 
 /* ---------- endpoint and link structures ---------- */
@@ -85,23 +69,23 @@ struct UBLinkState {
     QIONetListener *lioc; /* Listener, for server side */
     char *socket_path;
 
-    /* Receive buffer for the framed protocol */
+    /* Receive buffer for the spec-aligned protocol */
     uint8_t *rx_buf;
     size_t rx_buf_cap;         /* allocated capacity */
     size_t rx_buf_used;        /* valid bytes in rx_buf */
 
     /*
-     * Framing state machine.
-     * When rx_header_done == false we are collecting the 16-byte header.
-     * When rx_header_done == true  we are collecting the payload whose
-     * length is stored in rx_hdr.payload_len.  rx_frame_remaining tracks
-     * how many payload bytes are still outstanding.
+     * Spec-aligned framing state machine.
+     * Phase 1: Collect UB_LINK_PKT_HDR_SIZE bytes (fixed header for cfg==6).
+     *          Validate ulh.cfg, extract msgetah.plen.
+     * Phase 2: Collect plen bytes of payload.
+     * Phase 3: Enqueue complete packet to rx_msgq.
      */
-    bool rx_header_done;
-    UBLinkFrameHeader rx_hdr;
-    size_t rx_frame_remaining;
+    bool     rx_hdr_done;          /* true = fixed header parsed, collecting payload */
+    uint16_t rx_plen;              /* msgetah.plen from parsed header */
+    size_t   rx_payload_remaining; /* payload bytes still outstanding */
 
-    /* Queue of fully received frames (each entry is g_malloc'd payload) */
+    /* Queue of fully received packets */
     GQueue *rx_msgq;
 
     /* AIO watch source ID (0 = not registered) */
@@ -119,9 +103,5 @@ int ub_link_kick_remote(UBLinkState *s, Error **errp);
 int ub_link_poll_kick(UBLinkState *s);
 int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **errp);
 int ub_link_read_message(UBLinkState *s, void **buf, size_t *len, Error **errp);
-
-/* Framed-protocol send (non-static, used by DMA engine and msgq) */
-int ub_link_send_frame(UBLinkState *s, uint32_t flags,
-                       const void *payload, size_t len, Error **errp);
 
 #endif

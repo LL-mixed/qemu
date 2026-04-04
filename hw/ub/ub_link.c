@@ -10,6 +10,7 @@
 #include "hw/ub/ub_link.h"
 #include "hw/ub/ub.h"
 #include "hw/ub/ub_ubc.h"
+#include "hw/ub/ub_common.h"
 #include "io/channel-socket.h"
 #include "io/net-listener.h"
 #include "qapi/qapi-types-sockets.h"
@@ -127,45 +128,44 @@ static void ub_link_accept(QIONetListener *listener, QIOChannelSocket *cioc, gpo
     ub_link_register_aio_watch(s);
 }
 
-/* ---------- framed protocol: send ---------- */
+/* Initial size for the receive buffer */
+#define UB_LINK_RX_BUF_INITIAL  4096
 
-int ub_link_send_frame(UBLinkState *s, uint32_t flags,
-                       const void *payload, size_t len, Error **errp)
+/* ---------- spec-aligned protocol: send ---------- */
+
+static int ub_link_send_packet(UBLinkState *s,
+                                const void *pkt, size_t len,
+                                Error **errp)
 {
-    UBLinkFrameHeader hdr;
-    struct iovec iov[2];
-    int ret;
-
     if (!s || !s->ioc) {
-        error_setg(errp, "ub_link_send_frame: no connection");
+        error_setg(errp, "ub_link_send_packet: no connection");
         return -1;
     }
-
-    hdr.magic = cpu_to_be32(UB_LINK_FRAME_MAGIC);
-    hdr.version = cpu_to_be32(UB_LINK_FRAME_V1);
-    hdr.payload_len = cpu_to_be32((uint32_t)len);
-    hdr.flags = cpu_to_be32(flags);
-
-    iov[0].iov_base = &hdr;
-    iov[0].iov_len = UB_LINK_FRAME_HDR_SIZE;
-    iov[1].iov_base = (void *)payload;
-    iov[1].iov_len = len;
-
-    ret = qio_channel_writev_all(s->ioc, iov, ARRAY_SIZE(iov), errp);
-    if (ret < 0) {
+    if (len < UB_LINK_PKT_HDR_SIZE) {
+        error_setg(errp, "ub_link_send_packet: packet too short (%zu < %d)",
+                   len, UB_LINK_PKT_HDR_SIZE);
         return -1;
     }
-
-    qemu_log("ub_link: frame tx len=%zu flags=0x%x\n", len, flags);
+    if (qio_channel_write_all(s->ioc, pkt, len, errp) < 0) {
+        return -1;
+    }
+    qemu_log("ub_link: packet tx len=%zu\n", len);
     return 0;
 }
 
-/* ---------- framed protocol: receive state machine ---------- */
+/* ---------- spec-aligned protocol: receive state machine ---------- */
 
 /*
  * Drain bytes from the socket into the rx buffer, then walk through
- * complete frames and enqueue their payloads in rx_msgq.
- * Returns: -1 on error, 0 on success (may have parsed zero or more frames).
+ * complete UB packets and enqueue them in rx_msgq.
+ *
+ * State machine:
+ *   Phase 1: Collect UB_LINK_PKT_HDR_SIZE bytes (fixed header for cfg==6).
+ *            Validate ulh.cfg, extract msgetah.plen.
+ *   Phase 2: Collect plen bytes of payload.
+ *   Phase 3: Enqueue complete MsgPktHeader + payload packet.
+ *
+ * Returns: -1 on error, 0 on success (may have parsed zero or more packets).
  */
 static int ub_link_recv_frames(UBLinkState *s)
 {
@@ -178,101 +178,74 @@ static int ub_link_recv_frames(UBLinkState *s)
     }
 
     for (;;) {
-        /* Phase 1: read header */
-        if (!s->rx_header_done) {
+        /* Phase 1: collect fixed header (UB_LINK_PKT_HDR_SIZE bytes) */
+        if (!s->rx_hdr_done) {
             size_t have = s->rx_buf_used;
-            if (have < UB_LINK_FRAME_HDR_SIZE) {
-                want = UB_LINK_FRAME_HDR_SIZE - have;
-                if (s->rx_buf_cap < UB_LINK_FRAME_HDR_SIZE) {
-                    s->rx_buf_cap = UB_LINK_FRAME_HDR_SIZE;
+            if (have < UB_LINK_PKT_HDR_SIZE) {
+                want = UB_LINK_PKT_HDR_SIZE - have;
+                if (s->rx_buf_cap < UB_LINK_PKT_HDR_SIZE) {
+                    s->rx_buf_cap = UB_LINK_PKT_HDR_SIZE;
                     s->rx_buf = g_realloc(s->rx_buf, s->rx_buf_cap);
                 }
                 nr = qio_channel_read(s->ioc,
                                       (char *)s->rx_buf + have,
                                       want, &local_err);
                 if (nr <= 0) {
-                    if (nr == 0) {
-                        /* EOF / no data */
+                    if (nr == 0 || nr == QIO_CHANNEL_ERR_BLOCK) {
                         return 0;
                     }
-                    if (nr == QIO_CHANNEL_ERR_BLOCK) {
-                        return 0;
-                    }
-                    qemu_log("ub_link: frame hdr read error: %s\n",
+                    qemu_log("ub_link: header read error: %s\n",
                              error_get_pretty(local_err));
                     error_free(local_err);
                     return -1;
                 }
                 s->rx_buf_used += nr;
-                if (s->rx_buf_used < UB_LINK_FRAME_HDR_SIZE) {
-                    return 0; /* need more header bytes */
+                if (s->rx_buf_used < UB_LINK_PKT_HDR_SIZE) {
+                    return 0;
                 }
             }
 
-            /* Validate header */
-            memcpy(&s->rx_hdr, s->rx_buf, UB_LINK_FRAME_HDR_SIZE);
-            s->rx_hdr.magic = be32_to_cpu(s->rx_hdr.magic);
-            s->rx_hdr.version = be32_to_cpu(s->rx_hdr.version);
-            s->rx_hdr.payload_len = be32_to_cpu(s->rx_hdr.payload_len);
-            s->rx_hdr.flags = be32_to_cpu(s->rx_hdr.flags);
-
-            if (s->rx_hdr.magic != UB_LINK_FRAME_MAGIC) {
-                qemu_log("ub_link: bad frame magic 0x%08x, dropping\n",
-                         s->rx_hdr.magic);
+            /* Validate LPH from the fixed header */
+            MsgPktHeader *hdr = (MsgPktHeader *)s->rx_buf;
+            if (hdr->ulh.cfg != UB_CLAN_LINK_CFG) {
+                qemu_log("ub_link: invalid LPH.cfg=%u, dropping\n",
+                         hdr->ulh.cfg);
                 ub_link_rx_reset(s);
                 return -1;
             }
-            if (s->rx_hdr.version != UB_LINK_FRAME_V1) {
-                qemu_log("ub_link: unsupported frame version %u\n",
-                         s->rx_hdr.version);
-                ub_link_rx_reset(s);
-                return -1;
-            }
-            if (s->rx_hdr.payload_len > UB_LINK_RX_BUF_MAX) {
-                qemu_log("ub_link: frame payload too large %u\n",
-                         s->rx_hdr.payload_len);
+            uint32_t plen = hdr->msgetah.plen;
+            if (plen > UB_LINK_RX_BUF_MAX - UB_LINK_PKT_HDR_SIZE) {
+                qemu_log("ub_link: plen too large %u\n", plen);
                 ub_link_rx_reset(s);
                 return -1;
             }
 
-            s->rx_header_done = true;
-            s->rx_frame_remaining = s->rx_hdr.payload_len;
-
-            /* Shift past header if there are leftover bytes */
-            if (s->rx_buf_used > UB_LINK_FRAME_HDR_SIZE) {
-                size_t excess = s->rx_buf_used - UB_LINK_FRAME_HDR_SIZE;
-                memmove(s->rx_buf, s->rx_buf + UB_LINK_FRAME_HDR_SIZE, excess);
-                s->rx_buf_used = excess;
-            } else {
-                s->rx_buf_used = 0;
-            }
+            s->rx_plen = (uint16_t)plen;
+            s->rx_payload_remaining = plen;
+            s->rx_hdr_done = true;
         }
 
-        /* Phase 2: read payload */
-        if (s->rx_header_done && s->rx_frame_remaining > 0) {
-            /* Ensure capacity */
-            if (s->rx_buf_cap < s->rx_frame_remaining) {
-                s->rx_buf_cap = MIN(s->rx_frame_remaining * 2,
-                                    UB_LINK_RX_BUF_MAX);
+        /* Phase 2: collect payload (rx_plen bytes) */
+        if (s->rx_hdr_done && s->rx_payload_remaining > 0) {
+            size_t total_needed = UB_LINK_PKT_HDR_SIZE + s->rx_payload_remaining;
+            if (s->rx_buf_cap < total_needed) {
+                s->rx_buf_cap = MIN(total_needed * 2, UB_LINK_RX_BUF_MAX);
                 s->rx_buf = g_realloc(s->rx_buf, s->rx_buf_cap);
             }
 
-            want = s->rx_frame_remaining -
-                   (s->rx_buf_used > s->rx_frame_remaining
-                    ? s->rx_frame_remaining
-                    : s->rx_buf_used);
+            size_t have_after_hdr = s->rx_buf_used - UB_LINK_PKT_HDR_SIZE;
+            want = s->rx_payload_remaining -
+                   (have_after_hdr > s->rx_payload_remaining
+                    ? s->rx_payload_remaining : have_after_hdr);
             if (want > 0) {
                 nr = qio_channel_read(s->ioc,
                                       (char *)s->rx_buf + s->rx_buf_used,
                                       want, &local_err);
                 if (nr <= 0) {
-                    if (nr == QIO_CHANNEL_ERR_BLOCK) {
+                    if (nr == QIO_CHANNEL_ERR_BLOCK || nr == 0) {
                         return 0;
                     }
-                    if (nr == 0) {
-                        return 0;
-                    }
-                    qemu_log("ub_link: frame payload read error: %s\n",
+                    qemu_log("ub_link: payload read error: %s\n",
                              error_get_pretty(local_err));
                     error_free(local_err);
                     return -1;
@@ -280,40 +253,41 @@ static int ub_link_recv_frames(UBLinkState *s)
                 s->rx_buf_used += nr;
             }
 
-            if (s->rx_buf_used < s->rx_frame_remaining) {
-                return 0; /* need more payload bytes */
+            if (s->rx_buf_used < UB_LINK_PKT_HDR_SIZE + s->rx_payload_remaining) {
+                return 0;
             }
         }
 
-        /* Phase 3: complete frame — enqueue payload */
-        if (s->rx_header_done && s->rx_frame_remaining > 0 &&
-            s->rx_buf_used >= s->rx_frame_remaining) {
+        /* Phase 3: complete packet — enqueue */
+        if (s->rx_hdr_done &&
+            (s->rx_payload_remaining == 0 ||
+             s->rx_buf_used >= UB_LINK_PKT_HDR_SIZE + s->rx_payload_remaining)) {
+            size_t total_len = UB_LINK_PKT_HDR_SIZE + s->rx_plen;
+
             UBLinkRxMsg *msg = g_malloc(sizeof(*msg));
-            msg->flags = s->rx_hdr.flags;
-            msg->len = s->rx_frame_remaining;
+            msg->len = total_len;
             msg->data = g_malloc(msg->len);
             memcpy(msg->data, s->rx_buf, msg->len);
             g_queue_push_tail(s->rx_msgq, msg);
 
-            qemu_log("ub_link: frame rx len=%zu flags=0x%x\n",
-                     msg->len, msg->flags);
+            qemu_log("ub_link: packet rx cfg=%u plen=%u total=%zu\n",
+                     ((MsgPktHeader *)msg->data)->ulh.cfg,
+                     s->rx_plen, msg->len);
 
-            /* Shift past this frame's payload */
-            {
-                size_t consumed = s->rx_frame_remaining;
-                size_t leftover = s->rx_buf_used - consumed;
-                if (leftover > 0) {
-                    memmove(s->rx_buf, s->rx_buf + consumed, leftover);
-                }
-                s->rx_buf_used = leftover;
+            /* Shift past consumed bytes */
+            size_t consumed = total_len;
+            size_t leftover = s->rx_buf_used - consumed;
+            if (leftover > 0) {
+                memmove(s->rx_buf, s->rx_buf + consumed, leftover);
             }
+            s->rx_buf_used = leftover;
 
-            /* Reset for next frame */
-            s->rx_header_done = false;
-            s->rx_frame_remaining = 0;
-            memset(&s->rx_hdr, 0, sizeof(s->rx_hdr));
+            /* Reset for next packet */
+            s->rx_hdr_done = false;
+            s->rx_plen = 0;
+            s->rx_payload_remaining = 0;
 
-            /* Continue looping to parse more frames from remaining data */
+            /* Continue looping to parse more packets from remaining data */
             continue;
         }
 
@@ -739,9 +713,9 @@ static int ub_link_apply_remote_bridge(UBLinkState *s, Error **errp)
 static void ub_link_rx_reset(UBLinkState *s)
 {
     s->rx_buf_used = 0;
-    s->rx_header_done = false;
-    s->rx_frame_remaining = 0;
-    memset(&s->rx_hdr, 0, sizeof(s->rx_hdr));
+    s->rx_hdr_done = false;
+    s->rx_plen = 0;
+    s->rx_payload_remaining = 0;
 }
 
 static void ub_link_init_rx(UBLinkState *s)
@@ -769,8 +743,9 @@ static void ub_link_cleanup_rx(UBLinkState *s)
     s->rx_buf = NULL;
     s->rx_buf_cap = 0;
     s->rx_buf_used = 0;
-    s->rx_header_done = false;
-    s->rx_frame_remaining = 0;
+    s->rx_hdr_done = false;
+    s->rx_plen = 0;
+    s->rx_payload_remaining = 0;
 }
 
 static void ub_link_finalize(Object *obj)
@@ -967,14 +942,14 @@ int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **e
         return 0;
     }
 
-    /* Try framed socket protocol first */
+    /* Try spec-aligned socket protocol first */
     if (s->ioc) {
-        int ret = ub_link_send_frame(s, UB_LINK_FRAME_FLAG_CTRL, buf, len, errp);
+        int ret = ub_link_send_packet(s, buf, len, errp);
         if (ret >= 0) {
             return 0;
         }
         /* Socket error, fallback to file */
-        qemu_log("ub_link: frame send failed, falling back to file: %s\n",
+        qemu_log("ub_link: packet send failed, falling back to file: %s\n",
                  *errp ? error_get_pretty(*errp) : "unknown");
         if (*errp) {
             error_free(*errp);
