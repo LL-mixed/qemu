@@ -22,6 +22,7 @@
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_ubc.h"
 #include "hw/ub/ub_config.h"
+#include "hw/ub/hisi/ub_fm.h"
 #include "qemu/log.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -160,7 +161,7 @@ static uint32_t ub_dev_get_cna(UBDevice *dev)
     return dev_cna;
 }
 
-static UBDevice *ub_find_device_by_cna(UBBus *bus, uint32_t dcna)
+UBDevice *ub_find_device_by_cna(UBBus *bus, uint32_t dcna)
 {
     UBDevice *dev;
 
@@ -274,8 +275,6 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
     } else {
         ub_dev = ub_find_device_by_cna(s->bus, dcna);
         if (!ub_dev &&
-            header->msgetah.sub_msg_code != UB_CFG0_WRITE &&
-            header->msgetah.sub_msg_code != UB_CFG1_WRITE &&
             ub_load_remote_device_snapshot_by_cna(dcna, &remote_snapshot, NULL)) {
             use_remote_snapshot = true;
         }
@@ -345,6 +344,35 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
         break;
     case UB_CFG0_WRITE:
     case UB_CFG1_WRITE:
+        if (use_remote_snapshot && !ub_dev) {
+            Error *local_err = NULL;
+
+            if (!ub_update_remote_device_snapshot_cfg_by_cna(dcna, cfg_offset,
+                                                             payload->write_data,
+                                                             dw_mask, &local_err)) {
+                if (local_err) {
+                    qemu_log("ub_cfg_rw remote write snapshot update failed: %s\n",
+                             error_get_pretty(local_err));
+                    error_free(local_err);
+                }
+                rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_INVALID_ADDR;
+                goto fill_rq_cq;
+            }
+            qemu_log("ub_cfg_rw remote write snapshot updated dev=%s dcna=%#x offset=%#" PRIx64
+                     " data=%#x\n",
+                     remote_snapshot.device_id, dcna, cfg_offset, payload->write_data);
+            if (ub_fm_kick_by_cna(dcna, &local_err) < 0) {
+                qemu_log("ub_fm_kick_by_cna failed: %s\n", error_get_pretty(local_err));
+                error_free(local_err);
+            }
+            goto fill_rq_cq;
+        }
+
+        if (!ub_dev) {
+            rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_INVALID_ADDR;
+            goto fill_rq_cq;
+        }
+
         emulated_offset = ub_cfg_offset_to_emulated_offset(cfg_offset, false);
         if (emulated_offset != UINT64_MAX && !*((uint32_t *)(&ub_dev->wmask[emulated_offset]))) {
             rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_REG_ATTR_MISMATCH;

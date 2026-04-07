@@ -160,7 +160,7 @@ static void ub_init_ubc_node(uint16_t ubc_count, UbcNode *ubc, VirtMachineState 
         (ubc + i)->msg_queue_interrupt_attr = 0x0;
         memset(&(ubc + i)->ubc_info, 0, sizeof(UbGuid));
         (ubc + i)->ubc_info.vendor = VENDER_ID_HUAWEI;
-        (ubc + i)->ubc_info.device_id = 0x0541;
+        (ubc + i)->ubc_info.device_id = 0x0540;
         (ubc + i)->ubc_info.version = 0;
         (ubc + i)->ubc_info.type = UB_GUID_TYPE_BUS_CONTROLLER;
         (ubc + i)->ubc_info.seq_num = i + 1;

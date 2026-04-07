@@ -1916,7 +1916,7 @@ static void create_ub(VirtMachineState *vms)
     ubc_dev = qdev_new(TYPE_BUS_CONTROLLER_DEV);
     ubc_dev_state = BUS_CONTROLLER_DEV(ubc_dev);
     ubc_dev_state->parent.eid = 1;
-    ubc_dev_state->parent.port.port_num = 2;
+    ubc_dev_state->parent.port.port_num = 3;
     ubc_dev_state->parent.guid.vendor = VENDER_ID_HUAWEI;
     ubc_dev_state->parent.guid.device_id = 0x0541;
     ubc_dev_state->parent.guid.version = 0;
@@ -1929,25 +1929,8 @@ static void create_ub(VirtMachineState *vms)
     ubc_dev_state->bus_instance_guid.seq_num = virt_ub_node_seq(0);
     qdev_set_id(ubc_dev, g_strdup("ubcdev0"), &error_fatal);
     qdev_realize_and_unref(ubc_dev, BUS(ubc_state->bus), &error_fatal);
-
-    DeviceState *ubsw_dev = qdev_new(TYPE_UB_SWITCH_DEV);
-    UBDevice *ubsw = UB_DEVICE(ubsw_dev);
-    qdev_set_id(ubsw_dev, g_strdup("ubsw0"), &error_fatal);
-    ubsw->eid = 2;
-    ubsw->port.port_num = 1;
-    ubsw->guid.vendor = VENDER_ID_HUAWEI;
-    ubsw->guid.device_id = 0x0542;
-    ubsw->guid.version = 0;
-    ubsw->guid.type = UB_GUID_TYPE_SWITCH;
-    ubsw->guid.seq_num = virt_ub_node_seq(1);
-    qdev_realize_and_unref(ubsw_dev, BUS(ubc_state->bus), &error_fatal);
     {
         static const UBFMTopologyLinkDesc single_node_links[] = {
-            {
-                .a = { .device_id = (char *)"ubcdev0", .port_idx = 0 },
-                .b = { .device_id = (char *)"ubsw0", .port_idx = 0 },
-                .link_up = true,
-            },
             {
                 /*
                  * Reserve port1 for the future inter-node UBC<->UBC link

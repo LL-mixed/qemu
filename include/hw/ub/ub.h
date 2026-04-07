@@ -135,10 +135,17 @@ typedef struct NeighborInfo {
     bool is_remote_neighbor;
     uint32_t local_port_idx;
     uint32_t neighbor_port_idx;
+    bool remote_neighbor_guid_valid;
+    UbGuid remote_neighbor_guid;
+    bool remote_primary_cna_valid;
+    uint32_t remote_primary_cna;
     bool remote_bus_instance_guid_valid;
     bool remote_cfg_notify_sent;
     uint8_t remote_cfg_notify_attempts;
     uint64_t remote_cfg_notify_next_retry_ms;
+    bool remote_linkup_notify_sent;
+    uint8_t remote_linkup_notify_attempts;
+    uint64_t remote_linkup_notify_next_retry_ms;
     UbGuid remote_bus_instance_guid;
 } NeighborInfo;
 
@@ -297,6 +304,7 @@ void ub_default_read_config(UBDevice *dev, uint64_t offset,
 void ub_default_write_config(UBDevice *dev, uint64_t offset,
                              uint32_t *val, uint32_t dw_mask);
 UBDevice *ub_find_device_by_guid(UbGuid *guid);
+UBDevice *ub_find_device_by_cna(UBBus *bus, uint32_t dcna);
 int ub_dev_finally_setup(Error **errp);
 static inline uint64_t ub_config_size(void)
 {
@@ -329,6 +337,13 @@ bool ub_load_remote_device_snapshot_by_guid(const UbGuid *guid,
 bool ub_load_remote_device_snapshot_by_cna(uint32_t cna,
                                            UBRemoteDeviceSnapshot *snapshot,
                                            Error **errp);
+bool ub_update_remote_device_snapshot_cfg_by_cna(uint32_t cna,
+                                                 uint64_t cfg_offset,
+                                                 uint32_t write_data,
+                                                 uint32_t dw_mask,
+                                                 Error **errp);
+bool ub_sync_local_device_cfg_from_snapshot(UBDevice *dev, bool *changed,
+                                            Error **errp);
 uint32_t ub_default_cna_for_device(UBDevice *dev);
 void ub_set_device_cna(UBDevice *dev, uint32_t cna);
 bool ub_device_has_remote_only_neighbor(UBDevice *dev);

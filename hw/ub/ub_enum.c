@@ -49,10 +49,8 @@ static void enum_get_port_info_from_config_space(UBDevice *dev, uint16_t port_id
     port_info->bits0.len = sizeof(EnumTlvPortInfo);
     port_info->bits0.type = TLV_PORT_INFO;
     port_info->bits0.w = 1;
-    if (!memcmp(&port_basic->neighbor_port_info.neighbot_port_guid,
-                &port_info->remote_guid, sizeof(UbGuid))) {
-        port_info->bits0.s = UB_PORT_STATUS_DOWN;
-    } else {
+    /* Check if neighbor guid is initialized (non-zero) to determine link status */
+    if (ub_guid_initialized(&port_basic->neighbor_port_info.neighbot_port_guid)) {
         /* dw0 */
         port_info->bits0.s = UB_PORT_STATUS_UP;
         port_info->bits0.b = port_basic->port_info.enum_boundary;
@@ -62,6 +60,21 @@ static void enum_get_port_info_from_config_space(UBDevice *dev, uint16_t port_id
         port_info->local_port_idx = port_basic->port_info.port_idx;
         /* dw3~dw6 */
         port_info->remote_guid = port_basic->neighbor_port_info.neighbot_port_guid;
+    } else {
+        port_info->bits0.s = UB_PORT_STATUS_DOWN;
+    }
+
+    if (object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV) && port_idx == 1) {
+        char guid_str[UB_DEV_GUID_STRING_LENGTH + 1] = { 0 };
+
+        ub_device_get_str_from_guid(&port_info->remote_guid, guid_str,
+                                    sizeof(guid_str));
+        qemu_log("ub_enum local portinfo %s:%u s=%u b=%u local=%u remote=%u guid=%s\n",
+                 dev->qdev.id ? dev->qdev.id : "<unknown>",
+                 port_idx,
+                 port_info->bits0.s, port_info->bits0.b,
+                 port_info->local_port_idx, port_info->remote_port_idx,
+                 guid_str);
     }
 }
 

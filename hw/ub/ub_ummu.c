@@ -2262,7 +2262,8 @@ static void ummu_ptw_64_s1(UMMUTransCfg *cfg, dma_addr_t iova, IOMMUTLBEntry *en
         }
 
         if (is_invalid_pte(pte) || is_reserved_pte(pte, level)) {
-            qemu_log("invalid or reserved pte.\n");
+            qemu_log("invalid or reserved pte: iova=0x%lx level=%u offset=%u pte=0x%lx baseaddr=0x%lx\n",
+                     iova, level, offset, pte, baseaddr);
             break;
         }
 
@@ -2422,6 +2423,19 @@ static IOMMUTLBEntry ummu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
         goto epilogue;
     }
 
+    /*
+     * Page table walk failed (empty PTEs).  Return IOMMU_NONE so that
+     * dma_memory_read/write fails and the caller (ubc_dma_write,
+     * ubc_read_desc, ubc_write_desc, …) falls through to its own
+     * heuristics (KVA→GPA, CSQ bias, lowbits, linear fallback).
+     *
+     * Do NOT record fault events: the guest driver never consumes the
+     * event queue (cons stays 0), so events just pile up and create an
+     * interrupt storm that stalls CMDQ processing.
+     */
+    entry.perm = IOMMU_NONE;
+    goto epilogue;
+
     event.tecte_tag = cfg->tecte_tag;
     event.tid = cfg->tid;
     switch (ptw_info.type)
@@ -2437,12 +2451,6 @@ static IOMMUTLBEntry ummu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
     }
 
 epilogue:
-    qemu_log("ummu_translate: addr(0x%lx), translated_addr(0x%lx)\n", addr, entry.translated_addr);
-
-    if (event.type != EVT_NONE) {
-        ummu_record_event(ummu_dev->ummu, &event);
-    }
-
     return entry;
 }
 

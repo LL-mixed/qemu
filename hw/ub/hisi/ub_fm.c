@@ -19,6 +19,7 @@
 #include "hw/ub/hisi/ub_fm.h"
 #include "hw/ub/ub.h"
 #include "hw/ub/ub_link.h"
+#include "hw/ub/ub_ubc.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
 
@@ -153,6 +154,8 @@ static bool ub_fm_desc_matches_device(UBFMTopologyLinkDesc *desc, UBDevice *dev)
             !strcmp(desc->b.device_id, dev->qdev.id));
 }
 
+static void ub_fm_configure_remote_links(void);
+
 void ub_fm_controller_register(BusControllerState *s)
 {
     Error *local_err = NULL;
@@ -169,6 +172,121 @@ void ub_fm_controller_register(BusControllerState *s)
 
     if (ub_fm_refresh_topology(&local_err) < 0) {
         error_report_err(local_err);
+    }
+}
+
+/* Configure remote links for all active links */
+static void ub_fm_configure_remote_links(void)
+{
+    guint i;
+
+    qemu_log("ub_fm: configure_remote_links: ub_fm_active_links=%p len=%u\n",
+             ub_fm_active_links, ub_fm_active_links ? ub_fm_active_links->len : 0);
+
+    if (!ub_fm_active_links) {
+        return;
+    }
+
+    for (i = 0; i < ub_fm_active_links->len; i++) {
+        UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+        UBFMEndpointDesc *local = NULL;
+        UBFMEndpointDesc *remote = NULL;
+        UBDevice *local_dev = NULL;
+        g_autofree char *remote_path = NULL;
+        g_autoptr(GKeyFile) keyfile = NULL;
+        g_autoptr(GError) gerr = NULL;
+        g_autofree char *remote_guid_str = NULL;
+        UbGuid remote_guid;
+
+        qemu_log("ub_fm: checking link %u: %s:%u <-> %s:%u\n", i,
+                 link->desc.a.device_id ? link->desc.a.device_id : "(null)",
+                 link->desc.a.port_idx,
+                 link->desc.b.device_id ? link->desc.b.device_id : "(null)",
+                 link->desc.b.port_idx);
+
+        /* Determine which endpoint is local and which is remote */
+        if (link->desc.a.device_id && strchr(link->desc.a.device_id, '.') == NULL) {
+            /* a is local (no dot), b is remote */
+            local = &link->desc.a;
+            remote = &link->desc.b;
+        } else if (link->desc.b.device_id && strchr(link->desc.b.device_id, '.') == NULL) {
+            /* b is local (no dot), a is remote */
+            local = &link->desc.b;
+            remote = &link->desc.a;
+        } else {
+            /* Both endpoints have dots or neither does - skip */
+            qemu_log("ub_fm: skipping link %u - cannot determine local endpoint\n", i);
+            continue;
+        }
+
+        if (!local->device_id) {
+            qemu_log("ub_fm: skipping link %u - local device_id is NULL\n", i);
+            continue;
+        }
+
+        if (!remote->device_id) {
+            qemu_log("ub_fm: skipping link %u - remote device_id is NULL\n", i);
+            continue;
+        }
+
+        qemu_log("ub_fm: local=%s:%u remote=%s:%u\n",
+                 local->device_id, local->port_idx,
+                 remote->device_id, remote->port_idx);
+
+        /* Find the local device by ID */
+        qemu_log("ub_fm: about to call ub_find_device_by_id for %s\n", local->device_id);
+        local_dev = ub_find_device_by_id(local->device_id);
+        qemu_log("ub_fm: ub_find_device_by_id returned %p\n", local_dev);
+        if (!local_dev) {
+            qemu_log("ub_fm: cannot find local device for %s\n", local->device_id);
+            continue;
+        }
+
+        /* Read remote endpoint info from shared directory */
+        qemu_log("ub_fm: about to call ub_link_endpoint_path for %s:%u\n", remote->device_id, remote->port_idx);
+        remote_path = ub_link_endpoint_path(remote->device_id, remote->port_idx, false);
+        qemu_log("ub_fm: remote_path=%s\n", remote_path);
+        keyfile = g_key_file_new();
+        qemu_log("ub_fm: about to call g_key_file_load_from_file\n");
+        if (!g_key_file_load_from_file(keyfile, remote_path, G_KEY_FILE_NONE, &gerr)) {
+            qemu_log("ub_fm: failed to load remote endpoint info from %s: %s\n",
+                     remote_path, gerr ? gerr->message : "unknown");
+            continue;
+        }
+        qemu_log("ub_fm: g_key_file_load_from_file succeeded\n");
+
+        /* Get remote GUID */
+        fprintf(stderr, "ub_fm: about to call g_key_file_get_string\n"); fflush(stderr);
+        remote_guid_str = g_key_file_get_string(keyfile, "endpoint", "guid", &gerr);
+        fprintf(stderr, "ub_fm: g_key_file_get_string returned %p, gerr=%p\n", remote_guid_str, gerr); fflush(stderr);
+        if (!remote_guid_str || gerr) {
+            qemu_log("ub_fm: remote endpoint %s missing guid\n", remote_path);
+            continue;
+        }
+        fprintf(stderr, "ub_fm: remote_guid_str=%s\n", remote_guid_str); fflush(stderr);
+
+        /* Parse GUID string */
+        fprintf(stderr, "ub_fm: about to call ub_device_get_guid_from_str\n"); fflush(stderr);
+        if (!ub_device_get_guid_from_str(&remote_guid, remote_guid_str)) {
+            qemu_log("ub_fm: failed to parse remote guid %s\n", remote_guid_str);
+            continue;
+        }
+        fprintf(stderr, "ub_fm: ub_device_get_guid_from_str succeeded\n"); fflush(stderr);
+
+        /* Configure device with remote endpoint info */
+        fprintf(stderr, "ub_fm: about to call ub_connect_device_port_remote\n"); fflush(stderr);
+        if (ub_connect_device_port_remote(local_dev, local->port_idx,
+                                           remote->device_id, &remote_guid,
+                                           remote->port_idx, NULL) == 0) {
+            char guid_str[UB_DEV_GUID_STRING_LENGTH + 1];
+            ub_device_get_str_from_guid(&remote_guid, guid_str, sizeof(guid_str));
+            fprintf(stderr, "ub_fm: configured remote link %s:%u -> %s:%u guid=%s\n",
+                     local->device_id, local->port_idx,
+                     remote->device_id, remote->port_idx,
+                     guid_str); fflush(stderr);
+        } else {
+            fprintf(stderr, "ub_fm: ub_connect_device_port_remote failed\n"); fflush(stderr);
+        }
     }
 }
 
@@ -586,14 +704,22 @@ static void ub_fm_reconcile_local_fabric_config(void)
 
     for (i = 0; i < devices->len; i++) {
         UBDevice *dev = g_ptr_array_index(devices, i);
+        uint32_t desired_cna = dev->cna;
+        bool snapshot_changed = false;
 
-        ub_set_device_cna(dev, ub_default_cna_for_device(dev));
-        if (!ub_device_has_remote_only_neighbor(dev)) {
-            ub_program_route_table(dev);
-        } else {
-            qemu_log("ub_fm: defer route program for %s while remote-only neighbors exist\n",
-                     dev->qdev.id);
+        if (object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV)) {
+            (void)ub_sync_local_device_cfg_from_snapshot(dev, &snapshot_changed, NULL);
+            if (snapshot_changed) {
+                qemu_log("ub_fm: reconcile applied snapshot update for %s\n",
+                         dev->qdev.id);
+            }
         }
+
+        if (!desired_cna) {
+            desired_cna = ub_default_cna_for_device(dev);
+        }
+        ub_set_device_cna(dev, desired_cna);
+        ub_program_route_table(dev);
         (void)ub_publish_device_snapshot(dev, NULL);
         qemu_log("ub_fm: reconciled local fabric config for %s cna=%#x ports=%u\n",
                  dev->qdev.id, dev->cna, dev->port.port_num);
@@ -620,7 +746,7 @@ static void ub_fm_schedule_pending_refresh(bool needed)
 
     if (needed) {
         timer_mod(ub_fm_pending_refresh_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
     } else {
         timer_del(ub_fm_pending_refresh_timer);
     }
@@ -970,17 +1096,159 @@ int ub_fm_apply_declared_topology(Error **errp)
             int ret = ub_link_apply(link->runtime, errp);
 
             if (ret < 0) {
-                return -1;
-            }
-            if (ret > 0) {
+                /* Link failed - mark as failed but continue with other links */
                 has_pending = true;
                 continue;
             }
+            if (ret > 0) {
+                /* Link pending - not ready yet */
+                has_pending = true;
+                continue;
+            }
+            /* ret == 0: link fully applied and READY — register AIO receive callback */
+            if (link->runtime->remote_applied && !link->runtime->rx_cb) {
+                UBDevice *dev = NULL;
+                if (link->runtime->a.device) {
+                    dev = link->runtime->a.device;
+                } else if (link->runtime->b.device) {
+                    dev = link->runtime->b.device;
+                }
+                if (dev && object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV)) {
+                    BusControllerState *ubc = container_of_ubbus(
+                        UB_BUS(qdev_get_parent_bus(DEVICE(dev))));
+                    link->runtime->rx_cb =
+                        (void (*)(void *, UBLinkState *))ub_link_process_incoming_message;
+                    link->runtime->rx_cb_opaque = ubc;
+                }
+            }
         }
     }
+
+    if (ub_fm_active_links) {
+        for (i = 0; i < ub_fm_active_links->len; i++) {
+            UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+
+            if (link->runtime && ub_link_poll_kick(link->runtime)) {
+                UBDevice *dev = NULL;
+                uint32_t port_idx = 0;
+
+                if (link->runtime->a.device) {
+                    dev = link->runtime->a.device;
+                    port_idx = link->runtime->a.port_idx;
+                } else if (link->runtime->b.device) {
+                    dev = link->runtime->b.device;
+                    port_idx = link->runtime->b.port_idx;
+                }
+
+                if (dev && object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV)) {
+                    BusControllerState *ubc = container_of_ubbus(
+                        UB_BUS(qdev_get_parent_bus(DEVICE(dev))));
+                    bool snapshot_changed = false;
+
+                    /* Register AIO receive callback for direct URMA data delivery */
+                    if (!link->runtime->rx_cb) {
+                        link->runtime->rx_cb = (void (*)(void *, UBLinkState *))ub_link_process_incoming_message;
+                        link->runtime->rx_cb_opaque = ubc;
+                    }
+
+                    qemu_log("ub_fm: remote kick received on %s:%u, processing msgq\n",
+                             dev->qdev.id, port_idx);
+                    ub_link_process_incoming_message(ubc, link->runtime);
+                    msgq_process_task(ubc, 0);
+                    if (ub_sync_local_device_cfg_from_snapshot(dev, &snapshot_changed, NULL) &&
+                        snapshot_changed) {
+                        qemu_log("ub_fm: remote kick applied snapshot update on %s:%u\n",
+                                 dev->qdev.id, port_idx);
+                    }
+                }
+            }
+            /*
+             * Keep polling for remote links so runtime kicks/snapshot changes
+             * can be observed after the initial topology apply.
+             */
+            if (link->runtime &&
+                (link->runtime->remote_applied ||
+                 link->runtime->a.device == NULL ||
+                 link->runtime->b.device == NULL)) {
+                has_pending = true;
+            }
+        }
+    }
+
+    /* Configure remote links after topology is applied */
+    ub_fm_configure_remote_links();
+
     ub_fm_reconcile_local_fabric_config();
     ub_fm_schedule_pending_refresh(has_pending || ub_fm_has_pending_links());
     return 0;
+}
+
+int ub_fm_kick_by_cna(uint32_t dcna, Error **errp)
+{
+    guint i;
+
+    if (!ub_fm_active_links) {
+        return 0;
+    }
+
+    for (i = 0; i < ub_fm_active_links->len; i++) {
+        UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+        UBDevice *local = NULL;
+        uint32_t port_idx = 0;
+
+        if (!link->runtime || !link->runtime->remote_applied) {
+            continue;
+        }
+
+        if (link->runtime->a.device) {
+            local = link->runtime->a.device;
+            port_idx = link->runtime->a.port_idx;
+        } else if (link->runtime->b.device) {
+            local = link->runtime->b.device;
+            port_idx = link->runtime->b.port_idx;
+        }
+
+        if (local && local->port.neighbors[port_idx].is_remote_neighbor &&
+            local->port.neighbors[port_idx].remote_primary_cna == (dcna & 0x00ffffffU)) {
+            return ub_link_kick_remote(link->runtime, errp);
+        }
+    }
+
+    return 0;
+}
+
+UBFMManagedLink *ub_fm_find_link_by_cna(uint32_t dcna)
+{
+    guint i;
+
+    if (!ub_fm_active_links) {
+        return NULL;
+    }
+
+    for (i = 0; i < ub_fm_active_links->len; i++) {
+        UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+        UBDevice *local = NULL;
+        uint32_t port_idx = 0;
+
+        if (!link->runtime || !link->runtime->remote_applied) {
+            continue;
+        }
+
+        if (link->runtime->a.device) {
+            local = link->runtime->a.device;
+            port_idx = link->runtime->a.port_idx;
+        } else if (link->runtime->b.device) {
+            local = link->runtime->b.device;
+            port_idx = link->runtime->b.port_idx;
+        }
+
+        if (local && local->port.neighbors[port_idx].is_remote_neighbor &&
+            local->port.neighbors[port_idx].remote_primary_cna == (dcna & 0x00ffffffU)) {
+            return link;
+        }
+    }
+
+    return NULL;
 }
 
 uint64_t ub_fm_msgq_reg_read(void *opaque, hwaddr addr, unsigned len)

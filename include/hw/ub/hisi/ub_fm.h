@@ -70,4 +70,6 @@ void ub_fm_remove_topology_link(const char *a_device_id, uint32_t a_port_idx,
                                 const char *b_device_id, uint32_t b_port_idx);
 void ub_fm_clear_declared_topology(void);
 int ub_fm_apply_declared_topology(Error **errp);
+int ub_fm_kick_by_cna(uint32_t dcna, Error **errp);
+UBFMManagedLink *ub_fm_find_link_by_cna(uint32_t dcna);
 #endif

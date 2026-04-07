@@ -1,0 +1,88 @@
+#include "qemu/osdep.h"
+#include "qemu/units.h"
+#include "qemu/error-report.h"
+#include "qemu/log.h"
+#include "qapi/error.h"
+#include "hw/qdev-properties.h"
+#include "hw/pci/pci.h"
+#include "hw/pci/msi.h"
+#include "hw/arm/virt.h"
+#include "hw/core/cpu.h"
+#include "hw/ub/ub_common.h"
+#include "hw/ub/ubus_instance.h"
+#include "hw/ub/ub_bus.h"
+#include "hw/ub/ub_ubc.h"
+#include "hw/ub/ub_ummu.h"
+#include "hw/ub/ub_config.h"
+#include "hw/ub/ub_usi.h"
+#include "hw/ub/hisi/ubc.h"
+#include "hw/ub/hisi/ub_mem.h"
+#include "hw/ub/hisi/ub_fm.h"
+#include "hw/ub/ub_link.h"
+#include "sysemu/dma.h"
+#include "sysemu/sysemu.h"
+
+/* ... skipping large chunks of ubc implementation for brevity, assuming existing functions stay ... */
+
+static void ubc_publish_endpoint(BusControllerDev *ubc_dev)
+{
+    UBDevice *ub_dev = &ubc_dev->parent;
+    const char *node_id = g_getenv("UB_FM_NODE_ID");
+    const char *shared_dir = g_getenv("UB_FM_SHARED_DIR");
+    
+    qemu_log("ubc realize: node_id=%s shared_dir=%s\n", 
+             node_id ? node_id : "NULL", shared_dir ? shared_dir : "NULL");
+             
+    if (node_id && shared_dir) {
+        g_autofree char *token = g_strdup_printf("%s_%s", node_id, DEVICE(ubc_dev)->id);
+        g_autofree char *path = g_strdup_printf("%s/%s__1.ini", shared_dir, token);
+        GKeyFile *keyfile = g_key_file_new();
+        char guid_str[UB_DEV_GUID_STRING_LENGTH + 1];
+
+        ub_device_get_str_from_guid(&ub_dev->guid, guid_str, sizeof(guid_str));
+        g_key_file_set_string(keyfile, "endpoint", "device_id", DEVICE(ubc_dev)->id);
+        g_key_file_set_uint64(keyfile, "endpoint", "port_idx", 1);
+        g_key_file_set_string(keyfile, "endpoint", "guid", guid_str);
+        g_key_file_set_uint64(keyfile, "endpoint", "primary_cna", ub_dev->cna);
+
+        g_autofree char *data = g_key_file_to_data(keyfile, NULL, NULL);
+        g_mkdir_with_parents(shared_dir, 0755);
+        if (g_file_set_contents(path, data, -1, NULL)) {
+            qemu_log("ubc: published endpoint info to %s\n", path);
+        } else {
+            qemu_log("ubc: FAILED to publish endpoint info to %s\n", path);
+        }
+        g_key_file_free(keyfile);
+    }
+}
+
+static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
+{
+    UBBus *bus = UB_BUS(qdev_get_parent_bus(DEVICE(dev)));
+    BusControllerState *ubc = container_of_ubbus(bus);
+    PCIDevice *pci_dev = PCI_DEVICE(dev);
+
+    if (!ub_ubc_is_empty(bus)) {
+        error_setg(errp, "ubc realize repetitively");
+        return;
+    }
+
+    ubc->ubc_dev = BUS_CONTROLLER_DEV(dev);
+    dev->dev_type = UB_TYPE_IBUS_CONTROLLER;
+    
+    ub_bus_controller_dev_config_space_init(dev);
+    ub_bus_controller_init_ers_regions(ubc->ubc_dev, errp);
+    ub_bus_controller_activate_ers_mappings(dev);
+    
+    if (0 > ummu_associating_with_ubc(ubc)) {
+        qemu_log("failed to associating ubc with ummu. %s\n", dev->name);
+    }
+
+    if (ub_bus_instance_process(ubc->ubc_dev, errp)) {
+        return;
+    }
+    ub_fm_controller_register(ubc);
+    
+    ubc_publish_endpoint(ubc->ubc_dev);
+    ub_publish_device_snapshot(dev, errp);
+}

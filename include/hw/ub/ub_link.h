@@ -5,16 +5,6 @@
  * connection. It exists as a topology object, separate from the UBC model,
  * so future multi-instance UBC<->UBC links can be represented without
  * embedding interconnect behavior inside a controller implementation.
- *
- * Data transport uses UB spec-aligned packets over a Unix domain socket.
- * For cfg==6 (16-bit CNA, CTP) the wire format is:
- *
- *   [LPH 4B] [NTH 8B] [CTPH+UPIH+EIDH+BTAH 16B] [ExtHdr 4B] [Payload plen B]
- *   = MsgPktHeader (32 bytes fixed) + plen bytes payload
- *
- * The LPH (UbLinkHeader) provides cfg and vl fields for packet type
- * identification.  msgetah.plen in the fixed header determines the
- * variable-length payload that follows.
  */
 
 #ifndef UB_LINK_H
@@ -23,6 +13,7 @@
 #include "qom/object.h"
 #include "io/channel.h"
 #include "io/net-listener.h"
+#include "qapi/error.h"
 
 typedef struct UBDevice UBDevice;
 
@@ -44,6 +35,13 @@ typedef struct UBLinkRxMsg {
     size_t len;      /* total = UB_LINK_PKT_HDR_SIZE + plen */
     void *data;      /* g_malloc'd: MsgPktHeader + payload */
 } UBLinkRxMsg;
+
+/* Link state for Ready Contract */
+typedef enum UBLinkStateEnum {
+    UB_LINK_STATE_PENDING = 0,
+    UB_LINK_STATE_READY = 1,
+    UB_LINK_STATE_FAILED = -1
+} UBLinkStateEnum;
 
 /* ---------- endpoint and link structures ---------- */
 
@@ -88,8 +86,17 @@ struct UBLinkState {
     /* Queue of fully received packets */
     GQueue *rx_msgq;
 
-    /* AIO watch source ID (0 = not registered) */
-    guint aio_watch_id;
+    /* Callback invoked when a packet is received via socket AIO */
+    void (*rx_cb)(void *opaque, UBLinkState *s);
+    void *rx_cb_opaque;
+
+    /* Ready Contract state fields */
+    UBLinkStateEnum state;
+    bool socket_connected;
+    bool remote_guid_valid;
+    uint64_t reconcile_ts_ms;
+    char *last_error;
+    char *status_file_path;
 };
 
 void ub_link_configure(UBLinkState *s, const char *a_device_id, uint32_t a_port_idx,
@@ -103,5 +110,13 @@ int ub_link_kick_remote(UBLinkState *s, Error **errp);
 int ub_link_poll_kick(UBLinkState *s);
 int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **errp);
 int ub_link_read_message(UBLinkState *s, void **buf, size_t *len, Error **errp);
+char *ub_link_endpoint_path(const char *device_id, uint32_t port_idx, bool local_scope);
+
+/* Ready Contract management */
+int ub_link_update_status_file(UBLinkState *s);
+void ub_link_mark_connected(UBLinkState *s);
+void ub_link_mark_failed(UBLinkState *s, const char *reason);
+bool ub_link_is_ready(UBLinkState *s);
+char *ub_link_status_path(const char *device_id, uint32_t port_idx);
 
 #endif

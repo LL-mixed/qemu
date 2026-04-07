@@ -51,6 +51,9 @@ QLIST_HEAD(, BusControllerState) ub_bus_controllers;
 
 #define UB_PORT_PHYSICAL_PORT_LINK_STATUS 0x700
 #define UB_REMOTE_DEVICE_SNAPSHOT_GLOB "device-*.ini"
+#define UB_CFG0_EID_0_OFFSET  0x48
+#define UB_CFG0_UPI_OFFSET    0x7c
+#define UB_CFG0_FM_CNA_OFFSET 0x98
 static void ub_update_mappings(UBDevice *dev);
 
 static const char *ub_shared_dir(void)
@@ -316,6 +319,81 @@ static bool ub_load_remote_device_snapshot_from_path(const char *path,
     return true;
 }
 
+static bool ub_store_remote_device_snapshot_to_path(const char *path,
+                                                    const UBRemoteDeviceSnapshot *snapshot,
+                                                    Error **errp)
+{
+    g_autoptr(GKeyFile) keyfile = NULL;
+    g_autofree char *tmp_path = NULL;
+    g_autofree char *guid_str = NULL;
+    g_autofree char *data = NULL;
+    GError *gerr = NULL;
+    gsize data_len = 0;
+    uint32_t i;
+
+    if (!path || !snapshot) {
+        error_setg(errp, "ub snapshot store arguments invalid");
+        return false;
+    }
+
+    keyfile = g_key_file_new();
+    tmp_path = g_strdup_printf("%s.tmp-%d", path, (int)getpid());
+    guid_str = g_malloc0(UB_DEV_GUID_STRING_LENGTH + 1);
+    ub_device_get_str_from_guid((UbGuid *)&snapshot->guid, guid_str,
+                                UB_DEV_GUID_STRING_LENGTH + 1);
+
+    g_key_file_set_string(keyfile, "device", "device_id", snapshot->device_id);
+    g_key_file_set_string(keyfile, "device", "guid", guid_str);
+    g_key_file_set_uint64(keyfile, "device", "port_num", snapshot->port_num);
+    g_key_file_set_uint64(keyfile, "device", "class_code", snapshot->class_code);
+    g_key_file_set_uint64(keyfile, "device", "primary_cna",
+                          snapshot->primary_cna & 0x00ffffffU);
+    g_key_file_set_uint64(keyfile, "device", "eid",
+                          snapshot->eid & 0x000fffffU);
+    g_key_file_set_uint64(keyfile, "device", "fm_cna",
+                          snapshot->fm_cna & 0x00ffffffU);
+    g_key_file_set_uint64(keyfile, "device", "upi",
+                          snapshot->upi & 0x7fffU);
+
+    for (i = 0; i < snapshot->port_num && i < UB_DEV_MAX_NUM_OF_PORT; i++) {
+        char section[32];
+        g_autofree char *neighbor_guid_str = g_malloc0(UB_DEV_GUID_STRING_LENGTH + 1);
+
+        snprintf(section, sizeof(section), "port%u", i);
+        g_key_file_set_uint64(keyfile, section, "local_port_idx",
+                              snapshot->ports[i].local_port_idx);
+        g_key_file_set_uint64(keyfile, section, "link_up",
+                              snapshot->ports[i].link_up ? 1 : 0);
+        g_key_file_set_uint64(keyfile, section, "neighbor_port_idx",
+                              snapshot->ports[i].neighbor_port_idx);
+        ub_device_get_str_from_guid((UbGuid *)&snapshot->ports[i].neighbor_guid,
+                                    neighbor_guid_str,
+                                    UB_DEV_GUID_STRING_LENGTH + 1);
+        g_key_file_set_string(keyfile, section, "neighbor_guid", neighbor_guid_str);
+    }
+
+    data = g_key_file_to_data(keyfile, &data_len, &gerr);
+    if (gerr) {
+        error_setg(errp, "ub snapshot serialize failed for %s: %s",
+                   path, gerr->message);
+        g_error_free(gerr);
+        return false;
+    }
+    if (!g_file_set_contents(tmp_path, data, data_len, &gerr)) {
+        error_setg(errp, "ub snapshot write failed %s: %s",
+                   tmp_path, gerr->message);
+        g_error_free(gerr);
+        return false;
+    }
+    if (g_rename(tmp_path, path) < 0) {
+        error_setg(errp, "ub snapshot publish failed %s: %s",
+                   path, strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
 bool ub_load_remote_device_snapshot_by_guid(const UbGuid *guid,
                                             UBRemoteDeviceSnapshot *snapshot,
                                             Error **errp)
@@ -380,6 +458,114 @@ bool ub_load_remote_device_snapshot_by_cna(uint32_t cna,
 
     g_dir_close(dir);
     return false;
+}
+
+static uint32_t ub_cfg_apply_dword_mask(uint32_t oldv, uint32_t write_data, uint32_t dw_mask)
+{
+    return (oldv & ~dw_mask) | (write_data & dw_mask);
+}
+
+bool ub_update_remote_device_snapshot_cfg_by_cna(uint32_t cna,
+                                                 uint64_t cfg_offset,
+                                                 uint32_t write_data,
+                                                 uint32_t dw_mask,
+                                                 Error **errp)
+{
+    UBRemoteDeviceSnapshot snapshot = { 0 };
+    g_autofree char *path = NULL;
+    bool supported = true;
+
+    if (!ub_load_remote_device_snapshot_by_cna(cna, &snapshot, errp)) {
+        return false;
+    }
+
+    switch (cfg_offset) {
+    case UB_CFG0_BASIC_NA_INFO_START:
+        snapshot.primary_cna = ub_cfg_apply_dword_mask(snapshot.primary_cna,
+                                                       write_data, dw_mask);
+        snapshot.primary_cna &= 0x00ffffffU;
+        break;
+    case UB_CFG0_EID_0_OFFSET:
+        snapshot.eid = ub_cfg_apply_dword_mask(snapshot.eid, write_data, dw_mask);
+        snapshot.eid &= 0x000fffffU;
+        break;
+    case UB_CFG0_UPI_OFFSET:
+        snapshot.upi = ub_cfg_apply_dword_mask(snapshot.upi, write_data, dw_mask);
+        snapshot.upi &= 0x7fffU;
+        break;
+    case UB_CFG0_FM_CNA_OFFSET:
+        snapshot.fm_cna = ub_cfg_apply_dword_mask(snapshot.fm_cna,
+                                                  write_data, dw_mask);
+        snapshot.fm_cna &= 0x00ffffffU;
+        break;
+    default:
+        error_setg(errp, "ub remote snapshot write unsupported offset=%#" PRIx64,
+                   cfg_offset);
+        supported = false;
+        break;
+    }
+
+    if (!supported) {
+        return false;
+    }
+
+    path = ub_snapshot_guid_path(&snapshot.guid);
+    if (!ub_store_remote_device_snapshot_to_path(path, &snapshot, errp)) {
+        return false;
+    }
+    return true;
+}
+
+bool ub_sync_local_device_cfg_from_snapshot(UBDevice *dev, bool *changed,
+                                            Error **errp)
+{
+    UBRemoteDeviceSnapshot snapshot = { 0 };
+    uint64_t emulated_offset;
+    UbCfg0Basic *cfg0_basic;
+    uint32_t current_eid;
+    uint32_t current_fm_cna;
+    uint16_t current_upi;
+    bool local_changed = false;
+
+    if (changed) {
+        *changed = false;
+    }
+    if (!dev) {
+        error_setg(errp, "ub sync local snapshot with null device");
+        return false;
+    }
+    if (!ub_load_remote_device_snapshot_by_guid(&dev->guid, &snapshot, errp)) {
+        return false;
+    }
+
+    emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_BASIC_START, true);
+    cfg0_basic = (UbCfg0Basic *)(dev->config + emulated_offset);
+    current_eid = cfg0_basic->eid.dw0 & 0x000fffffU;
+    current_fm_cna = cfg0_basic->fm_cna & 0x00ffffffU;
+    current_upi = cfg0_basic->upi & 0x7fffU;
+
+    if (current_eid != (snapshot.eid & 0x000fffffU) ||
+        current_fm_cna != (snapshot.fm_cna & 0x00ffffffU) ||
+        current_upi != (snapshot.upi & 0x7fffU)) {
+        ub_set_cluster_peer_cfg(dev, snapshot.eid, snapshot.upi, snapshot.fm_cna);
+        dev->eid = snapshot.eid & 0x000fffffU;
+        local_changed = true;
+    }
+
+    if (local_changed) {
+        ub_program_route_table(dev);
+        (void)ub_publish_device_snapshot(dev, NULL);
+        qemu_log("ub sync local snapshot applied %s eid=%#x upi=%#x fm_cna=%#x\n",
+                 dev->qdev.id ? dev->qdev.id : "<unknown>",
+                 snapshot.eid & 0x000fffffU,
+                 snapshot.upi & 0x7fffU,
+                 snapshot.fm_cna & 0x00ffffffU);
+    }
+
+    if (changed) {
+        *changed = local_changed;
+    }
+    return true;
 }
 
 static void ubbus_dev_print(Monitor *mon, DeviceState *dev, int indent)
@@ -692,16 +878,23 @@ static uint32_t ub_route_entry_for_port(UBDevice *dev, uint32_t port_idx)
     }
 
     info = &dev->port.neighbors[port_idx];
-    if (!info->neighbor_dev && !info->is_remote_neighbor) {
+    if (!info->is_remote_neighbor && !info->neighbor_dev) {
         return 0;
     }
 
-    if (info->neighbor_dev) {
+    if (info->is_remote_neighbor) {
+        if (info->remote_primary_cna_valid) {
+            remote_cna = info->remote_primary_cna & 0x00ffffffU;
+            qemu_log("ub route entry %s:%u remote neighbor=%s port=%u remote_cna=%#x\n",
+                     dev->qdev.id, port_idx, info->neighbor_id,
+                     info->neighbor_port_idx, remote_cna);
+        } else {
+            qemu_log("ub route entry %s:%u remote cna unavailable neighbor_id=%s neighbor_port_idx=%u\n",
+                     dev->qdev.id, port_idx, info->neighbor_id, info->neighbor_port_idx);
+            remote_cna = 0;
+        }
+    } else if (info->neighbor_dev) {
         remote_cna = info->neighbor_dev->cna;
-    } else if (info->is_remote_neighbor) {
-        qemu_log("ub route entry %s:%u keep remote entry conservative neighbor_id=%s neighbor_port_idx=%u\n",
-                 dev->qdev.id, port_idx, info->neighbor_id, info->neighbor_port_idx);
-        remote_cna = 0;
     }
 
     return ((info->neighbor_port_idx & 0xffU) << 24) |
@@ -767,15 +960,7 @@ void ub_program_route_table(UBDevice *dev)
         route_table->entry[local_entry_idx] =
             ((i & 0xffU) << 24) | (dev->cna & 0x00ffffffU);
         if (remote_entry_idx < entry_num) {
-            NeighborInfo *info = &dev->port.neighbors[i];
-
-            if (info->is_remote_neighbor) {
-                qemu_log("ub route table %s skip remote-only entry for port%u neighbor=%s\n",
-                         dev->qdev.id, i, info->neighbor_id);
-                route_table->entry[remote_entry_idx] = 0;
-            } else {
-                route_table->entry[remote_entry_idx] = ub_route_entry_for_port(dev, i);
-            }
+            route_table->entry[remote_entry_idx] = ub_route_entry_for_port(dev, i);
         }
     }
 
@@ -1627,6 +1812,9 @@ int ub_connect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
     NeighborInfo *local = NULL;
     char guid_str[UB_DEV_GUID_STRING_LENGTH + 1] = {0};
 
+    fprintf(stderr, "ub_connect_device_port_remote: dev=%p, local_port_idx=%u, neighbor_id=%s\n",
+            dev, local_port_idx, neighbor_id ? neighbor_id : "(null)"); fflush(stderr);
+
     if (!dev || !neighbor_id || !neighbor_guid) {
         error_setg(errp, "ub remote link endpoint is null");
         return -1;
@@ -1637,11 +1825,38 @@ int ub_connect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
         return -1;
     }
 
-    local = &dev->port.neighbors[local_port_idx];
-    if (local->neighbor_dev) {
-        error_setg(errp, "%s:%u already has a local neighbor %s\n",
-                   dev->qdev.id, local_port_idx, local->neighbor_dev->qdev.id);
+    fprintf(stderr, "ub_connect_device_port_remote: dev->port.neighbors=%p\n", dev->port.neighbors); fflush(stderr);
+    if (!dev->port.neighbors) {
+        error_setg(errp, "ub_connect_device_port_remote: dev->port.neighbors is NULL");
         return -1;
+    }
+
+    fprintf(stderr, "ub_connect_device_port_remote: about to access neighbors array\n"); fflush(stderr);
+    local = &dev->port.neighbors[local_port_idx];
+    fprintf(stderr, "ub_connect_device_port_remote: got local=%p\n", local); fflush(stderr);
+
+    /* Validate local pointer before dereferencing */
+    if (!local) {
+        error_setg(errp, "ub_connect_device_port_remote: local is NULL");
+        return -1;
+    }
+
+    /* Try to read first field of local to validate memory access */
+    fprintf(stderr, "ub_connect_device_port_remote: testing local memory access\n"); fflush(stderr);
+    volatile uint32_t test_val = local->local_port_idx;
+    fprintf(stderr, "ub_connect_device_port_remote: local->local_port_idx=%u\n", test_val); fflush(stderr);
+
+    /* Check is_remote_neighbor to determine if union is valid */
+    fprintf(stderr, "ub_connect_device_port_remote: local->is_remote_neighbor=%d\n", local->is_remote_neighbor); fflush(stderr);
+
+    /* Only check neighbor_dev if this is NOT a remote neighbor (union is a device pointer) */
+    if (!local->is_remote_neighbor) {
+        fprintf(stderr, "ub_connect_device_port_remote: checking local->neighbor_dev\n"); fflush(stderr);
+        if (local->neighbor_dev) {
+            error_setg(errp, "%s:%u already has a local neighbor %s\n",
+                       dev->qdev.id, local_port_idx, local->neighbor_dev->qdev.id);
+            return -1;
+        }
     }
     if (local->is_remote_neighbor && local->neighbor_id[0]) {
         if (strcmp(local->neighbor_id, neighbor_id) ||
@@ -1662,6 +1877,9 @@ int ub_connect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
         ub_program_route_table(dev);
         (void)ub_publish_device_snapshot(dev, NULL);
         return 0;
+    } else {
+        /* This is a new remote neighbor setup */
+        fprintf(stderr, "ub_connect_device_port_remote: new remote neighbor setup\n"); fflush(stderr);
     }
 
     memset(local, 0, sizeof(*local));
@@ -1669,10 +1887,17 @@ int ub_connect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
     local->is_remote_neighbor = true;
     local->local_port_idx = local_port_idx;
     local->neighbor_port_idx = neighbor_port_idx;
+    local->remote_neighbor_guid = *neighbor_guid;
+    local->remote_neighbor_guid_valid = true;
+    local->remote_primary_cna_valid = false;
+    local->remote_primary_cna = 0;
     local->remote_bus_instance_guid_valid = false;
     local->remote_cfg_notify_sent = false;
     local->remote_cfg_notify_attempts = 0;
     local->remote_cfg_notify_next_retry_ms = 0;
+    local->remote_linkup_notify_sent = false;
+    local->remote_linkup_notify_attempts = 0;
+    local->remote_linkup_notify_next_retry_ms = 0;
     dev->port.port_info_exist = true;
     ub_config_set_port_basic_remote(local, neighbor_guid, dev);
     ub_device_get_str_from_guid((UbGuid *)neighbor_guid, guid_str,
@@ -1680,16 +1905,6 @@ int ub_connect_device_port_remote(UBDevice *dev, uint32_t local_port_idx,
     qemu_log("ub remote link set %s:%u -> %s:%u guid=%s\n",
              dev->qdev.id, local_port_idx, neighbor_id, neighbor_port_idx,
              guid_str);
-    if (ub_device_has_remote_only_neighbor(dev)) {
-        qemu_log("ub remote link %s:%u defer route program for remote-only neighbor\n",
-                 dev->qdev.id, local_port_idx);
-    } else {
-        qemu_log("ub remote link %s:%u route program start\n",
-                 dev->qdev.id, local_port_idx);
-        ub_program_route_table(dev);
-        qemu_log("ub remote link %s:%u route program done\n",
-                 dev->qdev.id, local_port_idx);
-    }
     qemu_log("ub remote link %s:%u snapshot publish start\n",
              dev->qdev.id, local_port_idx);
     (void)ub_publish_device_snapshot(dev, NULL);

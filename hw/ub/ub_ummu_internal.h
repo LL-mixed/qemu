@@ -570,6 +570,7 @@ typedef struct UMMUTransCfg {
     uint32_t tct_tgs;
     uint32_t tecte_tag;
     uint32_t tid;
+    uint32_t st_mode;
 } UMMUTransCfg;
 
 typedef enum UMMUEventType {

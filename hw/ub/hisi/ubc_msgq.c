@@ -30,8 +30,11 @@
 #include "sysemu/dma.h"
 #include "hw/ub/ub_cna_mgmt.h"
 #include "hw/ub/ub_common.h"
+#include "hw/ub/ub_link.h"
 #include "hw/ub/hisi/ub_fm.h"
 #include "qemu/timer.h"
+
+#define UB_MSG_CODE_URMA_DATA  7  /* URMA data transfer between nodes */
 
 #define UB_CFG_CPL_NOTIFY_MAX_ATTEMPTS 64
 #define UB_CFG_CPL_NOTIFY_RETRY_MS 100
@@ -262,11 +265,57 @@ static void handle_msg_exch(void *opaque, HiMsgSqe *sqe, void *payload)
     }
 }
 
+/*
+ * Handle VDM (Vendor Defined Message) — msg_code 3.
+ * The guest ubase driver sends entity enable/disable (sub_code 0xf6)
+ * as a sync request via this message type.  Acknowledge with success
+ * so that the driver does not time out (ETIMEDOUT / -110).
+ */
+static void handle_msg_vdm(void *opaque, HiMsgSqe *sqe, void *payload)
+{
+    BusControllerState *s = opaque;
+    MsgPktHeader *header = (MsgPktHeader *)payload;
+    MsgPktHeader rsp;
+    HiMsgCqe cqe;
+    uint32_t pi;
+
+    memcpy(&rsp, header, sizeof(rsp));
+
+    /* swap source / destination */
+    rsp.nth.scna = header->nth.dcna;
+    rsp.nth.dcna = header->nth.scna;
+    rsp.deid = EID_GEN(header->seid_h, header->seid_l);
+    rsp.seid_h = EID_HIGH(header->deid);
+    rsp.seid_l = EID_LOW(header->deid);
+    rsp.msgetah.type = MSG_RSP;
+    rsp.msgetah.rsp_status = 0; /* success */
+
+    pi = fill_rq(s, &rsp, sizeof(rsp));
+    if (pi == UINT32_MAX) {
+        qemu_log("vdm: fill_rq failed for sub_code=0x%02x msn=%u\n",
+                 header->msgetah.sub_msg_code, sqe->msn);
+        return;
+    }
+
+    memset(&cqe, 0, sizeof(cqe));
+    cqe.type = MSG_RSP;
+    cqe.msg_code = UB_MSG_CODE_VDM;
+    cqe.sub_msg_code = header->msgetah.sub_msg_code;
+    cqe.msn = sqe->msn;
+    cqe.p_len = sizeof(rsp) - MSG_PKT_HEADER_SIZE;
+    cqe.rq_pi = pi;
+    cqe.status = CQE_SUCCESS;
+    (void)fill_cq(s, &cqe);
+
+    qemu_log("vdm: ack sub_code=0x%02x code=0x%02x msn=%u\n",
+             header->msgetah.sub_msg_code, header->msgetah.code, sqe->msn);
+}
+
 static void (*msgq_handlers[])(void *opaque, HiMsgSqe *sqe, void *payload) = {
     [UB_MSG_CODE_RAS]  = NULL,
     [UB_MSG_CODE_LINK] = NULL,
     [UB_MSG_CODE_CFG]  = handle_msg_cfg,
-    [UB_MSG_CODE_VDM]  = NULL,
+    [UB_MSG_CODE_VDM]  = handle_msg_vdm,
     [UB_MSG_CODE_EXCH] = handle_msg_exch,
     [UB_MSG_CODE_SEC]  = handle_msg_sec,
     [UB_MSG_CODE_POOL]  = handle_msg_pool,
@@ -595,4 +644,76 @@ void msgq_handle_rst(void *opaque)
     ub_set_long(s->msgq_reg + RQ_DEPTH, 0);
 
     memset(&s->msgq, 0, sizeof(s->msgq));
+}
+
+/*
+ * Process an incoming message from a remote node via ub_link.
+ * For control messages (msg_code 0-6): inject into the guest msgq RQ + CQ.
+ * For URMA data (msg_code 7): forward to the URMA receive handler.
+ */
+void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
+{
+    void *buf = NULL;
+    size_t len = 0;
+    Error *local_err = NULL;
+    int ret;
+
+    if (!s || !link) {
+        return;
+    }
+
+    ret = ub_link_read_message(link, &buf, &len, &local_err);
+    if (ret < 0) {
+        qemu_log("ubc_msgq: failed to read remote message: %s\n",
+                 local_err ? error_get_pretty(local_err) : "unknown");
+        if (local_err) {
+            error_free(local_err);
+        }
+        return;
+    }
+
+    if (ret > 0 && buf) {
+        MsgPktHeader *header = (MsgPktHeader *)buf;
+        HiMsgCqe cqe = { 0 };
+        uint32_t pi;
+
+        qemu_log("ubc_msgq: received remote msg code=%u len=%zu\n",
+                 header->msgetah.msg_code, len);
+
+        /* URMA data packets (msg_code=7) are forwarded to ub_ubc.c handler */
+        if (header->msgetah.msg_code == UB_MSG_CODE_URMA_DATA &&
+            s->ubc_dev && len > sizeof(MsgPktHeader)) {
+            uint32_t dst_jetty = header->deid & 0xFFFFF;
+            uint8_t *data = (uint8_t *)buf + sizeof(MsgPktHeader);
+            uint32_t data_len = len - sizeof(MsgPktHeader);
+
+            ubc_handle_urma_rx_data(s->ubc_dev, dst_jetty, data, data_len);
+            g_free(buf);
+            return;
+        }
+
+        /* Control message: inject into Guest RQ */
+        pi = fill_rq(s, buf, len);
+        if (pi == UINT32_MAX) {
+            qemu_log("ubc_msgq: failed to fill rq for remote message\n");
+            g_free(buf);
+            return;
+        }
+
+        /* Notify Guest via CQ */
+        cqe.task_type = PROTOCOL_MSG;
+        cqe.type = header->msgetah.type;
+        cqe.msg_code = header->msgetah.msg_code;
+        cqe.sub_msg_code = header->msgetah.sub_msg_code;
+        cqe.p_len = len - sizeof(MsgPktHeader);
+        cqe.msn = 0x8000 | (uint16_t)(qemu_clock_get_ms(QEMU_CLOCK_REALTIME) & 0x7FFF);
+        cqe.rq_pi = pi;
+        cqe.status = CQE_SUCCESS;
+
+        if (fill_cq(s, &cqe) == UINT32_MAX) {
+            qemu_log("ubc_msgq: failed to fill cq for remote message\n");
+        }
+
+        g_free(buf);
+    }
 }
