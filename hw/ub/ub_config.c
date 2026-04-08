@@ -27,10 +27,6 @@
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 
-#define UB_CFG0_EID_0_OFFSET  0x48
-#define UB_CFG0_UPI_OFFSET    0x7c
-#define UB_CFG0_FM_CNA_OFFSET 0x98
-
 UbCfgAddrMapEntry *g_ub_cfg_addr_map_table = NULL;
 uint32_t g_emulated_ub_cfg_size;
 
@@ -255,12 +251,28 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
     memset(&rsp_pkt, 0, sizeof(CfgMsgPkt));
     memcpy(&rsp_pkt.header, header, sizeof(MsgPktHeader));
 
-    /* vm support only FE0(entity_idx = 0) */
-    if (entity) {
-        qemu_log("vm support only FE0, entity idx: %u\n", entity);
-        rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_REG_ATTR_MISMATCH;
-        goto fill_rq_cq;
+    /* Support multiple entities: select per-entity cfg view */
+    UBEntityCfgSpace *entity_cfg = NULL;
+    BusControllerDev *ubc_dev = s->ubc_dev;
+
+    if (entity > 0) {
+        if (!ubc_dev || entity >= ubc_dev->entity_count || entity >= UB_MAX_ENTITIES) {
+            qemu_log("ub_cfg_rw: invalid entity_idx=%u (entity_count=%u)\n",
+                     entity, ubc_dev ? ubc_dev->entity_count : 0);
+            rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_REG_ATTR_MISMATCH;
+            goto fill_rq_cq;
+        }
+
+        entity_cfg = &ubc_dev->entity_cfg_spaces[entity];
+        if (!entity_cfg->initialized) {
+            qemu_log("ub_cfg_rw: entity_idx=%u cfg space not initialized\n", entity);
+            rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_REG_ATTR_MISMATCH;
+            goto fill_rq_cq;
+        }
+
+        qemu_log("ub_cfg_rw: using per-entity cfg space for entity_idx=%u\n", entity);
     }
+
     /*
      * TODO: Check whether dcna is the unique identifier of the device when the configuration space is read or written.
      * local = 1: ubc or idev, dcna = 0: default to ubc
@@ -285,7 +297,7 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
     }
 
     rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_SUCCESS;
-    if (cfg_offset >= ub_config_size()) {
+    if (cfg_offset >= ub_emulated_config_size()) {
         rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_INVALID_ADDR;
         goto fill_rq_cq;
     }
@@ -328,15 +340,24 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
                 break;
             }
         } else if (ub_dev->config_read) {
-            ub_dev->config_read(ub_dev, cfg_offset, &rsp_pkt.pld.rsp.read_data, dw_mask);
+            /* 选择配置空间 */
+            uint8_t *cfg_base = entity_cfg ? entity_cfg->cfg_base : ub_dev->config;
+            uint64_t emulated_offset = ub_cfg_offset_to_emulated_offset(cfg_offset, false);
+
+            if (emulated_offset != UINT64_MAX) {
+                rsp_pkt.pld.rsp.read_data = *(uint32_t *)(cfg_base + emulated_offset) & dw_mask;
+            } else {
+                rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_INVALID_ADDR;
+            }
+
             if (cfg_offset == UB_CFG0_EID_0_OFFSET ||
                 cfg_offset == UB_CFG0_UPI_OFFSET ||
                 cfg_offset == UB_CFG0_FM_CNA_OFFSET ||
                 cfg_offset == UB_CFG0_BASIC_NA_INFO_START) {
                 qemu_log("ub_cfg_rw local read dev=%s local=%u dcna=%#x offset=%#" PRIx64
-                         " data=%#x\n",
+                         " entity=%u data=%#x\n",
                          ub_dev->qdev.id ? ub_dev->qdev.id : "<unknown>",
-                         local, dcna, cfg_offset, rsp_pkt.pld.rsp.read_data);
+                         local, dcna, cfg_offset, entity, rsp_pkt.pld.rsp.read_data);
             }
         } else {
             qemu_log("dev: %s read config func NULL\n", ub_dev->qdev.id);
@@ -373,19 +394,34 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
             goto fill_rq_cq;
         }
 
+        /* 选择配置空间 */
+        uint8_t *cfg_base = entity_cfg ? entity_cfg->cfg_base : ub_dev->config;
         emulated_offset = ub_cfg_offset_to_emulated_offset(cfg_offset, false);
-        if (emulated_offset != UINT64_MAX && !*((uint32_t *)(&ub_dev->wmask[emulated_offset]))) {
-            rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_REG_ATTR_MISMATCH;
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "register cannot be written: dev=%s eid=0x%x dev_type=%u guid_type=%u cfg_offset=0x%" PRIx64 " emu=0x%" PRIx64 "\n",
-                          ub_dev->qdev.id ? ub_dev->qdev.id : "(null)", ub_dev->eid, ub_dev->dev_type,
-                          ub_dev->guid.type, cfg_offset, emulated_offset);
-            goto fill_rq_cq;
-        }
-        if (ub_dev->config_write) {
-            ub_dev->config_write(ub_dev, cfg_offset, &payload->write_data, dw_mask);
-        } else {
-            qemu_log("dev: %s write config func NULL\n", ub_dev->qdev.id);
+
+        if (emulated_offset != UINT64_MAX) {
+            uint32_t *cfg_ptr = (uint32_t *)(cfg_base + emulated_offset);
+            uint32_t wmask = entity_cfg ? dw_mask : *((uint32_t *)(&ub_dev->wmask[emulated_offset]));
+
+            if (!wmask) {
+                rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_REG_ATTR_MISMATCH;
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "register cannot be written: dev=%s eid=0x%x dev_type=%u guid_type=%u cfg_offset=0x%" PRIx64 " emu=0x%" PRIx64 " entity=%u\n",
+                              ub_dev->qdev.id ? ub_dev->qdev.id : "(null)", ub_dev->eid, ub_dev->dev_type,
+                              ub_dev->guid.type, cfg_offset, emulated_offset, entity);
+                goto fill_rq_cq;
+            }
+
+            *cfg_ptr = (*cfg_ptr & ~wmask) | (payload->write_data & wmask);
+
+            if (cfg_offset == UB_CFG0_EID_0_OFFSET ||
+                cfg_offset == UB_CFG0_UPI_OFFSET ||
+                cfg_offset == UB_CFG0_FM_CNA_OFFSET ||
+                cfg_offset == UB_CFG0_BASIC_NA_INFO_START) {
+                qemu_log("ub_cfg_rw local write dev=%s local=%u dcna=%#x offset=%#" PRIx64
+                         " entity=%u data=%#x\n",
+                         ub_dev->qdev.id ? ub_dev->qdev.id : "<unknown>",
+                         local, dcna, cfg_offset, entity, payload->write_data);
+            }
         }
         break;
     default:
