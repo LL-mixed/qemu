@@ -24,9 +24,49 @@
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_link.h"
 #include "qemu/timer.h"
+#include "qapi/error.h"
 
 #define TYPE_BUS_CONTROLLER_DEV "ubc"
 OBJECT_DECLARE_TYPE(BusControllerDev, BusControllerDevClass, BUS_CONTROLLER_DEV)
+
+/* Entity table support (matches guest pool.h entity_base_info layout) */
+#define UB_ENTITY_GUID_DW_NUM  4
+#define UB_ENTITY_MAX_RES_NUM  3
+#define UB_MAX_ENTITIES        8
+
+typedef enum UBEntityState {
+    UB_ENTITY_STATE_ABSENT,
+    UB_ENTITY_STATE_PRESENT,
+    UB_ENTITY_STATE_ERROR,
+} UBEntityState;
+
+typedef struct UBEntityErs {
+    uint32_t ss;    /* segment size */
+    uint32_t sa_l;  /* start address low */
+    uint32_t sa_h;  /* start address high */
+} UBEntityErs;
+
+typedef struct UBEntityDesc {
+    uint32_t     entity_idx;
+    uint32_t     device_id;       /* 0x0541 for MUE, 0x0542 for UE */
+    uint32_t     eid[UB_ENTITY_GUID_DW_NUM];
+    uint32_t     ueid[UB_ENTITY_GUID_DW_NUM];
+    uint32_t     cna;
+    uint32_t     upi;
+    uint32_t     guid[UB_ENTITY_GUID_DW_NUM]; /* vendor|device_id|version|type|rsv|seq */
+    UBEntityErs  ers[UB_ENTITY_MAX_RES_NUM];
+    UBEntityState state;
+} UBEntityDesc;
+
+/* Per-Entity Configuration Space */
+typedef struct UBEntityCfgSpace {
+    uint8_t  *cfg_base;      /* 该实体的配置空间基址 */
+    uint32_t cfg_size;       /* 配置空间大小 */
+    uint32_t eid;            /* 实体 EID */
+    uint32_t cna;            /* 实体 CNA */
+    uint16_t upi;            /* 实体 UPI */
+    bool     initialized;    /* 是否已初始化 */
+} UBEntityCfgSpace;
 
 typedef struct UBCmdQueueState {
     uint64_t base;
@@ -76,6 +116,12 @@ typedef struct BusControllerDev {
     UBDevice parent;
     UbGuid bus_instance_guid;
     int bus_instance_lock_fd;
+
+    /* Multi-entity support */
+    uint32_t entity_count;  /* Number of entities (FEs), default=1 */
+    UBEntityDesc entities[UB_MAX_ENTITIES]; /* per-entity descriptor table */
+    UBEntityCfgSpace entity_cfg_spaces[UB_MAX_ENTITIES]; /* per-entity cfg spaces */
+
     struct {
         BusControllerDev *owner;
         MemoryRegion region;
@@ -170,4 +216,14 @@ void ub_notify_retry_timer_cb(void *opaque);
 void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link);
 void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
                               const uint8_t *data, uint32_t data_len);
+
+/* Entity table management */
+void ub_entity_table_init(BusControllerDev *ubc_dev);
+UBEntityDesc *ub_entity_desc_for_idx(BusControllerDev *ubc_dev, uint32_t entity_idx);
+void ub_entity_cfg_spaces_init(BusControllerDev *ubc_dev);
+void ub_entity_cfg_spaces_cleanup(BusControllerDev *ubc_dev);
+
+/* Entity injection (UB_DEV_REG / UB_DEV_RLS) */
+int ub_inject_entity_reg(BusControllerState *s, const UBEntityDesc *e, Error **errp);
+int ub_inject_entity_rls(BusControllerState *s, uint32_t eid, uint8_t reason, Error **errp);
 #endif
