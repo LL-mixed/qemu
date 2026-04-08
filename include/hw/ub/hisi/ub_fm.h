@@ -30,6 +30,13 @@ typedef struct UBFMEndpointDesc {
     uint32_t port_idx;
 } UBFMEndpointDesc;
 
+typedef struct UBFMNodeCapabilityDesc {
+    char *device_id;
+    uint32_t entity_count;
+    char *primary_fe_type;
+    char *secondary_fe_type;
+} UBFMNodeCapabilityDesc;
+
 typedef struct UBFMTopologyLinkDesc {
     UBFMEndpointDesc a;
     UBFMEndpointDesc b;
@@ -70,6 +77,38 @@ void ub_fm_remove_topology_link(const char *a_device_id, uint32_t a_port_idx,
                                 const char *b_device_id, uint32_t b_port_idx);
 void ub_fm_clear_declared_topology(void);
 int ub_fm_apply_declared_topology(Error **errp);
+
+/* Node Capability Management */
+void ub_fm_node_capabilities_init(void);
+void ub_fm_clear_node_capabilities(void);
+int ub_fm_load_node_capabilities_from_file(const char *path, Error **errp);
+int ub_fm_get_node_capability(const char *device_id,
+                               uint32_t *entity_count,
+                               const char **primary_fe_type,
+                               const char **secondary_fe_type);
+
 int ub_fm_kick_by_cna(uint32_t dcna, Error **errp);
 UBFMManagedLink *ub_fm_find_link_by_cna(uint32_t dcna);
+
+/* Entity Plan Management */
+typedef struct UBFMEntityPlanEntry {
+    uint32_t     entity_idx;
+    uint32_t     device_id;
+    uint32_t     eid[4];
+    uint32_t     ueid[4];
+    uint32_t     cna;
+    uint32_t     upi;
+    uint32_t     guid[4];
+    UBEntityState state;
+} UBFMEntityPlanEntry;
+
+typedef struct UBFMEntityPlan {
+    GPtrArray *entities;
+    char *source_name;
+    time_t last_modified;
+} UBFMEntityPlan;
+
+int ub_fm_load_entity_plan_from_file(const char *path, Error **errp);
+int ub_fm_apply_entity_plan(Error **errp);
+void ub_fm_entity_plan_free(UBFMEntityPlan *plan);
 #endif
