@@ -25,6 +25,7 @@
 
 static GPtrArray *ub_fm_declared_links;
 static GPtrArray *ub_fm_active_links;
+static GPtrArray *ub_fm_node_capabilities;
 static char *ub_fm_topology_source_name;
 static UBFMTopologyPopulateFn ub_fm_topology_populate;
 static void *ub_fm_topology_populate_opaque;
@@ -379,6 +380,19 @@ static void ub_fm_free_managed_link(gpointer data)
     }
     ub_fm_free_link_desc_fields(&link->desc);
     g_free(link);
+}
+
+static void ub_fm_free_node_capability(gpointer data)
+{
+	UBFMNodeCapabilityDesc *cap = data;
+
+	if (!cap) {
+		return;
+	}
+	g_free(cap->device_id);
+	g_free(cap->primary_fe_type);
+	g_free(cap->secondary_fe_type);
+	g_free(cap);
 }
 
 static UBFMTopologyLinkDesc *ub_fm_link_desc_dup(const UBFMTopologyLinkDesc *src)
@@ -887,6 +901,7 @@ int ub_fm_load_topology_snapshot_from_file(const char *path, Error **errp)
     GPtrArray *snapshot;
     GError *gerr = NULL;
     gsize i;
+    int ret;
 
     if (!path || !path[0]) {
         error_setg(errp, "ub_fm: topology file path is empty");
@@ -900,6 +915,13 @@ int ub_fm_load_topology_snapshot_from_file(const char *path, Error **errp)
         g_error_free(gerr);
         return -1;
     }
+
+	/* Load node capabilities first */
+	ret = ub_fm_load_node_capabilities_from_file(path, errp);
+	if (ret) {
+		qemu_log("ub_fm: warning: failed to load node capabilities from %s, continuing anyway\n", path);
+		/* Non-fatal: continue with link loading */
+	}
 
     snapshot = g_ptr_array_new_with_free_func(ub_fm_free_link_desc);
     groups = g_key_file_get_groups(keyfile, NULL);
@@ -1299,4 +1321,136 @@ void ub_fm_msgq_reg_write(void *opaque, hwaddr addr, uint64_t val, unsigned len)
     }
     qemu_log("ub_fm_msgq_reg_write addr 0x%lx len 0x%x val 0x%lx\n",
              addr, len, val);
+}
+
+/* ============================================
+ * Node Capability Management
+ * ============================================ */
+
+void ub_fm_node_capabilities_init(void)
+{
+    if (!ub_fm_node_capabilities) {
+        ub_fm_node_capabilities = g_ptr_array_new_with_free_func(
+            (GDestroyNotify)ub_fm_free_node_capability);
+        qemu_log("ub_fm: initialized node capabilities storage\n");
+    }
+}
+
+void ub_fm_clear_node_capabilities(void)
+{
+    if (ub_fm_node_capabilities) {
+        g_ptr_array_unref(ub_fm_node_capabilities);
+        ub_fm_node_capabilities = NULL;
+        qemu_log("ub_fm: cleared node capabilities storage\n");
+    }
+}
+
+static UBFMNodeCapabilityDesc *ub_fm_find_node_capability(const char *device_id)
+{
+    if (!ub_fm_node_capabilities || !device_id) {
+        return NULL;
+    }
+
+    for (guint i = 0; i < ub_fm_node_capabilities->len; i++) {
+        UBFMNodeCapabilityDesc *cap = g_ptr_array_index(ub_fm_node_capabilities, i);
+        if (cap && cap->device_id && strcmp(cap->device_id, device_id) == 0) {
+            return cap;
+        }
+    }
+
+    return NULL;
+}
+
+int ub_fm_get_node_capability(const char *device_id, 
+                               uint32_t *entity_count,
+                               const char **primary_fe_type,
+                               const char **secondary_fe_type)
+{
+    UBFMNodeCapabilityDesc *cap;
+
+    if (!device_id) {
+        return -EINVAL;
+    }
+
+    cap = ub_fm_find_node_capability(device_id);
+    if (!cap) {
+        qemu_log("ub_fm: node capability not found for %s\n", device_id);
+        return -ENOENT;
+    }
+
+    if (entity_count) {
+        *entity_count = cap->entity_count;
+    }
+    if (primary_fe_type) {
+        *primary_fe_type = cap->primary_fe_type;
+    }
+    if (secondary_fe_type) {
+        *secondary_fe_type = cap->secondary_fe_type;
+    }
+
+    return 0;
+}
+
+int ub_fm_load_node_capabilities_from_file(const char *path, Error **errp)
+{
+    g_autoptr(GKeyFile) keyfile = NULL;
+    g_autoptr(GError) gerr = NULL;
+    gchar **groups;
+    gsize num_groups;
+
+    if (!path) {
+        error_setg(errp, "ub_fm: topology path is NULL");
+        return -EINVAL;
+    }
+
+    ub_fm_node_capabilities_init();
+
+    keyfile = g_key_file_new();
+    if (!g_key_file_load_from_file(keyfile, path, G_KEY_FILE_NONE, &gerr)) {
+        error_setg(errp, "ub_fm: failed to load topology file %s: %s",
+                   path, gerr ? gerr->message : "unknown error");
+        return -EIO;
+    }
+
+    groups = g_key_file_get_groups(keyfile, &num_groups);
+    if (!groups) {
+        error_setg(errp, "ub_fm: no groups found in topology file %s", path);
+        return -EINVAL;
+    }
+
+    for (gsize i = 0; i < num_groups; i++) {
+        const char *group = groups[i];
+        
+        /* Parse [node "xxx"] sections */
+        if (g_str_has_prefix(group, "node")) {
+            UBFMNodeCapabilityDesc *cap = g_new0(UBFMNodeCapabilityDesc, 1);
+            g_autofree gchar *device_id = NULL;
+            g_autofree gchar *primary_fe_type = NULL;
+            g_autofree gchar *secondary_fe_type = NULL;
+
+            device_id = g_key_file_get_string(keyfile, group, "device_id", &gerr);
+            if (!device_id) {
+                g_free(cap);
+                continue;
+            }
+
+            cap->device_id = g_strdup(device_id);
+            cap->entity_count = g_key_file_get_uint64(keyfile, group, 
+                                                         "entity_count", &gerr);
+            cap->primary_fe_type = g_key_file_get_string(keyfile, group,
+                                                           "primary_fe_type", &gerr);
+            cap->secondary_fe_type = g_key_file_get_string(keyfile, group,
+                                                             "secondary_fe_type", &gerr);
+
+            g_ptr_array_add(ub_fm_node_capabilities, cap);
+            
+            qemu_log("ub_fm: loaded node capability %s: entity_count=%u, primary=%s, secondary=%s\n",
+                     cap->device_id, cap->entity_count,
+                     cap->primary_fe_type ? cap->primary_fe_type : "N/A",
+                     cap->secondary_fe_type ? cap->secondary_fe_type : "N/A");
+        }
+    }
+
+    g_strfreev(groups);
+    return 0;
 }

@@ -94,7 +94,9 @@ struct UBLinkState {
     UBLinkStateEnum state;
     bool socket_connected;
     bool remote_guid_valid;
+    bool snapshot_reconciled;  /* M1: Snapshot reconciliation status */
     uint64_t reconcile_ts_ms;
+    uint64_t state_set_ts_ms;  /* M1: State change timestamp for age check */
     char *last_error;
     char *status_file_path;
 };

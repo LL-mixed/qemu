@@ -511,15 +511,22 @@ void ub_link_mark_connected(UBLinkState *s)
     }
 
     /* Update state based on Ready Contract */
+    bool was_ready = (s->state == UB_LINK_STATE_READY);
     if (s->socket_connected && s->remote_guid_valid) {
+        if (!was_ready) {
+            s->state_set_ts_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);  /* M1: Track state change time */
+        }
         s->state = UB_LINK_STATE_READY;
     } else {
         s->state = UB_LINK_STATE_PENDING;
     }
 
+    /* M1: Snapshot reconciliation - mark as reconciled when both ends are connected */
+    s->snapshot_reconciled = (s->socket_connected && s->remote_guid_valid);
+
     ub_link_update_status_file(s);
-    qemu_log("ub_link: marked connected for %s:%u state=%d socket=%d guid_valid=%d\n",
-             local->device_id, local->port_idx, s->state, s->socket_connected, s->remote_guid_valid);
+    qemu_log("ub_link: marked connected for %s:%u state=%d socket=%d guid_valid=%d snapshot_reconciled=%d\n",
+             local->device_id, local->port_idx, s->state, s->socket_connected, s->remote_guid_valid, s->snapshot_reconciled);
 }
 
 /* Mark link as failed and update status */
@@ -622,6 +629,13 @@ void ub_link_configure(UBLinkState *s, const char *a_device_id, uint32_t a_port_
     s->b.port_idx = b_port_idx;
     s->link_up = link_up;
 
+    /* M1: Initialize Ready Contract fields */
+    s->socket_connected = false;
+    s->remote_guid_valid = false;
+    s->snapshot_reconciled = false;
+    s->reconcile_ts_ms = 0;
+    s->state_set_ts_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+
     /* Publish our endpoint immediately so others can find us */
     ub_link_published_state_save(s);
 }
@@ -648,8 +662,12 @@ int ub_link_apply(UBLinkState *s, Error **errp)
     ub_link_setup_socket(s, is_server);
 
     /* Check Ready Contract conditions before marking applied */
-    if (s->socket_connected && s->remote_guid_valid) {
-        /* All conditions met - mark as READY and applied */
+    uint64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    bool state_age_ok = (now_ms - s->state_set_ts_ms) >= 200;  /* M1: 200ms stability check */
+
+    if (s->socket_connected && s->remote_guid_valid &&
+        s->snapshot_reconciled && state_age_ok) {
+        /* All 4 Ready Contract conditions met - mark as READY and applied */
         s->state = UB_LINK_STATE_READY;
         s->applied = true;
         s->remote_applied = true;
