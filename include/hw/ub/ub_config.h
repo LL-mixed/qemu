@@ -509,6 +509,10 @@ typedef struct __attribute__ ((__packed__)) UbRouteTable {
 #define UB_CFG0_BASIC_GUID_START        (UB_CFG0_BASIC_START + 0x0E * DWORD_SIZE)
 #define UB_CFG0_BASIC_NA_INFO_START     (UB_CFG0_BASIC_START + 0x1A * DWORD_SIZE)
 #define UB_CFG0_DEV_UEID_OFFSET         (UB_CFG0_BASIC_START + 0x27 * DWORD_SIZE)
+/* Per-entity cfg space offsets */
+#define UB_CFG0_EID_0_OFFSET            0x48
+#define UB_CFG0_UPI_OFFSET              0x7C
+#define UB_CFG0_FM_CNA_OFFSET           0x98
 #define UB_CFG0_CAP1_RSV_START          (UB_CFG0_BASIC_START + UB_SLICE_SZ)
 #define UB_CFG0_CAP2_SHP_START          (UB_CFG0_CAP1_RSV_START + UB_SLICE_SZ)
 #define UB_CFG0_CAP3_ERR_RECORD_START   (UB_CFG0_CAP2_SHP_START + UB_SLICE_SZ)

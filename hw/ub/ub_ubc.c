@@ -1409,7 +1409,7 @@ static int ubc_handle_ue2ue_ctrlq(BusControllerDev *ubc_dev,
     return 0;
 }
 
-static void ubc_fill_res_caps(UBCResCmdResp *resp)
+static void ubc_fill_res_caps(UBCResCmdResp *resp, uint32_t entity_count)
 {
     memset(resp, 0, sizeof(*resp));
 
@@ -1442,14 +1442,14 @@ static void ubc_fill_res_caps(UBCResCmdResp *resp)
     resp->nic_jfc_max_cnt = cpu_to_le32(64);
     resp->nic_jfc_depth = cpu_to_le32(128);
 
-    resp->total_ue_num = cpu_to_le32(1);
+    resp->total_ue_num = cpu_to_le32(entity_count);
     resp->rsvd_jetty_cnt = cpu_to_le16(0);
     resp->mac_stats_num = cpu_to_le16(0);
     resp->ta_extdb_buf_size = cpu_to_le32(0x1000);
     resp->ta_timer_buf_size = cpu_to_le32(0x1000);
     resp->public_jetty_cnt = cpu_to_le32(64);
     resp->udma_tp_resp_vl_offset = 0;
-    resp->ue_num = 1;
+    resp->ue_num = entity_count;
 
     resp->udma_rc_depth = cpu_to_le32(1024);
     resp->jtg_max_cnt = cpu_to_le32(64);
@@ -3701,6 +3701,119 @@ static int ub_bus_instance_process(BusControllerDev *ubc_dev, Error **errp)
     return 0;
 }
 
+void ub_entity_table_init(BusControllerDev *ubc_dev)
+{
+    uint32_t i;
+
+    memset(ubc_dev->entities, 0, sizeof(ubc_dev->entities));
+    for (i = 0; i < ubc_dev->entity_count && i < UB_MAX_ENTITIES; i++) {
+        UBEntityDesc *e = &ubc_dev->entities[i];
+        e->entity_idx = i;
+        e->device_id = (i == 0) ? 0x0541 : 0x0542;
+        e->state = UB_ENTITY_STATE_PRESENT;
+        e->upi = 1;
+        e->cna = ubc_dev->parent.cna ? ubc_dev->parent.cna : (0x200 + i);
+        e->eid[0] = (i == 0) ? ubc_dev->parent.eid : (0x10001 + i - 1);
+        e->ueid[0] = (i == 0) ? ubc_dev->parent.eid : (0x10001 + i - 1);
+        e->guid[0] = (uint32_t)ubc_dev->parent.guid.seq_num;
+        e->guid[1] = 0;
+        e->guid[2] = (ubc_dev->parent.guid.rsv << 8) |
+                     (ubc_dev->parent.guid.type) |
+                     (ubc_dev->parent.guid.version << 4) |
+                     (e->device_id << 16);
+        e->guid[3] = ubc_dev->parent.guid.vendor;
+        e->ers[0].ss = UBC_ERS0_SPACE_SIZE;
+        e->ers[0].sa_l = (uint32_t)(UBC_ERS0_SPACE_ADDR + i * 0x200000);
+        e->ers[0].sa_h = 0;
+        e->ers[1].ss = UBC_ERS1_SPACE_SIZE;
+        e->ers[1].sa_l = (uint32_t)(UBC_ERS1_SPACE_ADDR + i * 0x200000);
+        e->ers[1].sa_h = 0;
+        e->ers[2].ss = UBC_ERS2_SPACE_SIZE;
+        e->ers[2].sa_l = (uint32_t)(UBC_ERS2_SPACE_ADDR + i * 0x200000);
+        e->ers[2].sa_h = 0;
+        qemu_log("entity_table_init: [%u] device_id=0x%04x eid=0x%x ueid=0x%x "
+                 "cna=0x%x upi=%u state=%s\n",
+                 i, e->device_id, e->eid[0], e->ueid[0], e->cna, e->upi,
+                 e->state == UB_ENTITY_STATE_PRESENT ? "present" : "absent");
+    }
+    qemu_log("entity_table_init: %u entities initialized\n", ubc_dev->entity_count);
+}
+
+UBEntityDesc *ub_entity_desc_for_idx(BusControllerDev *ubc_dev, uint32_t entity_idx)
+{
+    if (!ubc_dev || entity_idx >= ubc_dev->entity_count || entity_idx >= UB_MAX_ENTITIES) {
+        return NULL;
+    }
+    return &ubc_dev->entities[entity_idx];
+}
+
+void ub_entity_cfg_spaces_init(BusControllerDev *ubc_dev)
+{
+    uint32_t i;
+    UBDevice *ub_dev = &ubc_dev->parent;
+    uint32_t base_cfg_size = ub_emulated_config_size();
+
+    for (i = 0; i < ubc_dev->entity_count && i < UB_MAX_ENTITIES; i++) {
+        UBEntityCfgSpace *space = &ubc_dev->entity_cfg_spaces[i];
+        UBEntityDesc *e = &ubc_dev->entities[i];
+
+        /* 分配独立配置空间 */
+        space->cfg_base = g_malloc0(base_cfg_size);
+        if (!space->cfg_base) {
+            qemu_log("entity_cfg_spaces_init: failed to alloc for entity %u\n", i);
+            continue;
+        }
+
+        /* 复制基础配置 */
+        memcpy(space->cfg_base, ub_dev->config, base_cfg_size);
+
+        /* 设置实体特定字段 */
+        space->cfg_size = base_cfg_size;
+        space->eid = e->eid[0];
+        space->cna = e->cna;
+        space->upi = e->upi;
+        space->initialized = true;
+
+        /* 修改该实体配置空间中的 EID/CNA/UPICNA */
+        uint64_t emulated_offset;
+
+        /* 修改 EID */
+        emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_EID_0_OFFSET, true);
+        uint32_t *eid_ptr = (uint32_t *)(space->cfg_base + emulated_offset);
+        *eid_ptr = cpu_to_le32(e->eid[0]);
+
+        /* 修改 UPICNA */
+        emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_UPI_OFFSET, true);
+        uint32_t *upi_cna_ptr = (uint32_t *)(space->cfg_base + emulated_offset);
+        *upi_cna_ptr = cpu_to_le32((e->upi & 0x7FFF) | ((e->cna & 0xFF) << 16));
+
+        /* 修改 FM CNA */
+        emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_FM_CNA_OFFSET, true);
+        uint32_t *cna_ptr = (uint32_t *)(space->cfg_base + emulated_offset);
+        *cna_ptr = cpu_to_le32(e->cna);
+
+        qemu_log("entity_cfg_spaces_init: [%u] eid=%#x cna=%#x upi=%u cfg_size=%u\n",
+                 i, space->eid, space->cna, space->upi, space->cfg_size);
+    }
+
+    qemu_log("entity_cfg_spaces_init: %u entity cfg spaces initialized\n",
+             ubc_dev->entity_count);
+}
+
+void ub_entity_cfg_spaces_cleanup(BusControllerDev *ubc_dev)
+{
+    uint32_t i;
+
+    for (i = 0; i < UB_MAX_ENTITIES; i++) {
+        UBEntityCfgSpace *space = &ubc_dev->entity_cfg_spaces[i];
+        if (space->initialized && space->cfg_base) {
+            g_free(space->cfg_base);
+            space->cfg_base = NULL;
+            space->initialized = false;
+        }
+    }
+}
+
 static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
 {
     UBBus *bus = UB_BUS(qdev_get_parent_bus(DEVICE(dev)));
@@ -3716,6 +3829,8 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
     }
 
     ubc->ubc_dev = BUS_CONTROLLER_DEV(dev);
+    ub_entity_table_init(ubc->ubc_dev);
+    ub_entity_cfg_spaces_init(ubc->ubc_dev);
     if (dev->guid.type != UB_GUID_TYPE_IBUS_CONTROLLER &&
         dev->guid.type != UB_GUID_TYPE_BUS_CONTROLLER) {
         qemu_log("%s device type set error, expect: %u or %u, actual: %u\n",
@@ -3773,6 +3888,7 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
 
 static Property ub_bus_controller_dev_properties[] = {
     DEFINE_PROP_UB_DEV_GUID("bus_instance_guid", BusControllerDev, bus_instance_guid),
+    DEFINE_PROP_UINT32("entity_count", BusControllerDev, entity_count, 1),
     DEFINE_PROP_END_OF_LIST(),
 };
 
