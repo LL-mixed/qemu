@@ -224,18 +224,32 @@ static void ub_obtain_entity_info(BusControllerState *s, HiMsgSqe *sqe, MsgPktHe
 {
     EntityInfoMsgPkt *rsp_pkt = NULL;
     uint32_t rsp_pkt_size;
+    BusControllerDev *ubc_dev = s->ubc_dev;
+    uint32_t entity_count = ubc_dev ? ubc_dev->entity_count : 1;
 
     rsp_pkt_size = sizeof(EntityInfoMsgPkt) + sizeof(struct UeMap);
     rsp_pkt = g_malloc0(rsp_pkt_size);
     memcpy(&rsp_pkt->header, header, sizeof(rsp_pkt->header));
-    rsp_pkt->pld.rsp.entity_nums = 1;
-    rsp_pkt->pld.rsp.mue_nums = 1;
+
+    /* 统一字段语义 */
+    rsp_pkt->pld.rsp.entity_nums = entity_count;
+    rsp_pkt->pld.rsp.mue_nums = 1;  /* 始终为 1 个 MUE (entity_idx=0) */
+
+    /* 设置 entity map: 连续范围 [0, entity_count-1] */
     rsp_pkt->pld.rsp.map[0].start_entity_idx = 0;
-    rsp_pkt->pld.rsp.map[0].end_entity_idx = 0;
+    rsp_pkt->pld.rsp.map[0].end_entity_idx = entity_count - 1;
+
     rsp_pkt->header.msgetah.rsp_status = UB_MSG_RSP_SUCCESS;
+
+    /* 确保 plen 与实际 payload 一致 */
     rsp_pkt->header.msgetah.plen = ENTITY_INFO_BASE_PLD_SIZE + sizeof(struct UeMap);
+
     ub_obtain_entity_info_ms_fill_cq_rq(s, sqe, header, rsp_pkt);
     g_free(rsp_pkt);
+
+    qemu_log("ub_obtain_entity_info: entity_count=%u, entity_nums=%u, mue_nums=%u, map=0..%u, plen=%u\n",
+             entity_count, rsp_pkt->pld.rsp.entity_nums, rsp_pkt->pld.rsp.mue_nums,
+             rsp_pkt->pld.rsp.map[0].end_entity_idx, rsp_pkt->header.msgetah.plen);
 }
 
 static void (*msgq_exch_handlers[])(BusControllerState *s, HiMsgSqe *sqe,
