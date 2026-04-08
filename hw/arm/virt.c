@@ -1927,6 +1927,27 @@ static void create_ub(VirtMachineState *vms)
     ubc_dev_state->bus_instance_guid.version = 0;
     ubc_dev_state->bus_instance_guid.type = UB_GUID_TYPE_BUS_INSTANCE;
     ubc_dev_state->bus_instance_guid.seq_num = virt_ub_node_seq(0);
+
+    /* Set entity_count from environment variable (default=1) */
+    {
+        const char *entity_count_str = g_getenv("UB_SIM_ENTITY_COUNT");
+        uint32_t entity_count = entity_count_str ? atoi(entity_count_str) : 1;
+        if (entity_count < 1) {
+            entity_count = 1;
+        }
+        qemu_log("UB: setting entity_count=%u\n", entity_count);
+        qdev_prop_set_uint32(ubc_dev, "entity_count", entity_count);
+    }
+
+    /* Load entity plan from file if specified */
+    {
+        const char *entity_plan_path = g_getenv("UB_FM_ENTITY_PLAN_FILE");
+        if (entity_plan_path && entity_plan_path[0]) {
+            qemu_log("UB: loading entity plan from %s\n", entity_plan_path);
+            /* Note: actual load will be done after realize */
+        }
+    }
+
     qdev_set_id(ubc_dev, g_strdup("ubcdev0"), &error_fatal);
     qdev_realize_and_unref(ubc_dev, BUS(ubc_state->bus), &error_fatal);
     {
@@ -1958,6 +1979,24 @@ static void create_ub(VirtMachineState *vms)
                                                       &local_err) < 0) {
             error_report_err(local_err);
             exit(1);
+        }
+    }
+
+    /* Apply entity plan after UBC realize */
+    {
+        const char *entity_plan_path = g_getenv("UB_FM_ENTITY_PLAN_FILE");
+        if (entity_plan_path && entity_plan_path[0]) {
+            Error *local_err = NULL;
+            if (ub_fm_load_entity_plan_from_file(entity_plan_path, &local_err) < 0) {
+                error_report_err(local_err);
+                error_free(local_err);
+            } else {
+                qemu_log("UB: applying entity plan from %s\n", entity_plan_path);
+                if (ub_fm_apply_entity_plan(&local_err) < 0) {
+                    error_report_err(local_err);
+                    error_free(local_err);
+                }
+            }
         }
     }
 }
