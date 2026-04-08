@@ -1772,7 +1772,7 @@ static size_t ubc_cmd_fill_resp(uint16_t opcode, const uint8_t *req, size_t req_
         ue.max_jfs_inline_sz = cpu_to_le16(64);
         ue.max_jfc_inline_sz = cpu_to_le16(32);
         ue.trans_mode = 1;  /* UD mode */
-        ue.ue_cnt = cpu_to_le16(1);
+        ue.ue_cnt = cpu_to_le16(ubc_dev->entity_count);
         ue.ue_id = 1;
 
         /* BD1: address tables and SEID — critical for ubcore registration */
@@ -3405,6 +3405,7 @@ static void ub_bus_controller_space_cfg0_init(UBDevice *ub_dev)
     Cfg0SupportFeature *support_feature;
     UbCfg0ShpCap *shp_cap;
     UbSlotInfo *slot_info;
+    BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(ub_dev);
     uint64_t emulated_offset;
 
     emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_BASIC_START, true);
@@ -3412,7 +3413,7 @@ static void ub_bus_controller_space_cfg0_init(UBDevice *ub_dev)
     cfg0_basic->header.slice_version = UB_SLICE_VERSION;
     cfg0_basic->header.slice_used_size = UB_CFG0_BASIC_SLICE_USED_SIZE;
     cfg0_basic->total_num_of_port = ub_dev->port.port_num & UINT16_MASK;
-    cfg0_basic->total_num_of_ue = 1;
+    cfg0_basic->total_num_of_ue = ubc_dev->entity_count;
     cfg0_basic->cap_bitmap[CFG0_CAP2_SHP_INDEX / BITS_PER_BYTE] =
         1 << (CFG0_CAP2_SHP_INDEX % BITS_PER_BYTE);
     support_feature = &cfg0_basic->support_feature;
