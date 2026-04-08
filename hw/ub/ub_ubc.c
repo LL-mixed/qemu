@@ -42,6 +42,7 @@
 #include "hw/core/cpu.h"
 #include "hw/ub/ub_common.h"
 #include "hw/ub/ubus_instance.h"
+#include "hw/ub/ub_pool_msg.h"
 
 #define UBC_ERS_PAGE_SIZE (4 * KiB)
 #define UBC_ERS2_MMIO_SIZE (UBC_ERS2_SPACE_SIZE * UBC_ERS_PAGE_SIZE)
@@ -3813,6 +3814,142 @@ void ub_entity_cfg_spaces_cleanup(BusControllerDev *ubc_dev)
             space->initialized = false;
         }
     }
+}
+
+int ub_inject_entity_reg(BusControllerState *s, const UBEntityDesc *e, Error **errp)
+{
+    BusControllerDev *ubc_dev = s->ubc_dev;
+    UBPoolEntityRegMsg *reg_msg;
+    uint8_t *msg_buf;
+    uint32_t msg_size;
+    uint32_t pi;
+    HiMsgCqe cqe;
+
+    if (!s->msgq.rq_inited || !s->msgq.cq_inited) {
+        error_setg(errp, "msgq not initialized");
+        return -1;
+    }
+
+    if (!ubc_dev) {
+        error_setg(errp, "ubc_dev not initialized");
+        return -1;
+    }
+
+    msg_size = MSG_PKT_HEADER_SIZE + UB_POOL_ENTITY_REG_SIZE;
+    msg_buf = g_malloc0(msg_size);
+
+    /* 构造消息头 */
+    MsgPktHeader *header = (MsgPktHeader *)msg_buf;
+    header->msgetah.msg_code = UB_MSG_CODE_POOL;
+    header->msgetah.sub_msg_code = UB_DEV_REG;
+    header->msgetah.code = MSG_RSP;
+    header->msgetah.rsp_status = UB_MSG_RSP_SUCCESS;
+    header->msgetah.plen = UB_POOL_ENTITY_REG_SIZE;
+
+    /* 构造 entity_base_info */
+    reg_msg = (UBPoolEntityRegMsg *)(msg_buf + MSG_PKT_HEADER_SIZE);
+    reg_msg->base.entity_idx = e->entity_idx;
+    reg_msg->base.upi = e->upi;
+    reg_msg->base.cna = e->cna;
+    memcpy(reg_msg->base.eid, e->eid, sizeof(e->eid));
+    memcpy(reg_msg->base.ueid, e->ueid, sizeof(e->ueid));
+    memcpy(reg_msg->base.guid, e->guid, sizeof(e->guid));
+
+    /* 构造 entity_rs_info */
+    for (uint32_t i = 0; i < UB_ENTITY_MAX_RES_NUM; i++) {
+        reg_msg->ers[i].ss = e->ers[i].ss;
+        reg_msg->ers[i].sa_l = e->ers[i].sa_l;
+        reg_msg->ers[i].sa_h = e->ers[i].sa_h;
+    }
+
+    /* 注入到 RQ */
+    pi = fill_rq(s, msg_buf, msg_size);
+    g_free(msg_buf);
+
+    if (pi == UINT32_MAX) {
+        error_setg(errp, "fill_rq failed");
+        return -1;
+    }
+
+    /* 填充 CQE */
+    memset(&cqe, 0, sizeof(cqe));
+    cqe.status = CQE_SUCCESS;
+    cqe.rq_pi = pi;
+    cqe.p_len = msg_size;
+
+    if (fill_cq(s, &cqe) == UINT32_MAX) {
+        error_setg(errp, "fill_cq failed");
+        return -1;
+    }
+
+    qemu_log("entity_reg inject SUCCESS: entity_idx=%u eid=%#x ueid=%#x device_id=%#x cna=%#x\n",
+             e->entity_idx, e->eid[0], e->ueid[0], e->device_id, e->cna);
+
+    return 0;
+}
+
+int ub_inject_entity_rls(BusControllerState *s, uint32_t eid, uint8_t reason, Error **errp)
+{
+    BusControllerDev *ubc_dev = s->ubc_dev;
+    UBPoolEntityRlsMsg *rls_msg;
+    uint8_t *msg_buf;
+    uint32_t msg_size;
+    uint32_t pi;
+    HiMsgCqe cqe;
+
+    if (!s->msgq.rq_inited || !s->msgq.cq_inited) {
+        error_setg(errp, "msgq not initialized");
+        return -1;
+    }
+
+    if (!ubc_dev) {
+        error_setg(errp, "ubc_dev not initialized");
+        return -1;
+    }
+
+    msg_size = MSG_PKT_HEADER_SIZE + UB_POOL_ENTITY_RLS_SIZE;
+    msg_buf = g_malloc0(msg_size);
+
+    /* 构造消息头 */
+    MsgPktHeader *header = (MsgPktHeader *)msg_buf;
+    header->msgetah.msg_code = UB_MSG_CODE_POOL;
+    header->msgetah.sub_msg_code = UB_DEV_RLS;
+    header->msgetah.code = MSG_RSP;
+    header->msgetah.rsp_status = UB_MSG_RSP_SUCCESS;
+    header->msgetah.plen = UB_POOL_ENTITY_RLS_SIZE;
+
+    /* 构造 entity_rls_msg_pld */
+    rls_msg = (UBPoolEntityRlsMsg *)(msg_buf + MSG_PKT_HEADER_SIZE);
+    rls_msg->eid[0] = eid;
+    rls_msg->eid[1] = 0;
+    rls_msg->eid[2] = 0;
+    rls_msg->eid[3] = 0;
+    rls_msg->reason = reason;
+    rls_msg->rsvd1 = 0;
+
+    /* 注入到 RQ */
+    pi = fill_rq(s, msg_buf, msg_size);
+    g_free(msg_buf);
+
+    if (pi == UINT32_MAX) {
+        error_setg(errp, "fill_rq failed");
+        return -1;
+    }
+
+    /* 填充 CQE */
+    memset(&cqe, 0, sizeof(cqe));
+    cqe.status = CQE_SUCCESS;
+    cqe.rq_pi = pi;
+    cqe.p_len = msg_size;
+
+    if (fill_cq(s, &cqe) == UINT32_MAX) {
+        error_setg(errp, "fill_cq failed");
+        return -1;
+    }
+
+    qemu_log("entity_rls inject SUCCESS: eid=%#x reason=%#x\n", eid, reason);
+
+    return 0;
 }
 
 static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
