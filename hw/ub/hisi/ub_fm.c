@@ -1454,3 +1454,215 @@ int ub_fm_load_node_capabilities_from_file(const char *path, Error **errp)
     g_strfreev(groups);
     return 0;
 }
+
+/* Entity Plan Management */
+static UBFMEntityPlan *ub_fm_current_entity_plan = NULL;
+static int find_ubc_for_entity_plan(Object *obj, void *opaque);
+
+int ub_fm_load_entity_plan_from_file(const char *path, Error **errp)
+{
+    GKeyFile *keyfile;
+    GError *gerr = NULL;
+    gchar **groups;
+    gsize num_groups;
+    UBFMEntityPlan *plan;
+
+    if (!path) {
+        error_setg(errp, "ub_fm: entity plan path is NULL");
+        return -EINVAL;
+    }
+
+    keyfile = g_key_file_new();
+    if (!g_key_file_load_from_file(keyfile, path, G_KEY_FILE_NONE, &gerr)) {
+        error_setg(errp, "ub_fm: failed to load entity plan from %s: %s",
+                   path, gerr ? gerr->message : "unknown error");
+        g_clear_error(&gerr);
+        g_key_file_free(keyfile);
+        return -EIO;
+    }
+
+    plan = g_new0(UBFMEntityPlan, 1);
+    plan->entities = g_ptr_array_new_with_free_func(g_free);
+    plan->source_name = g_strdup(path);
+
+    groups = g_key_file_get_groups(keyfile, &num_groups);
+    for (gsize i = 0; i < num_groups; i++) {
+        if (!g_str_has_prefix(groups[i], "entity ")) {
+            continue;
+        }
+
+        UBFMEntityPlanEntry *entry = g_new0(UBFMEntityPlanEntry, 1);
+
+        entry->entity_idx = g_key_file_get_uint64(keyfile, groups[i],
+                                                   "entity_idx", &gerr);
+        entry->device_id = g_key_file_get_uint64(keyfile, groups[i],
+                                                   "device_id", NULL);
+        entry->cna = g_key_file_get_uint64(keyfile, groups[i], "cna", NULL);
+        entry->upi = g_key_file_get_uint64(keyfile, groups[i], "upi", NULL);
+
+        gchar *eid_str = g_key_file_get_string(keyfile, groups[i], "eid", NULL);
+        if (eid_str) {
+            entry->eid[0] = strtol(eid_str, NULL, 0);
+            g_free(eid_str);
+        }
+
+        gchar *ueid_str = g_key_file_get_string(keyfile, groups[i], "ueid", NULL);
+        if (ueid_str) {
+            entry->ueid[0] = strtol(ueid_str, NULL, 0);
+            g_free(ueid_str);
+        }
+
+        entry->guid[0] = g_key_file_get_uint64(keyfile, groups[i],
+                                                "guid_vendor", NULL);
+        entry->guid[1] = 0;
+        entry->guid[2] = g_key_file_get_uint64(keyfile, groups[i],
+                                                 "guid_device", NULL);
+        entry->guid[3] = g_key_file_get_uint64(keyfile, groups[i],
+                                                 "guid_vendor", NULL);
+
+        gchar *state_str = g_key_file_get_string(keyfile, groups[i],
+                                                  "state", NULL);
+        if (g_strcmp0(state_str, "present") == 0) {
+            entry->state = UB_ENTITY_STATE_PRESENT;
+        } else if (g_strcmp0(state_str, "absent") == 0) {
+            entry->state = UB_ENTITY_STATE_ABSENT;
+        } else {
+            entry->state = UB_ENTITY_STATE_ERROR;
+        }
+        g_free(state_str);
+
+        g_ptr_array_add(plan->entities, entry);
+
+        qemu_log("entity_plan: loaded entity %u: state=%s device_id=%#x eid=%#x\n",
+                 entry->entity_idx,
+                 entry->state == UB_ENTITY_STATE_PRESENT ? "present" : "absent",
+                 entry->device_id, entry->eid[0]);
+    }
+
+    g_strfreev(groups);
+    g_key_file_free(keyfile);
+
+    if (ub_fm_current_entity_plan) {
+        ub_fm_entity_plan_free(ub_fm_current_entity_plan);
+    }
+    ub_fm_current_entity_plan = plan;
+
+    qemu_log("entity_plan: loaded %u entities from %s\n",
+             plan->entities->len, path);
+
+    return 0;
+}
+
+void ub_fm_entity_plan_free(UBFMEntityPlan *plan)
+{
+    if (!plan) {
+        return;
+    }
+
+    if (plan->entities) {
+        g_ptr_array_unref(plan->entities);
+    }
+    g_free(plan->source_name);
+    g_free(plan);
+}
+
+int ub_fm_apply_entity_plan(Error **errp)
+{
+    BusControllerState *s;
+    BusControllerDev *ubc_dev;
+    UBFMEntityPlan *plan;
+    Object *container = object_get_objects_root();
+
+    if (!ub_fm_current_entity_plan) {
+        qemu_log("entity_plan: no plan to apply\n");
+        return 0;
+    }
+
+    /* Find UBC device */
+    s = NULL;
+    object_child_foreach(container, find_ubc_for_entity_plan, &s);
+    if (!s) {
+        error_setg(errp, "no bus controller found");
+        return -ENODEV;
+    }
+
+    ubc_dev = s->ubc_dev;
+    if (!ubc_dev) {
+        error_setg(errp, "ubc_dev not initialized");
+        return -EINVAL;
+    }
+
+    plan = ub_fm_current_entity_plan;
+
+    /* Diff: 期望 present 且 当前 absent -> 注入 UB_DEV_REG */
+    for (gsize i = 0; i < plan->entities->len; i++) {
+        UBFMEntityPlanEntry *desired = g_ptr_array_index(plan->entities, i);
+        UBEntityDesc *current = ub_entity_desc_for_idx(ubc_dev, desired->entity_idx);
+
+        if (desired->state == UB_ENTITY_STATE_PRESENT) {
+            if (!current || current->state == UB_ENTITY_STATE_ABSENT) {
+                /* 需要添加实体 */
+                UBEntityDesc new_entity = {0};
+                new_entity.entity_idx = desired->entity_idx;
+                new_entity.device_id = desired->device_id;
+                new_entity.cna = desired->cna;
+                new_entity.upi = desired->upi;
+                new_entity.state = UB_ENTITY_STATE_PRESENT;
+                memcpy(new_entity.eid, desired->eid, sizeof(desired->eid));
+                memcpy(new_entity.ueid, desired->ueid, sizeof(desired->ueid));
+                memcpy(new_entity.guid, desired->guid, sizeof(desired->guid));
+
+                /* 初始化 ERS */
+                new_entity.ers[0].ss = UBC_ERS0_SPACE_SIZE;
+                new_entity.ers[0].sa_l = UBC_ERS0_SPACE_ADDR + desired->entity_idx * 0x200000;
+                new_entity.ers[1].ss = UBC_ERS1_SPACE_SIZE;
+                new_entity.ers[1].sa_l = UBC_ERS1_SPACE_ADDR + desired->entity_idx * 0x200000;
+                new_entity.ers[2].ss = UBC_ERS2_SPACE_SIZE;
+                new_entity.ers[2].sa_l = UBC_ERS2_SPACE_ADDR + desired->entity_idx * 0x200000;
+
+                if (ub_inject_entity_reg(s, &new_entity, errp)) {
+                    qemu_log("entity_plan: failed to inject entity_reg for idx=%u\n",
+                             desired->entity_idx);
+                    if (current) {
+                        current->state = UB_ENTITY_STATE_ERROR;
+                    }
+                } else {
+                    qemu_log("entity_plan: injected entity_reg for idx=%u\n",
+                             desired->entity_idx);
+                    if (current) {
+                        current->state = UB_ENTITY_STATE_PRESENT;
+                    }
+                }
+            }
+        } else if (desired->state == UB_ENTITY_STATE_ABSENT) {
+            if (current && current->state == UB_ENTITY_STATE_PRESENT) {
+                /* 需要删除实体 */
+                if (ub_inject_entity_rls(s, current->eid[0], 0, errp)) {
+                    qemu_log("entity_plan: failed to inject entity_rls for eid=%#x\n",
+                             current->eid[0]);
+                } else {
+                    qemu_log("entity_plan: injected entity_rls for eid=%#x\n",
+                             current->eid[0]);
+                    current->state = UB_ENTITY_STATE_ABSENT;
+                }
+            }
+        }
+    }
+
+    qemu_log("entity_plan: apply completed\n");
+    return 0;
+}
+
+static int find_ubc_for_entity_plan(Object *obj, void *opaque)
+{
+    BusControllerState **s_ptr = (BusControllerState **)opaque;
+    if (object_dynamic_cast(obj, TYPE_BUS_CONTROLLER_DEV)) {
+        BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(obj);
+        /* 检查设备是否已初始化 */
+        if (ubc_dev && ubc_dev->parent.eid != 0) {
+            *s_ptr = container_of_ubbus(UB_BUS(qdev_get_parent_bus(DEVICE(ubc_dev))));
+            return 1;  /* 停止遍历 */
+        }
+    }
+    return 0;
+}
