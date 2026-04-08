@@ -1653,6 +1653,19 @@ int ub_fm_apply_entity_plan(Error **errp)
     return 0;
 }
 
+/* Reload entity plan from file (runtime trigger) */
+int ub_fm_reload_entity_plan(const char *path, Error **errp)
+{
+    int ret;
+
+    ret = ub_fm_load_entity_plan_from_file(path, errp);
+    if (ret) {
+        return ret;
+    }
+
+    return ub_fm_apply_entity_plan(errp);
+}
+
 static int find_ubc_for_entity_plan(Object *obj, void *opaque)
 {
     BusControllerState **s_ptr = (BusControllerState **)opaque;
