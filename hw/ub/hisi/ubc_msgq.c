@@ -34,18 +34,51 @@
 #include "hw/ub/hisi/ub_fm.h"
 #include "qemu/timer.h"
 
-#define UB_MSG_CODE_URMA_DATA  7  /* URMA data transfer between nodes */
+#define UB_MSG_CODE_URMA_DATA   7  /* URMA data transfer between nodes (SEND/RECV) */
+#define UB_MSG_CODE_URMA_WRITE  4  /* RDMA WRITE operation */
+
+/* RDMA WRITE payload header - must match definition in ub_ubc.c */
+typedef struct {
+    uint64_t remote_addr;   /* Remote memory address to write to */
+} UBCWritePayloadHdr;
 
 #define UB_CFG_CPL_NOTIFY_MAX_ATTEMPTS 64
 #define UB_CFG_CPL_NOTIFY_RETRY_MS 100
 
+static void handle_pool_dev_reg_rsp(BusControllerState *s, HiMsgSqe *sqe,
+                                     MsgPktHeader *header)
+{
+    BusControllerDev *ubc_dev = s->ubc_dev;
+
+    if (header->msgetah.type != MSG_RSP) {
+        return;
+    }
+
+    uint8_t rsp_status = header->msgetah.rsp_status;
+
+    for (uint32_t i = 0; i < ubc_dev->entity_count; i++) {
+        if (ubc_dev->entities[i].state == UB_ENTITY_STATE_PENDING) {
+            ubc_dev->entities[i].state = UB_ENTITY_STATE_PRESENT;
+            qemu_log("entity_reg: guest confirmed entity_idx=%u (rsp_status=%u)\n",
+                     i, rsp_status);
+        }
+    }
+}
+
+static void handle_pool_cpl_notify_rsp(BusControllerState *s, HiMsgSqe *sqe,
+                                        MsgPktHeader *header)
+{
+    qemu_log("cfg_cpl_notify: guest acked rsp_status=%u\n",
+             header->msgetah.rsp_status);
+}
+
 static void (*msgq_pool_handlers[])(BusControllerState *s, HiMsgSqe *sqe,
                                     MsgPktHeader *header) = {
-    [UB_DEV_REG]         = NULL, /* only send from CFM */
+    [UB_DEV_REG]         = handle_pool_dev_reg_rsp,
     [UB_DEV_RLS]         = NULL, /* only send from CFM */
     [UB_BI_CREATE]       = NULL,
     [UB_BI_DESTROY]      = NULL,
-    [UB_CFG_CPL_NOTIFY]  = NULL, /* only send from CFM */
+    [UB_CFG_CPL_NOTIFY]  = handle_pool_cpl_notify_rsp,
 };
 
 typedef struct UBCfgCplNotifyPld {
@@ -191,7 +224,8 @@ static void handle_msg_pool(void *opaque, HiMsgSqe *sqe, void *payload)
 }
 
 static void ub_obtain_entity_info_ms_fill_cq_rq(BusControllerState *s, HiMsgSqe *sqe,
-                                                MsgPktHeader *header, EntityInfoMsgPkt *rsp_pkt)
+                                                MsgPktHeader *header, EntityInfoMsgPkt *rsp_pkt,
+                                                uint32_t rsp_pkt_size)
 {
     HiMsgCqe cqe;
     uint32_t pi;
@@ -208,8 +242,8 @@ static void ub_obtain_entity_info_ms_fill_cq_rq(BusControllerState *s, HiMsgSqe 
     rsp_pkt->header.seid_l = EID_LOW(header->deid);
 
     cqe.msn = sqe->msn;
-    cqe.p_len = sizeof(EntityInfoMsgPkt) + sizeof(struct UeMap);
-    pi = fill_rq(s, rsp_pkt, sizeof(*rsp_pkt));
+    cqe.p_len = rsp_pkt_size;
+    pi = fill_rq(s, rsp_pkt, rsp_pkt_size);
     if (pi == UINT32_MAX) {
         qemu_log("fill rq failed!\n");
         return;
@@ -244,12 +278,12 @@ static void ub_obtain_entity_info(BusControllerState *s, HiMsgSqe *sqe, MsgPktHe
     /* 确保 plen 与实际 payload 一致 */
     rsp_pkt->header.msgetah.plen = ENTITY_INFO_BASE_PLD_SIZE + sizeof(struct UeMap);
 
-    ub_obtain_entity_info_ms_fill_cq_rq(s, sqe, header, rsp_pkt);
-    g_free(rsp_pkt);
-
     qemu_log("ub_obtain_entity_info: entity_count=%u, entity_nums=%u, mue_nums=%u, map=0..%u, plen=%u\n",
              entity_count, rsp_pkt->pld.rsp.entity_nums, rsp_pkt->pld.rsp.mue_nums,
              rsp_pkt->pld.rsp.map[0].end_entity_idx, rsp_pkt->header.msgetah.plen);
+
+    ub_obtain_entity_info_ms_fill_cq_rq(s, sqe, header, rsp_pkt, rsp_pkt_size);
+    g_free(rsp_pkt);
 }
 
 static void (*msgq_exch_handlers[])(BusControllerState *s, HiMsgSqe *sqe,
@@ -316,7 +350,7 @@ static void handle_msg_vdm(void *opaque, HiMsgSqe *sqe, void *payload)
     cqe.msg_code = UB_MSG_CODE_VDM;
     cqe.sub_msg_code = header->msgetah.sub_msg_code;
     cqe.msn = sqe->msn;
-    cqe.p_len = sizeof(rsp) - MSG_PKT_HEADER_SIZE;
+    cqe.p_len = sizeof(rsp);
     cqe.rq_pi = pi;
     cqe.status = CQE_SUCCESS;
     (void)fill_cq(s, &cqe);
@@ -667,26 +701,37 @@ void msgq_handle_rst(void *opaque)
  */
 void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
 {
-    void *buf = NULL;
-    size_t len = 0;
-    Error *local_err = NULL;
     int ret;
 
     if (!s || !link) {
         return;
     }
 
-    ret = ub_link_read_message(link, &buf, &len, &local_err);
-    if (ret < 0) {
-        qemu_log("ubc_msgq: failed to read remote message: %s\n",
-                 local_err ? error_get_pretty(local_err) : "unknown");
+    for (;;) {
+        void *buf = NULL;
+        size_t len = 0;
+        Error *local_err = NULL;
+
+        ret = ub_link_read_message(link, &buf, &len, &local_err);
+        if (ret < 0) {
+            qemu_log("ubc_msgq: failed to read remote message: %s\n",
+                     local_err ? error_get_pretty(local_err) : "unknown");
+            if (local_err) {
+                error_free(local_err);
+            }
+            break;
+        }
+        if (ret == 0 || !buf) {
+            if (local_err) {
+                error_free(local_err);
+            }
+            break;
+        }
+
         if (local_err) {
             error_free(local_err);
         }
-        return;
-    }
 
-    if (ret > 0 && buf) {
         MsgPktHeader *header = (MsgPktHeader *)buf;
         HiMsgCqe cqe = { 0 };
         uint32_t pi;
@@ -703,7 +748,49 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
 
             ubc_handle_urma_rx_data(s->ubc_dev, dst_jetty, data, data_len);
             g_free(buf);
-            return;
+            continue;
+        }
+
+        /* RDMA WRITE (msg_code=4): remote node writes to our memory directly */
+        if (header->msgetah.msg_code == UB_MSG_CODE_URMA_WRITE &&
+            s->ubc_dev && len > sizeof(MsgPktHeader) + sizeof(UBCWritePayloadHdr)) {
+            uint32_t dst_jetty = header->deid & 0xFFFFF;
+            const UBCWritePayloadHdr *write_hdr = (const UBCWritePayloadHdr *)
+                ((uint8_t *)buf + sizeof(MsgPktHeader));
+            const uint8_t *data = (uint8_t *)buf + sizeof(MsgPktHeader) + sizeof(UBCWritePayloadHdr);
+            uint32_t data_len = len - sizeof(MsgPktHeader) - sizeof(UBCWritePayloadHdr);
+
+            qemu_log("ubc_msgq: RDMA WRITE dst_jetty=%u remote_addr=%#" PRIx64 " len=%u\n",
+                     dst_jetty, write_hdr->remote_addr, data_len);
+
+            /* Write data directly to the specified remote address */
+            ubc_handle_urma_rx_write(s->ubc_dev, dst_jetty, write_hdr->remote_addr, data, data_len);
+            g_free(buf);
+            continue;
+        }
+
+        /* RDMA READ request (msg_code=6): remote node wants to read our memory */
+        if (header->msgetah.msg_code == 6 && s->ubc_dev &&
+            len >= sizeof(MsgPktHeader) + sizeof(UBCReadReqPld)) {
+            const UBCReadReqPld *req = (const UBCReadReqPld *)
+                ((uint8_t *)buf + sizeof(MsgPktHeader));
+            ubc_handle_read_request(s->ubc_dev, req, header->nth.scna);
+            g_free(buf);
+            continue;
+        }
+
+        /* RDMA READ response (msg_code=5): our pending read completed */
+        if (header->msgetah.msg_code == 5 && s->ubc_dev &&
+            len >= sizeof(MsgPktHeader) + sizeof(UBCReadRespPld)) {
+            const UBCReadRespPld *resp = (const UBCReadRespPld *)
+                ((uint8_t *)buf + sizeof(MsgPktHeader));
+            uint8_t *data = (uint8_t *)buf + sizeof(MsgPktHeader) +
+                            sizeof(UBCReadRespPld);
+            uint32_t data_len = len - sizeof(MsgPktHeader) -
+                                sizeof(UBCReadRespPld);
+            ubc_handle_read_response(s->ubc_dev, resp, data, data_len);
+            g_free(buf);
+            continue;
         }
 
         /* Control message: inject into Guest RQ */

@@ -425,7 +425,10 @@ REG32(UMMU_MEM_USI_ATTR, 0x4D9C)
 #define TCT_FMT_LVL2_4K 1
 #define TCT_FMT_LVL2_64K 2
 #define TCT_SPLIT_64K 10
-#define TCT_L2_ENTRIES                  (1UL << TCT_SPLIT_64K)
+#define TCT_SPLIT_4K  10
+#define TCT_L2_ENTRIES_64K               (1UL << TCT_SPLIT_64K)
+#define TCT_L2_ENTRIES_4K                (1UL << TCT_SPLIT_4K)
+#define TCT_L2_ENTRIES                  TCT_L2_ENTRIES_64K
 #define TCT_L1TCTE_V(x)                 extract32((x)->word[0], 0, 1)
 #define TCT_L2TCTE_PTR(x)               ((*(uint64_t *)&(x)->word[0]) & GENMASK_ULL(51, 12))
 #define TCTE_TTBA(x)                    ((*(uint64_t *)&(x)->word[4]) & GENMASK_ULL(51, 4))
@@ -656,6 +659,7 @@ typedef enum {
 
 typedef struct UMMUPTWEventInfo {
     UMMUPTWEventType type;
+    uint8_t level;  /* Page table level used for translation (0-3) */
 } UMMUPTWEventInfo;
 
 #define EVT_SET_TYPE(x, v)        ((x)->word[0] = deposit32((x)->word[0], 0, 8, v))
@@ -813,6 +817,11 @@ static inline int tgs2granule(int bits)
     default:
         return 0;
     }
+}
+
+static inline bool ummu_enabled(UMMUState *u)
+{
+    return !!FIELD_EX32(u->ctrl[0], CTRL0, UMMU_EN);
 }
 
 static inline bool ummu_eventq_enabled(UMMUState *u)

@@ -18,6 +18,7 @@
 #include "qemu/osdep.h"
 #include "hw/ub/hisi/ub_fm.h"
 #include "hw/ub/ub.h"
+#include "hw/ub/ub_config.h"
 #include "hw/ub/ub_link.h"
 #include "hw/ub/ub_ubc.h"
 #include "qemu/log.h"
@@ -31,6 +32,23 @@ static UBFMTopologyPopulateFn ub_fm_topology_populate;
 static void *ub_fm_topology_populate_opaque;
 static GPtrArray *ub_fm_snapshot_source_links;
 static QEMUTimer *ub_fm_pending_refresh_timer;
+
+/* Entity plan dynamic refresh support */
+static QEMUTimer *ub_fm_entity_plan_refresh_timer;
+static time_t ub_fm_entity_plan_last_mtime;
+static BusControllerState *ub_fm_registered_ubc;  /* single registered UBC */
+static UBFMEntityPlan *ub_fm_current_entity_plan;  /* forward declared */
+
+#define UB_FM_ENTITY_PLAN_REFRESH_MS 3000  /* check every 3 seconds */
+
+static bool ub_fm_entity_dynamic_enabled(void)
+{
+    const char *val = g_getenv("UB_FM_ENABLE_ENTITY_DYNAMIC");
+    if (!val || !val[0]) {
+        return true;  /* default enabled */
+    }
+    return (strcmp(val, "0") != 0);
+}
 
 static const char *ub_fm_get_local_node_id(void)
 {
@@ -165,6 +183,8 @@ void ub_fm_controller_register(BusControllerState *s)
         return;
     }
 
+    ub_fm_registered_ubc = s;
+
     qemu_log("ub_fm register controller eid=%u guid=%04x-%04x port_num=%u\n",
              s->ubc_dev->parent.eid,
              s->ubc_dev->parent.guid.vendor,
@@ -279,6 +299,17 @@ static void ub_fm_configure_remote_links(void)
         if (ub_connect_device_port_remote(local_dev, local->port_idx,
                                            remote->device_id, &remote_guid,
                                            remote->port_idx, NULL) == 0) {
+            
+            /* SYNC REMOTE CNA: Crucial for data plane addressing */
+            uint64_t remote_cna = g_key_file_get_uint64(keyfile, "endpoint", "primary_cna", NULL);
+            if (remote_cna) {
+                NeighborInfo *ni = &local_dev->port.neighbors[local->port_idx];
+                ni->remote_primary_cna = (uint32_t)remote_cna;
+                ni->remote_primary_cna_valid = true;
+                qemu_log("ub_fm: synced remote cna 0x%x for link %s:%u\n", 
+                         (uint32_t)remote_cna, local->device_id, local->port_idx);
+            }
+
             char guid_str[UB_DEV_GUID_STRING_LENGTH + 1];
             ub_device_get_str_from_guid(&remote_guid, guid_str, sizeof(guid_str));
             fprintf(stderr, "ub_fm: configured remote link %s:%u -> %s:%u guid=%s\n",
@@ -670,7 +701,8 @@ static bool ub_fm_has_pending_links(void)
     for (i = 0; i < ub_fm_active_links->len; i++) {
         UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
 
-        if (link->runtime && ub_link_is_pending(link->runtime)) {
+        if (link->runtime &&
+            (ub_link_is_pending(link->runtime) || link->runtime->ioc != NULL)) {
             return true;
         }
     }
@@ -743,11 +775,55 @@ static void ub_fm_reconcile_local_fabric_config(void)
 static void ub_fm_pending_refresh_cb(void *opaque)
 {
     Error *local_err = NULL;
+    bool has_pending_links;
+    bool has_pending_entities = false;
+
+    fprintf(stderr, "ub_fm: pending_refresh_cb FIRED plan=%p ubc=%p\n",
+            (void *)ub_fm_current_entity_plan,
+            (void *)ub_fm_registered_ubc);
+    fflush(stderr);
 
     if (ub_fm_refresh_topology(&local_err) < 0) {
         error_report_err(local_err);
     }
-    ub_fm_schedule_pending_refresh(ub_fm_has_pending_links());
+
+    /* Retry entity plan injection if pending entities exist */
+    if (ub_fm_current_entity_plan && ub_fm_registered_ubc) {
+        Error *plan_err = NULL;
+        /* Force apply on every tick while pending to ensure rapid discovery */
+        int plan_ret = ub_fm_apply_entity_plan(&plan_err);
+        if (plan_ret < 0) {
+            error_free(plan_err);
+        } else if (plan_err) {
+            error_free(plan_err);
+        }
+    }
+
+    /* Keep retrying if there are pending entities (e.g. entity_reg failed because
+     * msgq wasn't initialised yet).  The timer stops only when both links and
+     * entity injection are fully resolved. */
+    has_pending_links = ub_fm_has_pending_links();
+    if (ub_fm_current_entity_plan && ub_fm_registered_ubc) {
+        for (gsize ei = 0; ei < ub_fm_current_entity_plan->entities->len; ei++) {
+            UBFMEntityPlanEntry *desired = g_ptr_array_index(
+                ub_fm_current_entity_plan->entities, ei);
+            UBEntityDesc *current = ub_entity_desc_for_idx(
+                ub_fm_registered_ubc->ubc_dev, desired->entity_idx);
+            fprintf(stderr, "ub_fm: pending_refresh entity[%zu] idx=%u desired_state=%d current=%p current_state=%d\n",
+                    ei, desired->entity_idx, desired->state,
+                    (void *)current, current ? (int)current->state : -1);
+            fflush(stderr);
+            if (desired->state == UB_ENTITY_STATE_PRESENT &&
+                (!current || current->state != UB_ENTITY_STATE_PRESENT)) {
+                has_pending_entities = true;
+                break;
+            }
+        }
+    }
+    fprintf(stderr, "ub_fm: pending_refresh reschedule: links=%d entities=%d\n",
+            has_pending_links, has_pending_entities);
+    fflush(stderr);
+    ub_fm_schedule_pending_refresh(has_pending_links || has_pending_entities);
 }
 
 static void ub_fm_schedule_pending_refresh(bool needed)
@@ -758,9 +834,12 @@ static void ub_fm_schedule_pending_refresh(bool needed)
                                                    NULL);
     }
 
+    fprintf(stderr, "ub_fm: schedule_pending_refresh needed=%d timer=%p\n",
+            needed, (void *)ub_fm_pending_refresh_timer);
+    fflush(stderr);
     if (needed) {
         timer_mod(ub_fm_pending_refresh_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 500);
     } else {
         timer_del(ub_fm_pending_refresh_timer);
     }
@@ -1189,7 +1268,8 @@ int ub_fm_apply_declared_topology(Error **errp)
              * can be observed after the initial topology apply.
              */
             if (link->runtime &&
-                (link->runtime->remote_applied ||
+                (link->runtime->ioc != NULL ||
+                 link->runtime->remote_applied ||
                  link->runtime->a.device == NULL ||
                  link->runtime->b.device == NULL)) {
                 has_pending = true;
@@ -1208,6 +1288,8 @@ int ub_fm_apply_declared_topology(Error **errp)
 int ub_fm_kick_by_cna(uint32_t dcna, Error **errp)
 {
     guint i;
+    uint32_t cna = dcna & 0x00ffffffU;
+    UBFMManagedLink *fallback = NULL;
 
     if (!ub_fm_active_links) {
         return 0;
@@ -1215,61 +1297,115 @@ int ub_fm_kick_by_cna(uint32_t dcna, Error **errp)
 
     for (i = 0; i < ub_fm_active_links->len; i++) {
         UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
-        UBDevice *local = NULL;
-        uint32_t port_idx = 0;
+        UBLinkState *runtime;
+        UBLinkEndpointDesc *ep[2];
+        int e;
 
-        if (!link->runtime || !link->runtime->remote_applied) {
+        runtime = link->runtime;
+        if (!runtime) {
             continue;
         }
-
-        if (link->runtime->a.device) {
-            local = link->runtime->a.device;
-            port_idx = link->runtime->a.port_idx;
-        } else if (link->runtime->b.device) {
-            local = link->runtime->b.device;
-            port_idx = link->runtime->b.port_idx;
+        if (!fallback && runtime->link_up && runtime->ioc) {
+            fallback = link;
         }
 
-        if (local && local->port.neighbors[port_idx].is_remote_neighbor &&
-            local->port.neighbors[port_idx].remote_primary_cna == (dcna & 0x00ffffffU)) {
-            return ub_link_kick_remote(link->runtime, errp);
+        ep[0] = &runtime->a;
+        ep[1] = &runtime->b;
+        for (e = 0; e < 2; e++) {
+            UBDevice *local = ep[e]->device;
+            uint32_t port_idx = ep[e]->port_idx;
+            NeighborInfo *ni;
+
+            if (!local) {
+                continue;
+            }
+            if ((local->cna & 0x00ffffffU) == cna) {
+                return ub_link_kick_remote(runtime, errp);
+            }
+            if (port_idx >= local->port.port_num) {
+                continue;
+            }
+            ni = &local->port.neighbors[port_idx];
+            if (ni->is_remote_neighbor && ni->remote_primary_cna_valid &&
+                ((ni->remote_primary_cna & 0x00ffffffU) == cna)) {
+                return ub_link_kick_remote(runtime, errp);
+            }
         }
     }
 
+    if (fallback && ub_fm_active_links->len == 1) {
+        return ub_link_kick_remote(fallback->runtime, errp);
+    }
     return 0;
 }
 
 UBFMManagedLink *ub_fm_find_link_by_cna(uint32_t dcna)
 {
     guint i;
+    uint32_t cna = dcna & 0x00ffffffU;
+    UBFMManagedLink *fallback = NULL;
 
     if (!ub_fm_active_links) {
+        qemu_log("ub_fm_find_link_by_cna: dcna=%#x no active links\n", cna);
         return NULL;
     }
+    qemu_log("ub_fm_find_link_by_cna: dcna=%#x active_links=%u\n",
+             cna, ub_fm_active_links->len);
 
     for (i = 0; i < ub_fm_active_links->len; i++) {
         UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
-        UBDevice *local = NULL;
-        uint32_t port_idx = 0;
+        UBLinkState *runtime;
+        UBLinkEndpointDesc *ep[2];
+        int e;
 
-        if (!link->runtime || !link->runtime->remote_applied) {
+        runtime = link->runtime;
+        if (!runtime) {
             continue;
         }
-
-        if (link->runtime->a.device) {
-            local = link->runtime->a.device;
-            port_idx = link->runtime->a.port_idx;
-        } else if (link->runtime->b.device) {
-            local = link->runtime->b.device;
-            port_idx = link->runtime->b.port_idx;
+        if (!fallback && runtime->link_up && runtime->ioc) {
+            fallback = link;
         }
 
-        if (local && local->port.neighbors[port_idx].is_remote_neighbor &&
-            local->port.neighbors[port_idx].remote_primary_cna == (dcna & 0x00ffffffU)) {
-            return link;
+        ep[0] = &runtime->a;
+        ep[1] = &runtime->b;
+        for (e = 0; e < 2; e++) {
+            UBDevice *local = ep[e]->device;
+            uint32_t port_idx = ep[e]->port_idx;
+            NeighborInfo *ni;
+
+            if (!local) {
+                continue;
+            }
+            qemu_log("ub_fm_find_link_by_cna: link[%u] ep[%d]=%s:%u local_cna=%#x\n",
+                     i, e, local->qdev.id ? local->qdev.id : "<null>",
+                     port_idx, local->cna);
+            if ((local->cna & 0x00ffffffU) == cna) {
+                qemu_log("ub_fm_find_link_by_cna: hit local cna on link[%u] ep[%d]\n",
+                         i, e);
+                return link;
+            }
+            if (port_idx >= local->port.port_num) {
+                continue;
+            }
+            ni = &local->port.neighbors[port_idx];
+            qemu_log("ub_fm_find_link_by_cna: link[%u] ep[%d] ni_remote=%d valid=%d remote_cna=%#x\n",
+                     i, e, ni->is_remote_neighbor, ni->remote_primary_cna_valid,
+                     ni->remote_primary_cna);
+            if (ni->is_remote_neighbor && ni->remote_primary_cna_valid &&
+                ((ni->remote_primary_cna & 0x00ffffffU) == cna)) {
+                qemu_log("ub_fm_find_link_by_cna: hit neighbor remote cna on link[%u] ep[%d]\n",
+                         i, e);
+                return link;
+            }
         }
     }
 
+    if (fallback && ub_fm_active_links->len == 1) {
+        qemu_log("ub_fm_find_link_by_cna: fallback single active link for dcna=%#x\n",
+                 cna);
+        return fallback;
+    }
+    qemu_log("ub_fm_find_link_by_cna: miss dcna=%#x\n", cna);
     return NULL;
 }
 
@@ -1456,8 +1592,7 @@ int ub_fm_load_node_capabilities_from_file(const char *path, Error **errp)
 }
 
 /* Entity Plan Management */
-static UBFMEntityPlan *ub_fm_current_entity_plan = NULL;
-static int find_ubc_for_entity_plan(Object *obj, void *opaque);
+/* ub_fm_current_entity_plan already declared at top of file */
 
 int ub_fm_load_entity_plan_from_file(const char *path, Error **errp)
 {
@@ -1566,23 +1701,83 @@ void ub_fm_entity_plan_free(UBFMEntityPlan *plan)
     g_free(plan);
 }
 
+/* Entity plan periodic refresh: reload from file if mtime changed */
+static void ub_fm_entity_plan_refresh_cb(void *opaque)
+{
+    UBFMEntityPlan *plan = ub_fm_current_entity_plan;
+    struct stat st;
+
+    if (!plan || !plan->source_name) {
+        return;
+    }
+
+    if (!ub_fm_entity_dynamic_enabled()) {
+        qemu_log("entity_plan refresh: dynamic entity disabled, skipping\n");
+        return;
+    }
+
+    if (stat(plan->source_name, &st) != 0) {
+        qemu_log("entity_plan refresh: cannot stat %s\n", plan->source_name);
+        return;
+    }
+
+    if (st.st_mtime != ub_fm_entity_plan_last_mtime) {
+        Error *local_err = NULL;
+        qemu_log("entity_plan refresh: file changed (old mtime=%ld new mtime=%ld), reloading\n",
+                 (long)ub_fm_entity_plan_last_mtime, (long)st.st_mtime);
+        ub_fm_entity_plan_last_mtime = st.st_mtime;
+        if (ub_fm_reload_entity_plan(plan->source_name, &local_err) < 0) {
+            qemu_log("entity_plan refresh: reload failed: %s\n",
+                     local_err ? error_get_pretty(local_err) : "unknown");
+            error_free(local_err);
+        }
+    }
+}
+
+void ub_fm_entity_plan_refresh_start(const char *path)
+{
+    struct stat st;
+
+    if (!ub_fm_entity_dynamic_enabled()) {
+        qemu_log("entity_plan refresh: UB_FM_ENABLE_ENTITY_DYNAMIC=0, dynamic refresh disabled\n");
+        return;
+    }
+
+    if (!path || !path[0]) {
+        return;
+    }
+
+    if (stat(path, &st) == 0) {
+        ub_fm_entity_plan_last_mtime = st.st_mtime;
+    }
+
+    if (!ub_fm_entity_plan_refresh_timer) {
+        ub_fm_entity_plan_refresh_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                                        ub_fm_entity_plan_refresh_cb,
+                                                        NULL);
+    }
+
+    timer_mod(ub_fm_entity_plan_refresh_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + UB_FM_ENTITY_PLAN_REFRESH_MS);
+    qemu_log("entity_plan refresh: periodic check started for %s (interval=%dms)\n",
+             path, UB_FM_ENTITY_PLAN_REFRESH_MS);
+}
+
 int ub_fm_apply_entity_plan(Error **errp)
 {
     BusControllerState *s;
     BusControllerDev *ubc_dev;
     UBFMEntityPlan *plan;
-    Object *container = object_get_objects_root();
 
     if (!ub_fm_current_entity_plan) {
         qemu_log("entity_plan: no plan to apply\n");
         return 0;
     }
 
-    /* Find UBC device */
-    s = NULL;
-    object_child_foreach(container, find_ubc_for_entity_plan, &s);
+    /* Use registered UBC directly (avoids object hierarchy traversal issues) */
+    s = ub_fm_registered_ubc;
     if (!s) {
-        error_setg(errp, "no bus controller found");
+        error_setg(errp, "no bus controller registered yet");
         return -ENODEV;
     }
 
@@ -1600,25 +1795,84 @@ int ub_fm_apply_entity_plan(Error **errp)
         UBEntityDesc *current = ub_entity_desc_for_idx(ubc_dev, desired->entity_idx);
 
         if (desired->state == UB_ENTITY_STATE_PRESENT) {
-            if (!current || current->state == UB_ENTITY_STATE_ABSENT) {
-                /* 需要添加实体 */
-                UBEntityDesc new_entity = {0};
-                new_entity.entity_idx = desired->entity_idx;
-                new_entity.device_id = desired->device_id;
-                new_entity.cna = desired->cna;
-                new_entity.upi = desired->upi;
-                new_entity.state = UB_ENTITY_STATE_PRESENT;
-                memcpy(new_entity.eid, desired->eid, sizeof(desired->eid));
-                memcpy(new_entity.ueid, desired->ueid, sizeof(desired->ueid));
-                memcpy(new_entity.guid, desired->guid, sizeof(desired->guid));
+            if (!current || (current->state != UB_ENTITY_STATE_PRESENT && 
+                             current->state != UB_ENTITY_STATE_PENDING)) {
+                /*
+                 * 需要添加实体。
+For entity_idx > 0, prefer the entity
+                 * descriptor already initialised by ub_entity_table_init()
+                 * because it has correct GUID construction (type, device_id,
+                 * version, seq_num packed properly).  Only override ueid to
+                 * match the controller's bus-instance EID read from config
+                 * space — the guest driver's ub_bus_instance_exist() check
+                 * requires this.
+                 */
+                UBEntityDesc new_entity;
+                if (current) {
+                    new_entity = *current;
+                } else {
+                    memset(&new_entity, 0, sizeof(new_entity));
+                    new_entity.entity_idx = desired->entity_idx;
+                    new_entity.device_id = desired->device_id;
+                    new_entity.cna = desired->cna;
+                    new_entity.upi = desired->upi;
+                    memcpy(new_entity.eid, desired->eid, sizeof(desired->eid));
+                    memcpy(new_entity.ueid, desired->ueid, sizeof(desired->ueid));
+                    memcpy(new_entity.guid, desired->guid, sizeof(desired->guid));
+                    uint64_t ub_base = ub_ers_phys_base();
+                    uint64_t e_base = ub_base + (uint64_t)desired->entity_idx * 0x400000ULL;
 
-                /* 初始化 ERS */
-                new_entity.ers[0].ss = UBC_ERS0_SPACE_SIZE;
-                new_entity.ers[0].sa_l = UBC_ERS0_SPACE_ADDR + desired->entity_idx * 0x200000;
-                new_entity.ers[1].ss = UBC_ERS1_SPACE_SIZE;
-                new_entity.ers[1].sa_l = UBC_ERS1_SPACE_ADDR + desired->entity_idx * 0x200000;
-                new_entity.ers[2].ss = UBC_ERS2_SPACE_SIZE;
-                new_entity.ers[2].sa_l = UBC_ERS2_SPACE_ADDR + desired->entity_idx * 0x200000;
+                    new_entity.ers[0].ss = UBC_ERS0_SPACE_SIZE;
+                    new_entity.ers[0].sa_l = (uint32_t)(e_base & 0xFFFFFFFFULL);
+                    new_entity.ers[0].sa_h = (uint32_t)(e_base >> 32);
+
+                    new_entity.ers[1].ss = UBC_ERS1_SPACE_SIZE;
+                    new_entity.ers[1].sa_l = (uint32_t)((e_base + 0x100000ULL) & 0xFFFFFFFFULL);
+                    new_entity.ers[1].sa_h = (uint32_t)((e_base + 0x100000ULL) >> 32);
+
+                    new_entity.ers[2].ss = UBC_ERS2_SPACE_SIZE;
+                    new_entity.ers[2].sa_l = (uint32_t)((e_base + 0x200000ULL) & 0xFFFFFFFFULL);
+                    new_entity.ers[2].sa_h = (uint32_t)((e_base + 0x200000ULL) >> 32);
+                }
+                new_entity.state = UB_ENTITY_STATE_PRESENT;
+
+                if (desired->entity_idx > 0) {
+                    UBDevice *ub_dev = &ubc_dev->parent;
+                    uint64_t emulated_offset =
+                        ub_cfg_offset_to_emulated_offset(UB_CFG0_BASIC_START, true);
+                    UbCfg0Basic *cfg0_basic = (UbCfg0Basic *)(ub_dev->config + emulated_offset);
+                    uint32_t bus_eid = le32_to_cpu(cfg0_basic->eid.dw0) & 0x000fffffU;
+
+                    /* Override ueid to match controller's bus-instance EID.
+                     * The guest's ub_bus_instance_exist() checks that ueid
+                     * matches a registered bus instance. */
+                    new_entity.ueid[0] = bus_eid;
+                    qemu_log("entity_plan: override ueid to bus_eid=%#x for idx=%u\n",
+                             bus_eid, desired->entity_idx);
+
+                    /*
+                     * Inject a cfg_cpl_notify for the controller's own bus
+                     * instance so the guest creates a cluster BI with the
+                     * correct EID.  Without this, ub_bus_instance_exist(ueid)
+                     * fails because the static server BI was registered with
+                     * eid=0.
+                     */
+                    if (bus_eid) {
+                        Error *notify_err = NULL;
+                        int nr = ub_inject_remote_cfg_cpl_notify(
+                            s, &ubc_dev->bus_instance_guid, &notify_err);
+                        if (nr < 0) {
+                            qemu_log("entity_plan: cfg_cpl_notify inject failed for "
+                                     "entity %u: %s\n", desired->entity_idx,
+                                     notify_err ? error_get_pretty(notify_err) : "unknown");
+                            error_free(notify_err);
+                        } else {
+                            qemu_log("entity_plan: cfg_cpl_notify injected for "
+                                     "entity %u (bus_eid=%#x)\n",
+                                     desired->entity_idx, bus_eid);
+                        }
+                    }
+                }
 
                 if (ub_inject_entity_reg(s, &new_entity, errp)) {
                     qemu_log("entity_plan: failed to inject entity_reg for idx=%u\n",
@@ -1627,7 +1881,7 @@ int ub_fm_apply_entity_plan(Error **errp)
                         current->state = UB_ENTITY_STATE_ERROR;
                     }
                 } else {
-                    qemu_log("entity_plan: injected entity_reg for idx=%u\n",
+                    qemu_log("entity_plan: injected entity_reg for idx=%u (PRESENT)\n",
                              desired->entity_idx);
                     if (current) {
                         current->state = UB_ENTITY_STATE_PRESENT;
@@ -1635,7 +1889,8 @@ int ub_fm_apply_entity_plan(Error **errp)
                 }
             }
         } else if (desired->state == UB_ENTITY_STATE_ABSENT) {
-            if (current && current->state == UB_ENTITY_STATE_PRESENT) {
+            if (current && (current->state == UB_ENTITY_STATE_PRESENT ||
+                            current->state == UB_ENTITY_STATE_PENDING)) {
                 /* 需要删除实体 */
                 if (ub_inject_entity_rls(s, current->eid[0], 0, errp)) {
                     qemu_log("entity_plan: failed to inject entity_rls for eid=%#x\n",
@@ -1666,16 +1921,28 @@ int ub_fm_reload_entity_plan(const char *path, Error **errp)
     return ub_fm_apply_entity_plan(errp);
 }
 
-static int find_ubc_for_entity_plan(Object *obj, void *opaque)
+/* Event-driven entity injection: called when msgq is initialized by guest.
+ * Retries entity plan injection immediately rather than waiting for timer. */
+void ub_fm_try_inject_pending_entities(void)
 {
-    BusControllerState **s_ptr = (BusControllerState **)opaque;
-    if (object_dynamic_cast(obj, TYPE_BUS_CONTROLLER_DEV)) {
-        BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(obj);
-        /* 检查设备是否已初始化 */
-        if (ubc_dev && ubc_dev->parent.eid != 0) {
-            *s_ptr = container_of_ubbus(UB_BUS(qdev_get_parent_bus(DEVICE(ubc_dev))));
-            return 1;  /* 停止遍历 */
-        }
+    Error *local_err = NULL;
+
+    if (!ub_fm_current_entity_plan || !ub_fm_registered_ubc) {
+        return;
     }
-    return 0;
+
+    if (!ub_fm_registered_ubc->msgq.rq_inited || !ub_fm_registered_ubc->msgq.cq_inited) {
+        return;
+    }
+
+    fprintf(stderr, "ub_fm: msgq ready, triggering entity plan injection\n");
+    fflush(stderr);
+
+    if (ub_fm_apply_entity_plan(&local_err) < 0) {
+        fprintf(stderr, "ub_fm: entity plan injection after msgq init failed: %s\n",
+                local_err ? error_get_pretty(local_err) : "unknown");
+        error_free(local_err);
+    } else if (local_err) {
+        error_free(local_err);
+    }
 }

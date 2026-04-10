@@ -26,6 +26,22 @@
 
 #define UMMU_INTERRUPT_ID 0x8989  // UMMU DEVICE ID need allocate later
 
+#define UMMU_IOTLB_MAX_SIZE 256
+
+typedef struct UMMUIOTLBKey {
+    uint64_t iova;
+    uint16_t tecte_tag;
+    uint8_t tg;
+    uint8_t level;
+} UMMUIOTLBKey;
+
+typedef struct UMMUTLBEntry {
+    IOMMUTLBEntry entry;
+    uint8_t level;
+    uint8_t granule;
+    uint16_t tecte_tag;
+} UMMUTLBEntry;
+
 #define __bf_shf(x) (__builtin_ffsll(x) - 1)
 
 #define TYPE_UB_UMMU "ub-ummu"
@@ -125,6 +141,10 @@ struct UMMUState {
 
     /* set custom ummu config */
     ummu_custom_config set_custom_config;
+
+    /* IOTLB cache */
+    GHashTable *iotlb;
+    uint32_t iotlb_max_size;
 };
 
 struct UMMUBaseClass {

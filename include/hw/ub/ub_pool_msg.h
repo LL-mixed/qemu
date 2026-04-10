@@ -32,7 +32,7 @@
 #define UB_CFG_CPL_NOTIFY  4
 
 /* entity_base_info 结构 (匹配 guest pool.h) */
-typedef struct UBPoolEntityBaseInfo {
+typedef struct QEMU_PACKED UBPoolEntityBaseInfo {
     /* DW0 */
     uint32_t entity_idx : 16;
     uint32_t upi        : 15;
@@ -49,28 +49,28 @@ typedef struct UBPoolEntityBaseInfo {
 } UBPoolEntityBaseInfo;
 
 /* entity_rs_info 结构 */
-typedef struct UBPoolEntityRsInfo {
+typedef struct QEMU_PACKED UBPoolEntityRsInfo {
     uint32_t ss;    /* segment size */
     uint32_t sa_l;  /* start address low */
     uint32_t sa_h;  /* start address high */
 } UBPoolEntityRsInfo;
 
 /* entity_reg_msg_pld 结构 */
-typedef struct UBPoolEntityRegMsg {
+typedef struct QEMU_PACKED UBPoolEntityRegMsg {
     UBPoolEntityBaseInfo base;
     UBPoolEntityRsInfo ers[UB_ENTITY_MAX_RES_NUM];
 } UBPoolEntityRegMsg;
 
 /* entity_rls_msg_pld 结构 */
-typedef struct UBPoolEntityRlsMsg {
+typedef struct QEMU_PACKED UBPoolEntityRlsMsg {
     uint32_t eid[4];
     uint32_t reason : 8;
     uint32_t rsvd1  : 24;
 } UBPoolEntityRlsMsg;
 
 #define UB_POOL_ENTITY_BASE_SIZE  56
-#define UB_POOL_ENTITY_RS_SIZE    36
-#define UB_POOL_ENTITY_REG_SIZE   (UB_POOL_ENTITY_BASE_SIZE + UB_POOL_ENTITY_RS_SIZE * UB_ENTITY_MAX_RES_NUM)
+#define UB_POOL_ENTITY_RS_SIZE    36  /* total size of all ers[3] entries (matches guest ENTITY_RS_PLD_SIZE) */
+#define UB_POOL_ENTITY_REG_SIZE   (UB_POOL_ENTITY_BASE_SIZE + UB_POOL_ENTITY_RS_SIZE)
 #define UB_POOL_ENTITY_RLS_SIZE   20
 
 #endif /* UB_POOL_MSG_H */

@@ -406,7 +406,10 @@ typedef struct MsgPktHeader { /* TODO, check byte order */
     uint32_t rsv1 : 1;
     uint32_t odr : 3;
     /* DW7 */
-    struct MsgExtendedHeader msgetah;
+    union {
+        struct MsgExtendedHeader msgetah;
+        uint32_t msgetah_dw;
+    };
 
     /* DW8~DW11 */
     char payload[0]; /* payload */

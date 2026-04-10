@@ -36,6 +36,7 @@ OBJECT_DECLARE_TYPE(BusControllerDev, BusControllerDevClass, BUS_CONTROLLER_DEV)
 
 typedef enum UBEntityState {
     UB_ENTITY_STATE_ABSENT,
+    UB_ENTITY_STATE_PENDING,   /* injected but not yet confirmed by guest */
     UB_ENTITY_STATE_PRESENT,
     UB_ENTITY_STATE_ERROR,
 } UBEntityState;
@@ -78,6 +79,8 @@ typedef struct UBCmdQueueState {
 #define UBC_MAX_JETTIES  64
 #define UBC_MAX_JFCS     128
 #define UBC_MAX_JFRS     128
+#define UBC_MAX_AEQS     16
+#define UBC_MAX_CEQS     16
 
 typedef struct UBCJettyState {
     bool     active;
@@ -92,6 +95,9 @@ typedef struct UBCJettyState {
     bool     jfs_mode;       /* true=JFS send-only, false=JETTY send+recv */
     uint32_t seid_idx;       /* EID index */
     uint32_t sqe_bb_shift;   /* log2(sq_depth) */
+    uint32_t jetty_state;    /* jetty state machine: RESET/READY/ERROR/SUSPEND */
+    uint32_t user_data_l;    /* from JFS context DW7 — copied to CQE */
+    uint32_t user_data_h;    /* from JFS context DW8 — copied to CQE */
 } UBCJettyState;
 
 typedef struct UBCJfcState {
@@ -101,6 +107,8 @@ typedef struct UBCJfcState {
     uint32_t cq_depth;
     uint32_t cq_pi;
     uint32_t cq_ci;
+    uint32_t ceqn;           /* completion EQ index used by this JFC */
+    uint32_t cq_owner_phase; /* tracks owner bit phase for CQE generation */
 } UBCJfcState;
 
 typedef struct UBCJfrState {
@@ -111,6 +119,17 @@ typedef struct UBCJfrState {
     uint32_t rq_pi;
     uint32_t rq_ci;
 } UBCJfrState;
+
+typedef struct UBCEqState {
+    bool     active;
+    uint32_t eq_id;
+    uint64_t eq_buf_addr;    /* EQ buffer guest physical address */
+    uint32_t eq_depth;       /* number of EQEs */
+    uint32_t eq_pi;          /* producer index */
+    uint32_t eq_ci;          /* consumer index (for query only) */
+    uint32_t eq_owner_phase; /* owner bit phase for EQE generation */
+    uint32_t irq_num;        /* USI vector number programmed by guest */
+} UBCEqState;
 
 typedef struct BusControllerDev {
     UBDevice parent;
@@ -133,13 +152,6 @@ typedef struct BusControllerDev {
     UBCmdQueueState cmd_crq;
     UBCmdQueueState ctrl_csq;
     UBCmdQueueState ctrl_crq;
-    bool csq_bias_valid;
-    bool csq_bias_scanned;
-    uint64_t csq_bias_iova_base;
-    int64_t csq_iova_to_gpa_bias;
-    bool crq_bias_valid;
-    uint64_t crq_bias_iova_base;
-    int64_t crq_iova_to_gpa_bias;
 
     /*
      * CSQ base address recorded after the last successful CMDQ processing.
@@ -153,6 +165,8 @@ typedef struct BusControllerDev {
     UBCJettyState jetties[UBC_MAX_JETTIES];
     UBCJfcState   jfcs[UBC_MAX_JFCS];
     UBCJfrState   jfrs[UBC_MAX_JFRS];
+    UBCEqState    aeqs[UBC_MAX_AEQS];
+    UBCEqState    ceqs[UBC_MAX_CEQS];
 
     /* URMA RX buffering for packets arriving before dst jetty is active */
     struct {
@@ -163,11 +177,33 @@ typedef struct BusControllerDev {
             uint8_t  data[4096];
         } entries[64];
     } urma_rx_buf;
+
+    /* Associated UMMU for address translation */
+    struct UMMUState *ummu;
+
+    /* Pending RDMA READ requests awaiting remote response */
+    #define UBC_MAX_PENDING_READS 64  /* Increased from 16 for better concurrency */
+    struct {
+        uint32_t count;
+        struct {
+            bool     pending;
+            uint32_t jetty_id;    /* originating jetty */
+            uint32_t wqe_idx;     /* WQE index in SQ */
+            uint32_t jfc_id;      /* TX JFC for completion */
+            uint64_t local_va;    /* local SGE VA to write response data */
+            uint32_t local_len;   /* local SGE buffer length */
+            uint32_t req_id;      /* request ID for matching */
+        } entries[UBC_MAX_PENDING_READS];
+    } pending_reads;
+    uint32_t next_read_req_id;
 } BusControllerDev;
 
 struct BusControllerDevClass {
     UBDeviceClass parent_class;
 };
+
+/* Forward declaration for UMMU */
+typedef struct UMMUState UMMUState;
 
 #define TYPE_BUS_CONTROLLER "ub-bus-controller"
 OBJECT_DECLARE_TYPE(BusControllerState, BusControllerClass, BUS_CONTROLLER)
@@ -204,7 +240,9 @@ struct BusControllerClass {
 #define UBC_ERS1_SPACE_ADDR 0x18100000ULL
 #define UBC_ERS2_SPACE_ADDR 0x18200000ULL
 #define UBC_EID_UPI_TEN_DEFAULT_VAL 1024
-#define UBC_CLASS_CODE 0x0
+#define UBC_CLASS_CODE 0x0000  /* UB_CLASS_BUS_CONTROLLER — driver requires base_code=0x00 for IBUS_CONTROLLER type */
+
+uint64_t ub_ers_phys_base(void);
 
 void ub_save_ubc_list(BusControllerState *s);
 BusControllerState *container_of_ubbus(UBBus *bus);
@@ -216,6 +254,9 @@ void ub_notify_retry_timer_cb(void *opaque);
 void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link);
 void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
                               const uint8_t *data, uint32_t data_len);
+void ubc_handle_urma_rx_write(BusControllerDev *ubc_dev, uint32_t dst_jetty,
+                              uint64_t remote_addr, const uint8_t *data,
+                              uint32_t data_len);
 
 /* Entity table management */
 void ub_entity_table_init(BusControllerDev *ubc_dev);
@@ -226,4 +267,29 @@ void ub_entity_cfg_spaces_cleanup(BusControllerDev *ubc_dev);
 /* Entity injection (UB_DEV_REG / UB_DEV_RLS) */
 int ub_inject_entity_reg(BusControllerState *s, const UBEntityDesc *e, Error **errp);
 int ub_inject_entity_rls(BusControllerState *s, uint32_t eid, uint8_t reason, Error **errp);
+
+/* RDMA READ request/response handling (cross-node) */
+
+/* READ request payload (sent from requester to remote) */
+typedef struct QEMU_PACKED UBCReadReqPld {
+    uint32_t req_id;
+    uint32_t src_jetty_id;
+    uint64_t remote_addr;
+    uint32_t read_len;
+    uint32_t rmt_obj_id;
+} UBCReadReqPld;
+
+/* READ response payload (sent from remote back to requester) */
+typedef struct QEMU_PACKED UBCReadRespPld {
+    uint32_t req_id;
+    uint32_t src_jetty_id;
+    uint32_t data_len;
+    uint32_t status;
+    /* data follows immediately after this header */
+} UBCReadRespPld;
+
+void ubc_handle_read_request(BusControllerDev *ubc_dev, const UBCReadReqPld *req,
+                              uint32_t dcna);
+void ubc_handle_read_response(BusControllerDev *ubc_dev, const UBCReadRespPld *resp,
+                                const uint8_t *data, uint32_t data_len);
 #endif

@@ -46,21 +46,32 @@ static UBDevice *ub_link_try_resolve_device(const char *device_id)
     return UB_DEVICE(obj);
 }
 
+static UBDevice *ub_link_resolve_device(const char *device_id)
+{
+    UBDevice *dev = ub_link_try_resolve_device(device_id);
+
+    if (!dev) {
+        dev = ub_find_device_by_id(device_id);
+    }
+    return dev;
+}
+
 static void ub_link_select_endpoints(UBLinkState *s,
                                      UBLinkEndpointDesc **local,
                                      UBLinkEndpointDesc **remote)
 {
-    UBDevice *a_dev = ub_link_try_resolve_device(s->a.device_id);
-    UBDevice *b_dev = ub_link_try_resolve_device(s->b.device_id);
+    UBDevice *a_dev = ub_link_resolve_device(s->a.device_id);
+    UBDevice *b_dev = ub_link_resolve_device(s->b.device_id);
+
+    s->a.device = a_dev;
+    s->b.device = b_dev;
 
     if (a_dev && !b_dev) {
-        s->a.device = a_dev;
         *local = &s->a;
         *remote = &s->b;
         return;
     }
     if (b_dev && !a_dev) {
-        s->b.device = b_dev;
         *local = &s->b;
         *remote = &s->a;
         return;
@@ -137,7 +148,7 @@ static void ub_link_published_state_save(UBLinkState *s)
     (void)remote;
 
     if (!local->device) {
-        local->device = ub_link_try_resolve_device(local->device_id);
+        local->device = ub_link_resolve_device(local->device_id);
     }
     local_dev = local->device;
     if (!local_dev) {
@@ -204,6 +215,7 @@ static void ub_link_load_remote_endpoint_and_connect(UBLinkState *s,
         if (!local_dev) {
             local_dev = ub_link_try_resolve_device(local->device_id);
         }
+        local->device = local_dev;
     }
 
     if (!local_dev) {
@@ -253,6 +265,8 @@ static void ub_link_load_remote_endpoint_and_connect(UBLinkState *s,
         if (s->socket_connected && s->remote_guid_valid) {
             s->state = UB_LINK_STATE_READY;
         }
+        /* Re-evaluate snapshot reconciliation now that remote_guid_valid is set */
+        s->snapshot_reconciled = (s->socket_connected && s->remote_guid_valid);
         ub_link_update_status_file(s);
     }
 }
@@ -349,19 +363,90 @@ int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **e
     return qio_channel_write_all(s->ioc, (const char *)buf, len, errp);
 }
 
+static bool ub_link_ensure_rx_capacity(UBLinkState *s, size_t need, Error **errp)
+{
+    size_t cap = s->rx_buf_cap ? s->rx_buf_cap : 4096;
+
+    if (need > UB_LINK_RX_BUF_MAX + sizeof(uint32_t)) {
+        error_setg(errp, "ub_link: rx buffer need %zu exceeds max", need);
+        return false;
+    }
+
+    while (cap < need) {
+        cap <<= 1;
+    }
+
+    if (cap != s->rx_buf_cap) {
+        uint8_t *new_buf = g_realloc(s->rx_buf, cap);
+        if (!new_buf) {
+            error_setg(errp, "ub_link: rx buffer realloc failed");
+            return false;
+        }
+        s->rx_buf = new_buf;
+        s->rx_buf_cap = cap;
+    }
+
+    return true;
+}
+
 int ub_link_read_message(UBLinkState *s, void **buf, size_t *len, Error **errp)
 {
-    if (!s || !s->ioc) return 0;
-    uint32_t plen_le;
-    ssize_t ret = qio_channel_read(s->ioc, (char *)&plen_le, sizeof(plen_le), NULL);
-    if (ret <= 0) return 0;
-    uint32_t plen = le32_to_cpu(plen_le);
-    *buf = g_malloc(plen);
-    if (qio_channel_read_all(s->ioc, (char *)*buf, plen, errp) < 0) {
-        g_free(*buf);
+    uint8_t tmp[4096];
+    ssize_t ret;
+
+    if (!s || !s->ioc) {
+        return 0;
+    }
+
+    if (!s->rx_buf && !ub_link_ensure_rx_capacity(s, sizeof(tmp), errp)) {
         return -1;
     }
+
+    /* Non-blocking stream read: accumulate as much as available this turn. */
+    for (;;) {
+        ret = qio_channel_read(s->ioc, (char *)tmp, sizeof(tmp), NULL);
+        if (ret <= 0) {
+            break;
+        }
+
+        if (!ub_link_ensure_rx_capacity(s, s->rx_buf_used + (size_t)ret, errp)) {
+            s->rx_buf_used = 0;
+            return -1;
+        }
+
+        memcpy(s->rx_buf + s->rx_buf_used, tmp, (size_t)ret);
+        s->rx_buf_used += (size_t)ret;
+    }
+
+    if (s->rx_buf_used < sizeof(uint32_t)) {
+        return 0;
+    }
+
+    uint32_t plen_le;
+    uint32_t plen;
+    size_t frame_len;
+    memcpy(&plen_le, s->rx_buf, sizeof(plen_le));
+    plen = le32_to_cpu(plen_le);
+    if (plen == 0 || plen > UB_LINK_RX_BUF_MAX) {
+        error_setg(errp, "ub_link: invalid frame length %u", plen);
+        s->rx_buf_used = 0;
+        return -1;
+    }
+
+    frame_len = sizeof(uint32_t) + (size_t)plen;
+    if (s->rx_buf_used < frame_len) {
+        return 0;
+    }
+
+    *buf = g_malloc((size_t)plen);
+    memcpy(*buf, s->rx_buf + sizeof(uint32_t), (size_t)plen);
     *len = (size_t)plen;
+
+    s->rx_buf_used -= frame_len;
+    if (s->rx_buf_used > 0) {
+        memmove(s->rx_buf, s->rx_buf + frame_len, s->rx_buf_used);
+    }
+
     return 1;
 }
 
@@ -481,6 +566,9 @@ void ub_link_mark_connected(UBLinkState *s)
         return;
     }
 
+    qemu_log("ub_link: mark_connected %s:%u <-> %s:%u\n",
+             s->a.device_id, s->a.port_idx, s->b.device_id, s->b.port_idx);
+
     s->socket_connected = true;
     s->reconcile_ts_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
 
@@ -494,7 +582,7 @@ void ub_link_mark_connected(UBLinkState *s)
     if (local->device) {
         local_dev = local->device;
     } else {
-        local_dev = ub_find_device_by_id(local->device_id);
+        local_dev = ub_link_try_resolve_device(local->device_id);
         if (local_dev) {
             local->device = local_dev;
         }
@@ -507,7 +595,12 @@ void ub_link_mark_connected(UBLinkState *s)
 
         if (ub_guid_initialized(&port_basic->neighbor_port_info.neighbot_port_guid)) {
             s->remote_guid_valid = true;
+            qemu_log("ub_link: remote guid valid for %s:%u\n", local->device_id, local->port_idx);
+        } else {
+            qemu_log("ub_link: remote guid NOT YET initialized for %s:%u\n", local->device_id, local->port_idx);
         }
+    } else {
+        qemu_log("ub_link: local device %s not yet resolved during mark_connected\n", local->device_id);
     }
 
     /* Update state based on Ready Contract */
@@ -526,7 +619,14 @@ void ub_link_mark_connected(UBLinkState *s)
 
     ub_link_update_status_file(s);
     qemu_log("ub_link: marked connected for %s:%u state=%d socket=%d guid_valid=%d snapshot_reconciled=%d\n",
-             local->device_id, local->port_idx, s->state, s->socket_connected, s->remote_guid_valid, s->snapshot_reconciled);
+             local->device_id, local->port_idx, s->state,
+             s->socket_connected, s->remote_guid_valid, s->snapshot_reconciled);
+
+    /* If we are connected but guid is not yet valid, we might be in a race.
+     * Force a reload of the remote endpoint info. */
+    if (s->socket_connected && !s->remote_guid_valid) {
+        ub_link_load_remote_endpoint_and_connect(s, local, remote);
+    }
 }
 
 /* Mark link as failed and update status */
@@ -665,6 +765,11 @@ int ub_link_apply(UBLinkState *s, Error **errp)
     uint64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     bool state_age_ok = (now_ms - s->state_set_ts_ms) >= 200;  /* M1: 200ms stability check */
 
+    qemu_log("ub_link: apply %s:%u <-> %s:%u (sock=%d guid=%d snap=%d age=%d ms_ago=%lu)\n",
+             s->a.device_id, s->a.port_idx, s->b.device_id, s->b.port_idx,
+             s->socket_connected, s->remote_guid_valid, s->snapshot_reconciled,
+             state_age_ok, (unsigned long)(now_ms - s->state_set_ts_ms));
+
     if (s->socket_connected && s->remote_guid_valid &&
         s->snapshot_reconciled && state_age_ok) {
         /* All 4 Ready Contract conditions met - mark as READY and applied */
@@ -673,6 +778,16 @@ int ub_link_apply(UBLinkState *s, Error **errp)
         s->remote_applied = true;
         ub_link_update_status_file(s);
         return 0;
+    } else if (s->socket_connected && s->remote_guid_valid && s->snapshot_reconciled) {
+        /* Conditions met but stability window hasn't elapsed — stay PENDING
+         * but do NOT reset state if already READY from configure_remote_links. */
+        if (s->state != UB_LINK_STATE_READY) {
+            s->state = UB_LINK_STATE_PENDING;
+        }
+        s->applied = false;
+        s->remote_applied = false;
+        ub_link_update_status_file(s);
+        return 1; /* PENDING */
     } else {
         /* Not ready yet - mark as PENDING */
         s->state = UB_LINK_STATE_PENDING;

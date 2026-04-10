@@ -1926,7 +1926,7 @@ static void create_ub(VirtMachineState *vms)
     ubc_dev_state->bus_instance_guid.device_id = 0x0541;
     ubc_dev_state->bus_instance_guid.version = 0;
     ubc_dev_state->bus_instance_guid.type = UB_GUID_TYPE_BUS_INSTANCE;
-    ubc_dev_state->bus_instance_guid.seq_num = virt_ub_node_seq(0);
+    ubc_dev_state->bus_instance_guid.seq_num = virt_ub_node_seq(0) + 0x100000;
 
     /* Set entity_count from environment variable (default=1) */
     {
@@ -1996,6 +1996,8 @@ static void create_ub(VirtMachineState *vms)
                     error_report_err(local_err);
                     error_free(local_err);
                 }
+                /* Start periodic refresh for runtime entity plan changes */
+                ub_fm_entity_plan_refresh_start(entity_plan_path);
             }
         }
     }

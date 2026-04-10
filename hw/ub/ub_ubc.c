@@ -31,15 +31,14 @@
 #include "hw/ub/ub_ummu.h"
 #include "hw/ub/ub_config.h"
 #include "hw/ub/ub_usi.h"
-#include "hw/pci/pci.h"
-#include "hw/pci/msi.h"
 #include "hw/ub/hisi/ubc.h"
 #include "hw/ub/hisi/ub_mem.h"
 #include "hw/ub/hisi/ub_fm.h"
 #include "hw/ub/ub_link.h"
 #include "sysemu/dma.h"
-#include "migration/vmstate.h"
+#include "sysemu/cpus.h"
 #include "hw/core/cpu.h"
+#include "migration/vmstate.h"
 #include "hw/ub/ub_common.h"
 #include "hw/ub/ubus_instance.h"
 #include "hw/ub/ub_pool_msg.h"
@@ -47,8 +46,21 @@
 #define UBC_ERS_PAGE_SIZE (4 * KiB)
 #define UBC_ERS2_MMIO_SIZE (UBC_ERS2_SPACE_SIZE * UBC_ERS_PAGE_SIZE)
 
-#define UBC_GUEST_RAM_BASE 0x40000000ULL
-#define UBC_GUEST_RAM_SIZE 0x200000000ULL   /* 8 GB guest RAM */
+/*
+ * The ERS ubba values must map to addresses visible inside the
+ * "ub-idev-ers-as" MMIO alias window (VIRT_UB_IDEV_ERS range).
+ * The static UBC_ERSx_SPACE_ADDR constants (0x18000000 etc.) are only
+ * valid when that window happens to start at 0x18000000, which it never
+ * does on a machine with 8 GiB RAM — the alias base is typically at
+ * 0x180_0000_0000 (512 GiB aligned).  This helper resolves the dynamic
+ * base so that both the controller config-space fields and entity
+ * injection messages carry addresses that the guest can actually ioremap.
+ */
+uint64_t ub_ers_phys_base(void)
+{
+    VirtMachineState *vms = VIRT_MACHINE(qdev_get_machine());
+    return vms->memmap[VIRT_UB_IDEV_ERS].base;
+}
 
 /* ubase cmdq registers in ERS2 */
 #define UBASE_CSQ_BASEADDR_L_REG 0x18400
@@ -77,6 +89,7 @@
 #define UBASE_CTRLQ_BB_LEN 32
 #define UBASE_CTRLQ_HDR_LEN 12
 #define UBASE_CTRLQ_DATA_NUM 5
+#define UBASE_CTRLQ_DATA_LEN (UBASE_CTRLQ_BB_LEN - UBASE_CTRLQ_HDR_LEN)
 
 typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
     uint8_t  service_ver;
@@ -108,6 +121,8 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 
 #define UBASE_VECTOR0_CMDQ_SRC_REG 0x18004
 #define UBASE_VECTOR0_RX_CMDQ_INT_B 1
+#define UBASE_VECTOR0_CTRLQ_SRC_REG 0x18014
+#define UBASE_VECTOR0_RX_CTRLQ_INT_B 0
 
 #define UBASE_OPC_QUERY_FW_VER 0x0001
 #define UBASE_OPC_QUERY_UE_RES 0x0002
@@ -138,37 +153,97 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define UBASE_MAX_VL_NUM 16
 #define UBASE_MAX_SL_NUM 16
 
-/* Mailbox sub-opcodes (cmd field in UBCMbox.cmd_tag) */
+/*
+ * Mailbox sub-opcodes (cmd field in UBCMbox.cmd_tag).
+ * Two parallel control channels exist:
+ *   1. Mailbox: used for JFS/JFC/JFR context lifecycle (CREATE/MODIFY/QUERY/DESTROY)
+ *   2. CtrlQ:   used for service-type operations (TP_ACL, DEV_REGISTER, QOS)
+ * CtrlQ messages may also be carried via CMDQ fallback (UBASE_OPC_UE2UE_UBASE)
+ * when the native CtrlQ path is unavailable.
+ *
+ * JFS sub-opcodes (high nibble = 0x0):
+ */
 #define UBC_MB_CREATE_JFS_CONTEXT   0x04
 #define UBC_MB_MODIFY_JFS_CONTEXT   0x05
 #define UBC_MB_QUERY_JFS_CONTEXT    0x06
 #define UBC_MB_DESTROY_JFS_CONTEXT  0x07
+/* JFC sub-opcodes (high nibble = 0x2): */
 #define UBC_MB_CREATE_JFC_CONTEXT   0x24
+#define UBC_MB_MODIFY_JFC_CONTEXT   0x25
+#define UBC_MB_QUERY_JFC_CONTEXT    0x26
+#define UBC_MB_DESTROY_JFC_CONTEXT  0x27
+/* AEQ sub-opcodes (high nibble = 0x3): */
+#define UBC_MB_CREATE_AEQ_CONTEXT   0x34
+#define UBC_MB_QUERY_AEQ_CONTEXT    0x36
+#define UBC_MB_DESTROY_AEQ_CONTEXT  0x37
+/* CEQ sub-opcodes (high nibble = 0x4): */
+#define UBC_MB_CREATE_CEQ_CONTEXT   0x44
+#define UBC_MB_QUERY_CEQ_CONTEXT    0x46
+#define UBC_MB_DESTROY_CEQ_CONTEXT  0x47
+/* JFR sub-opcodes (high nibble = 0x5): */
 #define UBC_MB_CREATE_JFR_CONTEXT   0x54
+#define UBC_MB_MODIFY_JFR_CONTEXT   0x55
+#define UBC_MB_QUERY_JFR_CONTEXT    0x56
+#define UBC_MB_DESTROY_JFR_CONTEXT  0x57
 
 /* udma_jetty_ctx size and field extraction constants */
 #define UDMA_JETTY_CTX_SIZE  256
 #define UDMA_JFC_CTX_SIZE    256
 #define UDMA_JFR_CTX_SIZE    256
+#define UBASE_EQ_CTX_SIZE    64
 
 /* WQE / SQE constants for DMA transport */
 #define UDMA_SQE_SIZE          64   /* one WQEBB = 64 bytes */
 #define UDMA_SQE_CTL_LEN_SEND  48   /* sizeof(udma_sqe_ctl) for SEND opcode */
-#define UDMA_SQE_OPCODE_SEND  0   /* matches kernel enum udma_sq_opcode UDMA_OPC_SEND */
 #define UDMA_SQE_INLINE_EN_BIT 6  /* bit position in DW1 */
 #define UDMA_JFS_SGE_SIZE      16   /* sizeof(udma_normal_sge) */
 
+/* WQE opcodes (DW1[15:8]) — matches kernel enum udma_sq_opcode */
+#define UDMA_SQE_OPCODE_SEND               0x00  /* UDMA_OPC_SEND */
+#define UDMA_SQE_OPCODE_SEND_WITH_IMM      0x01  /* UDMA_OPC_SEND_WITH_IMM */
+#define UDMA_SQE_OPCODE_SEND_WITH_INVALID  0x02  /* UDMA_OPC_SEND_WITH_INVALID */
+#define UDMA_SQE_OPCODE_WRITE              0x03  /* UDMA_OPC_WRITE */
+#define UDMA_SQE_OPCODE_WRITE_WITH_IMM     0x04  /* UDMA_OPC_WRITE_WITH_IMM */
+#define UDMA_SQE_OPCODE_READ               0x06  /* UDMA_OPC_READ */
+#define UDMA_SQE_OPCODE_CAS                0x07  /* UDMA_OPC_CAS */
+#define UDMA_SQE_OPCODE_FAA                0x0b  /* UDMA_OPC_FAA */
+
+/* Jetty state machine values (matches guest enum jetty_state) */
+#define JETTY_STATE_RESET   0
+#define JETTY_STATE_READY   1
+#define JETTY_STATE_ERROR   2
+#define JETTY_STATE_SUSPEND 3
+
+/* CQE status codes */
+#define CQE_STATUS_SUCCESS        0
+#define CQE_STATUS_LOCAL_LEN_ERR  1
+#define CQE_STATUS_LOCAL_OP_ERR   2
+#define CQE_STATUS_REMOTE_ERR     3
+#define CQE_STATUS_RQ_EMPTY_ERR   4
+#define CQE_STATUS_DMA_ERR        5
+
 /* URMA inter-node data transfer msg_code (fits in 3-bit msg_code field) */
 #define UB_MSG_CODE_URMA_DATA  7
-#define UBASE_CTRLQ_BB_LEN 32
-#define UBASE_CTRLQ_HDR_LEN 12
-#define UBASE_CTRLQ_DATA_LEN (UBASE_CTRLQ_BB_LEN - UBASE_CTRLQ_HDR_LEN)
-#define UBASE_CTRLQ_SER_TYPE_QOS 0x04
-#define UBASE_CTRLQ_OPC_QUERY_VL 0x01
-#define UBASE_CTRLQ_OPC_QUERY_SL 0x02
+
+/* Extended msg_codes for RDMA READ/WRITE (stored in msgetah) */
+#define UB_MSG_CODE_URMA_READ_REQ  6
+#define UB_MSG_CODE_URMA_READ_RESP 5
+#define UB_MSG_CODE_URMA_WRITE     4
+
+/* Doorbell/MMIO region constants (matches UAPI) */
+#define UDMA_JETTY_DSQE_OFFSET   0x1000
+#define UDMA_DOORBELL_OFFSET     0x80
+#define UDMA_HW_PAGE_SIZE        0x1000
+#define UBASE_EQE_SIZE           64
+
+/* RDMA WRITE payload header (prepended before actual data) */
+typedef struct {
+    uint64_t remote_addr;   /* Remote memory address to write to */
+} UBCWritePayloadHdr;
 
 /* --- URMA RX buffering for early-arriving packets --- */
 #define UBC_URMA_RX_BUF_MAX 64
+#define UBC_URMA_RX_BUF_DATA_MAX 4096
 
 typedef struct UBCUrxBufEntry {
     uint32_t dst_jetty;
@@ -456,6 +531,9 @@ typedef struct QEMU_PACKED UBCCtrlqQueryVlResp {
 } UBCCtrlqQueryVlResp;
 
 static void ubc_raise_cmdq_event(BusControllerDev *ubc_dev);
+static void ubc_raise_ctrlq_event(BusControllerDev *ubc_dev);
+static bool ubc_notify_vector(BusControllerDev *ubc_dev, uint16_t usi_vector,
+                              uint16_t msi_vector, const char *name);
 
 static uint32_t ub_msgq_cq_int_ro(BusControllerState *s)
 {
@@ -571,9 +649,11 @@ static void ub_msgq_reg_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
         break;
     case CQ_ADDR_H:
         msgq_cq_init(s);
+        ub_fm_try_inject_pending_entities();
         break;
     case RQ_ADDR_H:
         msgq_rq_init(s);
+        ub_fm_try_inject_pending_entities();
         break;
     case MSGQ_RST:
         msgq_handle_rst(s);
@@ -629,91 +709,102 @@ static inline AddressSpace *ubc_dma_as(BusControllerDev *ubc_dev)
     return as ? as : &address_space_memory;
 }
 
-static bool ubc_try_iova_linear_fallback(dma_addr_t iova, dma_addr_t *gpa)
-{
-    const dma_addr_t iova_base = 0xFFFE0000000ULL;
-    const dma_addr_t ram_base = UBC_GUEST_RAM_BASE;
-    const dma_addr_t ram_size = UBC_GUEST_RAM_SIZE;
-    const dma_addr_t iova_limit = iova_base + ram_size;
-    dma_addr_t off;
-
-    if (iova < iova_base || iova >= iova_limit) {
-        return false;
-    }
-
-    off = iova - iova_base;
-    if (off >= ram_size) {
-        return false;
-    }
-
-    *gpa = ram_base + off;
-    return true;
-}
-
-static bool ubc_try_iova_lowbits_fallback(dma_addr_t iova, dma_addr_t *gpa)
-{
-    dma_addr_t off = iova & (UBC_GUEST_RAM_SIZE - 1);
-
-    *gpa = UBC_GUEST_RAM_BASE + off;
-    return true;
-}
-
 /*
- * Translate a guest kernel virtual address to guest physical address
- * using QEMU's CPU page table walker. Handles both direct-mapped
- * (kmalloc) and vmalloc addresses — unlike simple PAGE_OFFSET subtraction
- * which only works for the direct linear map region.
+ * Kernel-side UDMA paths program queue/context addresses as virtual addresses.
+ * In simulation, if UMMU translation misses, recover by aliasing the low 32 bits
+ * into guest RAM window [0x40000000, ...], consistent with UMMU early alias.
  */
-static bool ubc_kva_to_gpa(dma_addr_t kva, dma_addr_t *gpa)
+static bool ubc_is_kernel_linear_va(dma_addr_t iova)
 {
-    CPUState *cpu = first_cpu;
-    hwaddr phys;
-
-    if (!cpu) {
-        return false;
-    }
-
-    /* Only handle kernel virtual addresses (bit 63 set on ARM64) */
-    if (!(kva >> 63)) {
-        return false;
-    }
-
-    phys = cpu_get_phys_page_debug(cpu, kva);
-    if (phys == (hwaddr)-1) {
-        return false;
-    }
-
-    *gpa = (dma_addr_t)phys;
-    return true;
+    return iova >= 0xFFFF800000000000ULL && iova < 0xFFFFC00000000000ULL;
 }
 
-static bool ubc_try_learned_bias_fallback(BusControllerDev *ubc_dev,
-                                          const UBCmdQueueState *q,
-                                          dma_addr_t iova,
-                                          dma_addr_t *gpa)
+static MemTxResult ubc_dma_read_via_cpu_ptw(dma_addr_t va, void *buf, size_t len)
 {
-    /* CRQ queues use their own bias (learned by scanning guest RAM) */
-    if (q == &ubc_dev->cmd_crq || q == &ubc_dev->ctrl_crq) {
-        if (!ubc_dev->crq_bias_valid ||
-            ubc_dev->crq_bias_iova_base != ubc_dev->cmd_crq.base ||
-            !ubc_dev->cmd_crq.base) {
-            return false;
+    CPUState *cs = first_cpu;
+    uint8_t *dst = buf;
+    size_t done = 0;
+
+    if (!cs) {
+        return MEMTX_DECODE_ERROR;
+    }
+
+    while (done < len) {
+        vaddr cur_va = (vaddr)(va + done);
+        hwaddr page_base_va = (hwaddr)cur_va & ~(UDMA_HW_PAGE_SIZE - 1);
+        hwaddr page_base_pa = cpu_get_phys_page_debug(cs, page_base_va);
+        size_t page_off = (size_t)cur_va & (UDMA_HW_PAGE_SIZE - 1);
+        size_t chunk = MIN(len - done, UDMA_HW_PAGE_SIZE - page_off);
+        MemTxResult ret;
+
+        if (page_base_pa == (hwaddr)-1) {
+            return MEMTX_DECODE_ERROR;
         }
-        *gpa = (dma_addr_t)((int64_t)iova + ubc_dev->crq_iova_to_gpa_bias);
+
+        ret = address_space_read(&address_space_memory,
+                                 page_base_pa + page_off,
+                                 MEMTXATTRS_UNSPECIFIED,
+                                 dst + done, chunk);
+        if (ret != MEMTX_OK) {
+            return ret;
+        }
+        done += chunk;
+    }
+
+    return MEMTX_OK;
+}
+
+static MemTxResult ubc_dma_write_via_cpu_ptw(dma_addr_t va, const void *buf, size_t len)
+{
+    CPUState *cs = first_cpu;
+    const uint8_t *src = buf;
+    size_t done = 0;
+
+    if (!cs) {
+        return MEMTX_DECODE_ERROR;
+    }
+
+    while (done < len) {
+        vaddr cur_va = (vaddr)(va + done);
+        hwaddr page_base_va = (hwaddr)cur_va & ~(UDMA_HW_PAGE_SIZE - 1);
+        hwaddr page_base_pa = cpu_get_phys_page_debug(cs, page_base_va);
+        size_t page_off = (size_t)cur_va & (UDMA_HW_PAGE_SIZE - 1);
+        size_t chunk = MIN(len - done, UDMA_HW_PAGE_SIZE - page_off);
+        MemTxResult ret;
+
+        if (page_base_pa == (hwaddr)-1) {
+            return MEMTX_DECODE_ERROR;
+        }
+
+        ret = address_space_write(&address_space_memory,
+                                  page_base_pa + page_off,
+                                  MEMTXATTRS_UNSPECIFIED,
+                                  src + done, chunk);
+        if (ret != MEMTX_OK) {
+            return ret;
+        }
+        done += chunk;
+    }
+
+    return MEMTX_OK;
+}
+
+static bool ubc_dma_alias_addr(dma_addr_t iova, dma_addr_t *alias)
+{
+    if (ubc_is_kernel_linear_va(iova)) {
+        /*
+         * Guest SQ/RQ/CQ buffers can be programmed as kernel linear VAs
+         * (phys_to_virt(pa)). Convert back with the arm64 linear-map base.
+         */
+        *alias = iova - 0xFFFF800000000000ULL;
         return true;
     }
 
-    if (!ubc_dev->csq_bias_valid ||
-        ubc_dev->csq_bias_iova_base != ubc_dev->cmd_csq.base ||
-        !ubc_dev->cmd_csq.base) {
+    if (iova <= 0x200000000ULL) {
         return false;
     }
 
-    if (q != &ubc_dev->cmd_csq && q != &ubc_dev->ctrl_csq) {
-        return false;
-    }
-
-    *gpa = (dma_addr_t)((int64_t)iova + ubc_dev->csq_iova_to_gpa_bias);
+    *alias = 0x40000000ULL + (iova & 0xFFFFFFFFULL);
     return true;
 }
 
@@ -726,356 +817,81 @@ static MemTxResult ubc_dma_read(BusControllerDev *ubc_dev, dma_addr_t iova,
                                  void *buf, size_t len)
 {
     AddressSpace *as = ubc_dma_as(ubc_dev);
+    dma_addr_t alias;
+    bool is_kva = ubc_is_kernel_linear_va(iova);
+    bool try_ptw = is_kva || (iova >= 0xFFFF000000000000ULL);
+    bool has_alias = ubc_dma_alias_addr(iova, &alias);
     MemTxResult ret;
-    dma_addr_t gpa;
-    const uint32_t *first_dw = NULL;
+    bool trace_iova = ((iova & 0xFFFFFFFFFFFFF000ULL) == 0xFFFF8000805E6000ULL);
 
-    /* Try ARM64 KVA-to-GPA first — KVA addresses are never valid IOVAs,
-     * and the IOMMU path would succeed with zeros for unmapped addresses. */
-    if (ubc_kva_to_gpa(iova, &gpa)) {
-        ret = address_space_read(&address_space_memory, gpa,
-                                MEMTXATTRS_UNSPECIFIED, buf, len);
-        if (ret == MEMTX_OK) {
-            first_dw = (const uint32_t *)buf;
-            fprintf(stderr, "ubc_dma_read: KVA iova=%#lx gpa=%#lx dw0=%#x\n",
-                    (unsigned long)iova, (unsigned long)gpa, first_dw[0]);
-            return ret;
-        }
-    }
-
-    /* Try IOMMU address space */
     ret = address_space_read(as, iova, MEMTXATTRS_UNSPECIFIED, buf, len);
-    if (ret == MEMTX_OK) {
-        return ret;
+    if (trace_iova) {
+        qemu_log("ubc dma read trace: iova=%#" PRIx64 " len=%zu as=%s ret=%d is_kva=%d try_ptw=%d has_alias=%d alias=%#" PRIx64 "\n",
+                 (uint64_t)iova, len,
+                 (as == &address_space_memory) ? "memory" : "iommu", ret,
+                 is_kva, try_ptw, has_alias, (uint64_t)alias);
     }
 
-    /* Try CSQ learned bias — same IOMMU domain as CMDQ descriptors */
-    if (ubc_dev->csq_bias_valid) {
-        gpa = (dma_addr_t)((int64_t)iova + ubc_dev->csq_iova_to_gpa_bias);
-        ret = address_space_read(&address_space_memory, gpa,
-                                MEMTXATTRS_UNSPECIFIED, buf, len);
-        if (ret == MEMTX_OK) {
-            return ret;
+    if (ret != MEMTX_OK && try_ptw) {
+        ret = ubc_dma_read_via_cpu_ptw(iova, buf, len);
+        if (trace_iova) {
+            qemu_log("ubc dma read trace: cpu_ptw iova=%#" PRIx64 " ret=%d\n",
+                     (uint64_t)iova, ret);
         }
     }
 
-    /* Try linear IOVA fallback */
-    if (ubc_try_iova_linear_fallback(iova, &gpa)) {
-        ret = address_space_read(&address_space_memory, gpa,
-                                MEMTXATTRS_UNSPECIFIED, buf, len);
-        if (ret == MEMTX_OK) {
-            return ret;
+    if (ret != MEMTX_OK && as != &address_space_memory) {
+        /* IOMMU translation failed — fall back to direct physical access.
+         * This handles the early-boot case where the guest kernel's DMA layer
+         * allocates IOVAs from the IOMMU aperture but the UMMU has not yet
+         * been programmed with TECTE/page tables.  The controller device
+         * should be able to access guest memory directly in this case. */
+        ret = address_space_read(&address_space_memory, iova,
+                                 MEMTXATTRS_UNSPECIFIED, buf, len);
+        if (trace_iova) {
+            qemu_log("ubc dma read trace: fallback memory iova=%#" PRIx64 " ret=%d\n",
+                     (uint64_t)iova, ret);
         }
     }
-
-    /* Try low-bits fallback */
-    if (ubc_try_iova_lowbits_fallback(iova, &gpa)) {
-        ret = address_space_read(&address_space_memory, gpa,
-                                MEMTXATTRS_UNSPECIFIED, buf, len);
+    if (ret != MEMTX_OK && has_alias) {
+        ret = address_space_read(&address_space_memory, alias,
+                                 MEMTXATTRS_UNSPECIFIED, buf, len);
         if (ret == MEMTX_OK) {
-            return ret;
+            qemu_log("ubc dma read alias: iova=%#" PRIx64 " -> %#" PRIx64
+                     " len=%zu\n", (uint64_t)iova, (uint64_t)alias, len);
         }
     }
-
-    /* Last resort: treat iova as GPA */
-    return address_space_read(&address_space_memory, iova,
-                             MEMTXATTRS_UNSPECIFIED, buf, len);
+    return ret;
 }
 
 static MemTxResult ubc_dma_write(BusControllerDev *ubc_dev, dma_addr_t iova,
                                   const void *buf, size_t len)
 {
     AddressSpace *as = ubc_dma_as(ubc_dev);
+    dma_addr_t alias;
+    bool is_kva = ubc_is_kernel_linear_va(iova);
+    bool try_ptw = is_kva || (iova >= 0xFFFF000000000000ULL);
+    bool has_alias = ubc_dma_alias_addr(iova, &alias);
     MemTxResult ret;
-    dma_addr_t gpa;
-    static int log_count = 0;
 
-    /* Try ARM64 KVA-to-GPA first — KVA addresses are never valid IOVAs */
-    if (ubc_kva_to_gpa(iova, &gpa)) {
-        ret = address_space_write(&address_space_memory, gpa,
-                                 MEMTXATTRS_UNSPECIFIED, buf, len);
-        if (ret == MEMTX_OK) {
-            return ret;
-        }
-    }
-
-    /* Try IOMMU address space */
     ret = address_space_write(as, iova, MEMTXATTRS_UNSPECIFIED, buf, len);
-    if (ret == MEMTX_OK) {
-        return ret;
-    }
 
-    /* Try CSQ learned bias — same IOMMU domain as CMDQ descriptors */
-    if (ubc_dev->csq_bias_valid) {
-        gpa = (dma_addr_t)((int64_t)iova + ubc_dev->csq_iova_to_gpa_bias);
-        ret = address_space_write(&address_space_memory, gpa,
-                                 MEMTXATTRS_UNSPECIFIED, buf, len);
+    if (ret != MEMTX_OK && try_ptw) {
+        ret = ubc_dma_write_via_cpu_ptw(iova, buf, len);
+    }
+    if (ret != MEMTX_OK && as != &address_space_memory) {
+        ret = address_space_write(&address_space_memory, iova,
+                                  MEMTXATTRS_UNSPECIFIED, buf, len);
+    }
+    if (ret != MEMTX_OK && has_alias) {
+        ret = address_space_write(&address_space_memory, alias,
+                                  MEMTXATTRS_UNSPECIFIED, buf, len);
         if (ret == MEMTX_OK) {
-            return ret;
+            qemu_log("ubc dma write alias: iova=%#" PRIx64 " -> %#" PRIx64
+                     " len=%zu\n", (uint64_t)iova, (uint64_t)alias, len);
         }
     }
-
-    /* Try linear IOVA fallback */
-    if (ubc_try_iova_linear_fallback(iova, &gpa)) {
-        ret = address_space_write(&address_space_memory, gpa,
-                                 MEMTXATTRS_UNSPECIFIED, buf, len);
-        if (ret == MEMTX_OK) {
-            return ret;
-        }
-    }
-
-    /* Try low-bits fallback */
-    if (ubc_try_iova_lowbits_fallback(iova, &gpa)) {
-        ret = address_space_write(&address_space_memory, gpa,
-                                 MEMTXATTRS_UNSPECIFIED, buf, len);
-        if (ret == MEMTX_OK) {
-            return ret;
-        }
-        if (log_count < 20) {
-            fprintf(stderr, "ubc_dma_write: ALL FALLBACKS FAILED iova=%#lx lowbits_gpa=%#lx len=%zu\n",
-                    (uint64_t)iova, (uint64_t)gpa, len);
-            log_count++;
-        }
-    }
-
-    /* Last resort: treat iova as GPA */
-    return address_space_write(&address_space_memory, iova,
-                              MEMTXATTRS_UNSPECIFIED, buf, len);
-}
-
-static inline bool ubc_is_query_fw_desc(const UBCCmdqDesc *desc)
-{
-    size_t i;
-    const uint8_t must = UBASE_CMD_FLAG_IN | UBASE_CMD_FLAG_WR |
-                         UBASE_CMD_FLAG_NO_INTR;
-    const uint8_t forbid = UBASE_CMD_FLAG_OUT | UBASE_CMD_FLAG_NEXT |
-                           UBASE_CMD_FLAG_GET_BD_NUM;
-
-    if (le16_to_cpu(desc->opcode) != UBASE_OPC_QUERY_FW_VER ||
-        desc->bd_num != 1 ||
-        (desc->flag & must) != must ||
-        (desc->flag & forbid) != 0 ||
-        desc->ret != 0 || desc->rsv != 0) {
-        return false;
-    }
-
-    for (i = 0; i < ARRAY_SIZE(desc->data); i++) {
-        if (desc->data[i] != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static inline bool ubc_head_desc_suspicious(const UBCCmdqDesc *desc)
-{
-    return le16_to_cpu(desc->opcode) == 0 ||
-           !(desc->flag & UBASE_CMD_FLAG_IN) ||
-           (desc->flag & UBASE_CMD_FLAG_OUT) ||
-           desc->bd_num == 0;
-}
-
-static bool ubc_get_ram_range(dma_addr_t *base, dma_addr_t *size)
-{
-    /* 
-     * In a typical virt machine, RAM starts at 0x40000000.
-     * We try to find the actual RAM range from the system memory.
-     */
-    MemoryRegion *sysmem = get_system_memory();
-    MemoryRegion *mr;
-
-    /* Common case for 'virt' machine */
-    mr = memory_region_find(sysmem, 0x40000000, 1).mr;
-    if (mr && memory_region_is_ram(mr)) {
-        *base = 0x40000000;
-        *size = memory_region_size(mr);
-        memory_region_unref(mr);
-        return true;
-    }
-
-    /* Fallback or other machines: scan first 32GB for any RAM */
-    for (uint64_t addr = 0; addr < 32 * GiB; addr += 128 * MiB) {
-        mr = memory_region_find(sysmem, addr, 1).mr;
-        if (mr && memory_region_is_ram(mr)) {
-            *base = addr;
-            *size = memory_region_size(mr);
-            memory_region_unref(mr);
-            return true;
-        }
-        if (mr) {
-            memory_region_unref(mr);
-        }
-    }
-
-    return false;
-}
-
-static bool ubc_learn_csq_bias(BusControllerDev *ubc_dev)
-{
-    UBCmdQueueState *csq = &ubc_dev->cmd_csq;
-    dma_addr_t ram_base, ram_size, ram_end;
-    uint8_t buf[0x10000];
-    dma_addr_t cur;
-
-    if (!csq->base || !csq->depth) {
-        return false;
-    }
-
-    /* 
-     * Optimization: try direct translation first (works if IOVA == KVA and
-     * we can peek into guest page tables).
-     */
-    {
-        CPUState *cpu = first_cpu;
-        hwaddr gpa_try = cpu_get_phys_page_debug(cpu, csq->base);
-        if (gpa_try != -1) {
-            ubc_dev->csq_iova_to_gpa_bias = (int64_t)gpa_try - (int64_t)csq->base;
-            ubc_dev->csq_bias_iova_base = csq->base;
-            ubc_dev->csq_bias_valid = true;
-            qemu_log("ubc cmdq learned csq bias via cpu_get_phys_page_debug: %" PRId64 "\n",
-                     (int64_t)ubc_dev->csq_iova_to_gpa_bias);
-            return true;
-        }
-    }
-
-    if (!ubc_get_ram_range(&ram_base, &ram_size)) {
-        qemu_log("ubc cmdq failed to detect guest RAM range\n");
-        return false;
-    }
-    ram_end = ram_base + ram_size;
-
-    for (cur = ram_base; cur < ram_end; cur += sizeof(buf)) {
-        size_t chunk = MIN((dma_addr_t)sizeof(buf), ram_end - cur);
-        size_t off;
-
-        if (dma_memory_read(&address_space_memory, cur, buf, chunk,
-                            MEMTXATTRS_MEMORY) != MEMTX_OK) {
-            continue;
-        }
-
-        for (off = 0; off + sizeof(UBCCmdqDesc) <= chunk; off += sizeof(UBCCmdqDesc)) {
-            UBCCmdqDesc *cand = (UBCCmdqDesc *)(buf + off);
-            UBCCmdqDesc *next = NULL;
-            dma_addr_t gpa = cur + off;
-
-            if ((gpa & (sizeof(UBCCmdqDesc) - 1)) != 0 ||
-                !ubc_is_query_fw_desc(cand)) {
-                continue;
-            }
-            if (off + 2 * sizeof(UBCCmdqDesc) <= chunk) {
-                next = (UBCCmdqDesc *)(buf + off + sizeof(*cand));
-            }
-            if (next && (next->opcode != 0 || next->flag != 0 ||
-                         next->bd_num != 0 || next->ret != 0 ||
-                         next->rsv != 0)) {
-                continue;
-            }
-
-            ubc_dev->csq_iova_to_gpa_bias = (int64_t)gpa - (int64_t)csq->base;
-            ubc_dev->csq_bias_iova_base = csq->base;
-            ubc_dev->csq_bias_valid = true;
-            qemu_log("ubc cmdq learned csq bias iova_base=%#" PRIx64
-                     " gpa_base=%#" PRIx64 " bias=%" PRId64 "\n",
-                     (uint64_t)csq->base, (uint64_t)gpa,
-                     (int64_t)ubc_dev->csq_iova_to_gpa_bias);
-            return true;
-        }
-    }
-
-    qemu_log("ubc cmdq failed to learn csq bias for iova_base=%#" PRIx64 "\n",
-             (uint64_t)csq->base);
-    return false;
-}
-
-/*
- * Check if a GPA range is entirely zero-filled.
- */
-static bool ubc_is_zero_range(dma_addr_t gpa, size_t len)
-{
-    uint8_t buf[4096];
-
-    while (len > 0) {
-        size_t chunk = MIN(len, sizeof(buf));
-
-        if (dma_memory_read(&address_space_memory, gpa, buf, chunk,
-                            MEMTXATTRS_MEMORY) != MEMTX_OK) {
-            return false;
-        }
-        for (size_t i = 0; i < chunk; i++) {
-            if (buf[i] != 0) {
-                return false;
-            }
-        }
-        gpa += chunk;
-        len -= chunk;
-    }
-    return true;
-}
-
-/*
- * Learn the CRQ IOVA-to-GPA bias by scanning guest RAM near the CSQ buffer.
- *
- * The CSQ and CRQ are allocated sequentially by dma_alloc_coherent() in the
- * guest, so the CRQ GPA is typically close to the CSQ GPA.  Since the UMMU
- * IOMMU translation is not functional in pure-emulation mode, we find the
- * CRQ buffer by looking for a page-aligned, zero-filled block of the correct
- * size near the known CSQ location.
- */
-static bool ubc_learn_crq_bias(BusControllerDev *ubc_dev)
-{
-    UBCmdQueueState *crq = &ubc_dev->cmd_crq;
-    UBCmdQueueState *csq = &ubc_dev->cmd_csq;
-    dma_addr_t csq_gpa, csq_size, crq_size;
-    dma_addr_t scan_start, scan_end, gpa;
-    dma_addr_t ram_base, ram_size, ram_end;
-    const dma_addr_t scan_window = 4 * 1024 * 1024;
-
-    if (!ubc_dev->csq_bias_valid || !crq->base || !crq->depth || !csq->base) {
-        return false;
-    }
-
-    if (ubc_dev->crq_bias_valid &&
-        ubc_dev->crq_bias_iova_base == crq->base) {
-        return true; /* already learned for this IOVA */
-    }
-
-    csq_gpa = (dma_addr_t)((int64_t)csq->base + ubc_dev->csq_iova_to_gpa_bias);
-    csq_size = (dma_addr_t)csq->depth * sizeof(UBCCmdqDesc);
-    crq_size = (dma_addr_t)crq->depth * sizeof(UBCCmdqDesc);
-
-    /* Scan forward from csq_gpa + csq_size (CRQ likely right after CSQ) */
-    scan_start = csq_gpa + csq_size;
-    if (scan_start & 0xfffu) {
-        scan_start = (scan_start + 0x1000u) & ~(dma_addr_t)0xfffu;
-    }
-    scan_end = scan_start + scan_window;
-    if (!ubc_get_ram_range(&ram_base, &ram_size)) {
-        return false;
-    }
-    ram_end = ram_base + ram_size;
-
-    if (scan_end > ram_end) {
-        scan_end = ram_end;
-    }
-
-    for (gpa = scan_start; gpa + crq_size <= scan_end; gpa += 0x1000) {
-        if (ubc_is_zero_range(gpa, crq_size)) {
-            ubc_dev->crq_iova_to_gpa_bias = (int64_t)gpa - (int64_t)crq->base;
-            ubc_dev->crq_bias_iova_base = crq->base;
-            ubc_dev->crq_bias_valid = true;
-            qemu_log("ubc learned crq bias crq_iova=%#" PRIx64
-                     " crq_gpa=%#" PRIx64 " bias=%" PRId64 "\n",
-                     (uint64_t)crq->base, (uint64_t)gpa,
-                     ubc_dev->crq_iova_to_gpa_bias);
-            return true;
-        }
-    }
-
-    qemu_log("ubc failed to learn crq bias for iova=%#" PRIx64
-             " (scanned %#" PRIx64 "..%#" PRIx64 ")\n",
-             (uint64_t)crq->base, (uint64_t)scan_start,
-             (uint64_t)scan_end);
-    return false;
+    return ret;
 }
 
 static MemTxResult ubc_read_desc(const UBCmdQueueState *q,
@@ -1083,48 +899,13 @@ static MemTxResult ubc_read_desc(const UBCmdQueueState *q,
                                  uint16_t idx,
                                  UBCCmdqDesc *desc)
 {
-    AddressSpace *as;
-    dma_addr_t addr;
-    dma_addr_t fallback_addr;
-    MemTxResult ret;
-
-    as = ubc_dma_as(ubc_dev);
-    addr = q->base + (dma_addr_t)idx * sizeof(*desc);
-    ret = dma_memory_read(as, addr, desc, sizeof(*desc), MEMTXATTRS_MEMORY);
-    if (ret == MEMTX_OK) {
-        return ret;
-    }
-
-    ret = dma_memory_read(&address_space_memory, addr, desc, sizeof(*desc),
-                          MEMTXATTRS_MEMORY);
-    if (ret == MEMTX_OK) {
-        return ret;
-    }
-
-    if (ubc_try_learned_bias_fallback(ubc_dev, q, addr, &fallback_addr)) {
-        ret = dma_memory_read(&address_space_memory, fallback_addr, desc,
+    AddressSpace *as = ubc_dma_as(ubc_dev);
+    dma_addr_t addr = q->base + (dma_addr_t)idx * sizeof(*desc);
+    MemTxResult ret = dma_memory_read(as, addr, desc, sizeof(*desc),
+                                      MEMTXATTRS_MEMORY);
+    if (ret != MEMTX_OK && as != &address_space_memory) {
+        ret = dma_memory_read(&address_space_memory, addr, desc,
                               sizeof(*desc), MEMTXATTRS_MEMORY);
-        if (ret == MEMTX_OK) {
-            return ret;
-        }
-    }
-
-    if (!ubc_try_iova_linear_fallback(addr, &fallback_addr)) {
-        if (!ubc_try_iova_lowbits_fallback(addr, &fallback_addr)) {
-            qemu_log("ubc cmdq read no fallback iova=%#" PRIx64 " ret=%d\n",
-                     (uint64_t)addr, ret);
-            return ret;
-        }
-    }
-
-    ret = dma_memory_read(&address_space_memory, fallback_addr, desc,
-                          sizeof(*desc), MEMTXATTRS_MEMORY);
-    if (ret != MEMTX_OK) {
-        qemu_log("ubc cmdq read fallback failed iova=%#" PRIx64 " gpa=%#" PRIx64
-                 " ret=%d\n", (uint64_t)addr, (uint64_t)fallback_addr, ret);
-    } else {
-        qemu_log("ubc cmdq read fallback iova=%#" PRIx64 " gpa=%#" PRIx64 "\n",
-                 (uint64_t)addr, (uint64_t)fallback_addr);
     }
     return ret;
 }
@@ -1134,74 +915,13 @@ static MemTxResult ubc_write_desc(const UBCmdQueueState *q,
                                   uint16_t idx,
                                   const UBCCmdqDesc *desc)
 {
-    AddressSpace *as;
-    dma_addr_t addr;
-    dma_addr_t fallback_addr;
-    MemTxResult ret;
-
-    addr = q->base + (dma_addr_t)idx * sizeof(*desc);
-    as = ubc_dma_as(ubc_dev);
-
-    /* Try ARM64 KVA-to-GPA first — handles kernel DMA addresses (bit 63 set)
-     * that the IOMMU passthrough silently discards.  This is the primary
-     * translation for both CSQ and CRQ descriptor writes. */
-    if (ubc_kva_to_gpa(addr, &fallback_addr)) {
-        ret = address_space_write(&address_space_memory, fallback_addr,
-                                 MEMTXATTRS_UNSPECIFIED, desc, sizeof(*desc));
-        if (ret == MEMTX_OK) {
-            return ret;
-        }
-    }
-
-    /*
-     * CRQ (completion response queue) base addresses are IOVAs from the
-     * guest DMA allocator.  The IOMMU passthrough "succeeds" (MEMTX_OK)
-     * even when the GPA is beyond RAM, silently discarding the write.
-     * For CRQ descriptors, skip the IOMMU path and go straight to the
-     * fallback chain so the data actually lands in guest RAM.
-     */
-    if (q != &ubc_dev->cmd_crq && q != &ubc_dev->ctrl_crq) {
-        ret = dma_memory_write(as, addr, desc, sizeof(*desc), MEMTXATTRS_MEMORY);
-        if (ret == MEMTX_OK) {
-            return ret;
-        }
-        ret = dma_memory_write(&address_space_memory, addr, desc, sizeof(*desc),
-                               MEMTXATTRS_MEMORY);
-        if (ret == MEMTX_OK) {
-            return ret;
-        }
-    }
-
-    if (ubc_try_learned_bias_fallback(ubc_dev, q, addr, &fallback_addr)) {
-        ret = dma_memory_write(&address_space_memory, fallback_addr, desc,
+    AddressSpace *as = ubc_dma_as(ubc_dev);
+    dma_addr_t addr = q->base + (dma_addr_t)idx * sizeof(*desc);
+    MemTxResult ret = dma_memory_write(as, addr, desc, sizeof(*desc),
+                                       MEMTXATTRS_MEMORY);
+    if (ret != MEMTX_OK && as != &address_space_memory) {
+        ret = dma_memory_write(&address_space_memory, addr, desc,
                                sizeof(*desc), MEMTXATTRS_MEMORY);
-        if (ret == MEMTX_OK) {
-            if (q == &ubc_dev->cmd_crq || q == &ubc_dev->ctrl_crq) {
-                qemu_log("ubc cmdq crq write fallback bias iova=%#" PRIx64
-                         " gpa=%#" PRIx64 "\n",
-                         (uint64_t)addr, (uint64_t)fallback_addr);
-            }
-            return ret;
-        }
-    }
-
-    if (!ubc_try_iova_linear_fallback(addr, &fallback_addr)) {
-        if (!ubc_try_iova_lowbits_fallback(addr, &fallback_addr)) {
-            qemu_log("ubc cmdq write no fallback iova=%#" PRIx64 " ret=%d\n",
-                     (uint64_t)addr, ret);
-            return ret;
-        }
-    }
-
-    ret = dma_memory_write(&address_space_memory, fallback_addr, desc,
-                           sizeof(*desc), MEMTXATTRS_MEMORY);
-    if (ret != MEMTX_OK) {
-        qemu_log("ubc cmdq write fallback failed iova=%#" PRIx64 " gpa=%#" PRIx64
-                 " ret=%d\n", (uint64_t)addr, (uint64_t)fallback_addr, ret);
-    } else if (q == &ubc_dev->cmd_crq || q == &ubc_dev->ctrl_crq) {
-        qemu_log("ubc cmdq crq write fallback map iova=%#" PRIx64
-                 " gpa=%#" PRIx64 "\n",
-                 (uint64_t)addr, (uint64_t)fallback_addr);
     }
     return ret;
 }
@@ -1307,7 +1027,7 @@ static int ubc_cmdq_push_crq_msg(BusControllerDev *ubc_dev, uint16_t opcode,
         uint16_t first = (crq->tail - bd_num + crq->depth) % crq->depth;
         crq->tail = idx;
         ubc_ers2_write32(ubc_dev, UBASE_CRQ_TAIL_REG, crq->tail);
-        ubc_raise_cmdq_event(ubc_dev);
+        ubc_raise_ctrlq_event(ubc_dev);
         /* verify first desc was written to guest RAM */
         if (ubc_read_desc(crq, ubc_dev, first, &verify) == MEMTX_OK) {
             qemu_log("ubc push_crq verify[%u] opcode=0x%x flag=0x%x bd=%u"
@@ -1485,11 +1205,99 @@ static void ubc_parse_jetty_ctx(const uint32_t *dw, UBCJettyState *js)
     js->jfrn = ((dw[4] >> 20) & 0xFFF) | ((dw[5] & 0xFF) << 12);
     js->rx_jfcn = (dw[5] >> 12) & 0xFFFFF;
     js->seid_idx = dw[6] & 0x3FF;
+    /* DW7-DW8: user_data (jfs kernel address, copied to CQE) */
+    js->user_data_l = dw[7];
+    js->user_data_h = dw[8];
+}
+
+static void ubc_parse_eq_ctx(const uint32_t *dw, UBCEqState *eq)
+{
+    uint32_t shift = dw[1] & 0x1F;
+    uint32_t eqe_base_l = (dw[2] >> 12) & 0xFFFFF;
+    uint32_t eqe_base_h = dw[3];
+
+    eq->eq_buf_addr = ((uint64_t)eqe_base_h << 32) |
+                      ((uint64_t)eqe_base_l << 12);
+    if (shift <= 20) {
+        eq->eq_depth = 1u << (shift + 6);
+    } else {
+        eq->eq_depth = 0;
+    }
+    eq->irq_num = dw[6] & 0xFFFF;
+}
+
+static bool ubc_push_ceq_event(BusControllerDev *ubc_dev, uint32_t ceqn,
+                               uint32_t jfcn)
+{
+    UBCEqState *ceq;
+    uint8_t ceqe[UBASE_EQE_SIZE];
+    uint32_t owner;
+    uint32_t comp;
+    dma_addr_t ceqe_addr;
+    MemTxResult ret;
+
+    if (ceqn >= UBC_MAX_CEQS) {
+        qemu_log("ubc CEQE: ceqn=%u out of range\n", ceqn);
+        return false;
+    }
+
+    ceq = &ubc_dev->ceqs[ceqn];
+    if (!ceq->active || ceq->eq_depth == 0) {
+        qemu_log("ubc CEQE: ceq %u inactive or depth=0 (active=%d depth=%u)\n",
+                 ceqn, ceq->active, ceq->eq_depth);
+        return false;
+    }
+
+    owner = ceq->eq_owner_phase & 0x1;
+    comp = (jfcn & 0xFFFFF) | (owner << 31);
+    memset(ceqe, 0, sizeof(ceqe));
+    memcpy(ceqe, &comp, sizeof(comp));
+
+    ceqe_addr = ceq->eq_buf_addr + (dma_addr_t)ceq->eq_pi * UBASE_EQE_SIZE;
+    ret = ubc_dma_write(ubc_dev, ceqe_addr, ceqe, sizeof(ceqe));
+    if (ret != MEMTX_OK) {
+        qemu_log("ubc CEQE: DMA write failed ceqn=%u addr=%#" PRIx64 "\n",
+                 ceqn, (uint64_t)ceqe_addr);
+        return false;
+    }
+
+    ceq->eq_pi = (ceq->eq_pi + 1) % ceq->eq_depth;
+    if (ceq->eq_pi == 0) {
+        ceq->eq_owner_phase ^= 1;
+    }
+
+    qemu_log("ubc CEQE: ceqn=%u jfcn=%u owner=%u eq_pi=%u irq_num=%u\n",
+             ceqn, jfcn, owner, ceq->eq_pi, ceq->irq_num);
+
+    /*
+     * CEQ notify vector mapping:
+     * - USI path uses eq_ctx.irq_num from mailbox context.
+     * - INT_TYPE1 path uses MSI vector index order: misc(0), aeq(1), ceq(2+ceqn).
+     */
+    if (ubc_notify_vector(ubc_dev, (uint16_t)ceq->irq_num,
+                          (uint16_t)(2 + ceqn), "ceq")) {
+        return true;
+    }
+
+    qemu_log("ubc CEQE: failed to notify vector=%u\n", ceq->irq_num);
+    return false;
 }
 
 /* Forward declarations for URMA RX buffering helpers (defined later) */
 static void ubc_flush_urma_rx_buffer(BusControllerDev *ubc_dev, uint32_t jetty_id);
 
+/*
+ * Mailbox command handler.
+ *
+ * Protocol boundary:
+ *   - Mailbox path: CMDQ opcode POST_MB(0x7000) → ubc_handle_post_mb()
+ *     Handles JFS/JFC/JFR context lifecycle (CREATE/MODIFY/QUERY/DESTROY).
+ *   - CtrlQ path: CMDQ opcode UE2UE_UBASE(0xF00E) → ubc_handle_ue2ue_ctrlq()
+ *     Handles service-type operations (TP_ACL, DEV_REGISTER, QOS).
+ *     Also available via native CtrlQ registers (separate CSQ/CRQ pair).
+ *   - Query path: CMDQ opcodes like QUERY_FW_VER, QUERY_UE_RES, etc.
+ *     Directly handled by ubc_cmd_fill_resp().
+ */
 static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
                                const uint8_t *req, size_t req_len,
                                uint8_t *resp, size_t resp_cap)
@@ -1518,14 +1326,11 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
 
     qemu_log("ubc POST_MB raw cmd_tag=0x%08x sub_op=0x%02x tag=%u dma_addr=%#" PRIx64 "\n",
              cmd_tag, sub_op, tag, (uint64_t)dma_addr);
-    fprintf(stderr, "ubc POST_MB raw cmd_tag=0x%08x sub_op=0x%02x tag=%u\n",
-            cmd_tag, sub_op, tag);
 
     switch (sub_op) {
+    /* ---- JFS (Send Queue) lifecycle ---- */
     case UBC_MB_CREATE_JFS_CONTEXT: {
         UBCJettyState *js;
-
-        fprintf(stderr, "ubc POST_MB CREATE_JFS: tag=%u\n", tag);
 
         if (tag >= UBC_MAX_JETTIES) {
             qemu_log("ubc POST_MB CREATE_JFS: tag %u out of range\n", tag);
@@ -1541,22 +1346,85 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
             mb.status = cpu_to_le32(1);
             break;
         }
+        {
+            const uint32_t *dw = (const uint32_t *)ctx_buf;
+            qemu_log("ubc CREATE_JFS raw short: tag=%u dma=%#" PRIx64
+                     " dw0=%08x dw1=%08x dw2=%08x dw9=%08x\n",
+                     tag, (uint64_t)dma_addr, dw[0], dw[1], dw[2], dw[9]);
+        }
 
         js = &ubc_dev->jetties[tag];
         memset(js, 0, sizeof(*js));
         js->active = true;
         js->jetty_id = tag;
+        js->jetty_state = JETTY_STATE_READY;
         ubc_parse_jetty_ctx((const uint32_t *)ctx_buf, js);
 
         qemu_log("ubc POST_MB CREATE_JFS: jetty_id=%u sq_buf=%#" PRIx64
-                 " sq_depth=%u tx_jfcn=%u jfs_mode=%d seid_idx=%u\n",
+                 " sq_depth=%u tx_jfcn=%u jfs_mode=%d seid_idx=%u state=READY\n",
                  js->jetty_id, js->sq_buf_addr, js->sq_depth,
                  js->tx_jfcn, js->jfs_mode, js->seid_idx);
 
         /* Flush any buffered URMA RX packets for this jetty now active */
         ubc_flush_urma_rx_buffer(ubc_dev, tag);
 
-        mb.status = cpu_to_le32(0); /* success */
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_MODIFY_JFS_CONTEXT: {
+        UBCJettyState *js;
+
+        if (tag >= UBC_MAX_JETTIES || !ubc_dev->jetties[tag].active) {
+            qemu_log("ubc POST_MB MODIFY_JFS: tag=%u invalid or inactive\n", tag);
+            mb.status = cpu_to_le32(0);
+            break;
+        }
+
+        /* DMA-read updated context and re-parse mutable fields */
+        dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, sizeof(ctx_buf));
+        js = &ubc_dev->jetties[tag];
+
+        if (dma_ret == MEMTX_OK) {
+            /* Re-parse to pick up any changed fields (depth, SGE, etc.) */
+            ubc_parse_jetty_ctx((const uint32_t *)ctx_buf, js);
+            js->jetty_state = JETTY_STATE_READY;
+        }
+
+        qemu_log("ubc POST_MB MODIFY_JFS: jetty_id=%u state=READY\n", tag);
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_QUERY_JFS_CONTEXT: {
+        /*
+         * Driver queries jetty state to check PI/CI and state.
+         * udma_jetty_ctx layout (little-endian bitfields in DW0):
+         *   ta_timeout[1:0] | rnr_retry_num[4:2] | type[7:5] | sqe_bb_shift[11:8]
+         *   | sl[15:12] | state[18:16] | jfs_mode[19] | sqe_token_id_l[31:20]
+         * enum jetty_state: RESET=0, READY=1, ERROR=2, SUSPEND=3
+         * DW18[31:16] = CI, DW20[15:0] = PI
+         */
+        if (tag < UBC_MAX_JETTIES && ubc_dev->jetties[tag].active) {
+            UBCJettyState *js = &ubc_dev->jetties[tag];
+            uint32_t *dw = (uint32_t *)ctx_buf;
+
+            /* DMA-read the existing context */
+            dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, sizeof(ctx_buf));
+            if (dma_ret == MEMTX_OK) {
+                /* Update state in DW0 bits [18:16] */
+                dw[0] = (dw[0] & ~(0x7u << 16)) |
+                         ((uint32_t)js->jetty_state << 16);
+                /* Update CI = sq_ci in DW18 bits [31:16] */
+                dw[18] = (dw[18] & 0xFFFFu) | ((uint32_t)js->sq_ci << 16);
+                /* Update PI = sq_pi in DW20 bits [15:0] */
+                dw[20] = (dw[20] & ~0xFFFFu) | (js->sq_pi & 0xFFFFu);
+
+                /* DMA-write back the modified context */
+                ubc_dma_write(ubc_dev, dma_addr, ctx_buf, sizeof(ctx_buf));
+            }
+            qemu_log("ubc POST_MB QUERY_JFS: jetty=%u state=%u pi=%u ci=%u\n",
+                     tag, js->jetty_state, js->sq_pi, js->sq_ci);
+        }
+        mb.status = cpu_to_le32(0);
         break;
     }
     case UBC_MB_DESTROY_JFS_CONTEXT: {
@@ -1573,124 +1441,345 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
         mb.status = cpu_to_le32(0);
         break;
     }
-    case UBC_MB_MODIFY_JFS_CONTEXT: {
-        qemu_log("ubc POST_MB MODIFY_JFS: tag=%u (accepted)\n", tag);
-        mb.status = cpu_to_le32(0);
-        break;
-    }
-    case UBC_MB_QUERY_JFS_CONTEXT: {
-        /* Driver queries jetty state to check PI/CI and state.
-         * udma_jetty_ctx layout (little-endian bitfields in DW0):
-         *   ta_timeout[1:0] | rnr_retry_num[4:2] | type[7:5] | sqe_bb_shift[11:8]
-         *   | sl[15:12] | state[18:16] | jfs_mode[19] | sqe_token_id_l[31:20]
-         * enum jetty_state: RESET=0, READY=1, ERROR=2, SUSPEND=3
-         * DW18[31:16] = CI, DW20[15:0] = PI
-         */
-        fprintf(stderr, "ubc QUERY_JFS: tag=%u dma_addr=%#lx active=%d\n",
-                tag, (unsigned long)dma_addr,
-                tag < UBC_MAX_JETTIES ? (int)ubc_dev->jetties[tag].active : -1);
-        if (tag < UBC_MAX_JETTIES && ubc_dev->jetties[tag].active) {
-            UBCJettyState *js = &ubc_dev->jetties[tag];
-            uint8_t ctx_buf[UDMA_JETTY_CTX_SIZE];
-            uint32_t *dw = (uint32_t *)ctx_buf;
-            MemTxResult dma_ret;
 
-            /* First DMA-read the existing context */
-            dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, sizeof(ctx_buf));
-            fprintf(stderr, "ubc QUERY_JFS: DMA-read ret=%d dw0=%#x dw18=%#x dw20=%#x sq_ci=%u sq_pi=%u\n",
-                    dma_ret, dw[0], dw[18], dw[20], js->sq_ci, js->sq_pi);
-            if (dma_ret == MEMTX_OK) {
-                /* Update state = JETTY_READY (1) in DW0 bits [18:16] */
-                dw[0] = (dw[0] & ~(0x7u << 16)) | (1u << 16);
-                /* Update CI = sq_ci in DW18 bits [31:16] */
-                dw[18] = (dw[18] & 0xFFFFu) | ((uint32_t)js->sq_ci << 16);
-                /* Update PI = sq_pi in DW20 bits [15:0] */
-                dw[20] = (dw[20] & ~0xFFFFu) | (js->sq_pi & 0xFFFFu);
-
-                /* DMA-write back the modified context */
-                dma_ret = ubc_dma_write(ubc_dev, dma_addr, ctx_buf, sizeof(ctx_buf));
-                fprintf(stderr, "ubc QUERY_JFS: DMA-write ret=%d dw0=%#x dw18=%#x dw20=%#x\n",
-                        dma_ret, dw[0], dw[18], dw[20]);
-
-                /* Verify: read back */
-                if (dma_ret == MEMTX_OK) {
-                    uint8_t verify_buf[UDMA_JETTY_CTX_SIZE];
-                    memset(verify_buf, 0xAA, sizeof(verify_buf));
-                    dma_ret = ubc_dma_read(ubc_dev, dma_addr, verify_buf, sizeof(verify_buf));
-                    if (dma_ret == MEMTX_OK) {
-                        uint32_t *vdw = (uint32_t *)verify_buf;
-                        fprintf(stderr, "ubc QUERY_JFS: verify read-back dw0=%#x dw18=%#x dw20=%#x\n",
-                                vdw[0], vdw[18], vdw[20]);
-                    }
-                }
-            }
-        }
-        mb.status = cpu_to_le32(0);
-        break;
-    }
+    /* ---- JFC (Completion Queue) lifecycle ---- */
     case UBC_MB_CREATE_JFC_CONTEXT: {
-        if (tag < UBC_MAX_JFCS) {
-            UBCJfcState *jfc = &ubc_dev->jfcs[tag];
-            memset(jfc, 0, sizeof(*jfc));
-            jfc->active = true;
-            jfc->jfc_id = tag;
+        if (tag >= UBC_MAX_JFCS) {
+            qemu_log("ubc POST_MB CREATE_JFC: tag %u out of range\n", tag);
+            mb.status = cpu_to_le32(1);
+            break;
+        }
+        if (ubc_dev->jfcs[tag].active) {
+            qemu_log("ubc POST_MB CREATE_JFC: tag %u already active\n", tag);
+            mb.status = cpu_to_le32(0);
+            break;
+        }
 
-            dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf,
-                                   UDMA_JFC_CTX_SIZE);
-            if (dma_ret == MEMTX_OK) {
-                /* Extract CQ buffer address from JFC context:
-                 * DW1[31:12] = cqe_base_addr_l, DW2 = cqe_base_addr_h */
-                const uint32_t *dw = (const uint32_t *)ctx_buf;
-                uint32_t cqe_base_l = (dw[1] >> 12) & 0xFFFFF;
-                uint32_t cqe_base_h = dw[2];
-                uint32_t cqe_bb_shift = (dw[0] >> 8) & 0xF;
-                jfc->cq_buf_addr = ((uint64_t)cqe_base_h << 32) |
-                                   ((uint64_t)cqe_base_l << 12);
-                jfc->cq_depth = 1u << cqe_bb_shift;
+        UBCJfcState *jfc = &ubc_dev->jfcs[tag];
+        memset(jfc, 0, sizeof(*jfc));
+        jfc->active = true;
+        jfc->jfc_id = tag;
+        jfc->ceqn = 0;
+        /*
+         * CQE owner semantics in guest driver:
+         *   valid_owner = (ci >> log2(depth)) & 1
+         *   new CQE when cqe->owner != valid_owner
+         * With initial ci=0, the first generated CQE must carry owner=1.
+         */
+        jfc->cq_owner_phase = 1;
+
+        dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UDMA_JFC_CTX_SIZE);
+        if (dma_ret == MEMTX_OK) {
+            /*
+             * Extract CQ buffer address/depth from JFC context.
+             * Guest layout (struct udma_jfc_ctx):
+             *   DW0[31:12] cqe_va_l
+             *   DW1        cqe_va_h
+             *   DW0[7:4]   shift, where depth = 1 << (shift + 6)
+             *   DW2[31:24] ceqn
+             */
+            const uint32_t *dw = (const uint32_t *)ctx_buf;
+            uint32_t cqe_base_l = (dw[0] >> 12) & 0xFFFFF;
+            uint32_t cqe_base_h = dw[1];
+            uint32_t cqe_shift = (dw[0] >> 4) & 0xF;
+            uint32_t ceqn = (dw[2] >> 24) & 0xFF;
+            jfc->cq_buf_addr = ((uint64_t)cqe_base_h << 32) |
+                               ((uint64_t)cqe_base_l << 12);
+            jfc->cq_depth = 1u << (cqe_shift + 6);
+            if (ceqn < UBC_MAX_CEQS) {
+                jfc->ceqn = ceqn;
             }
+        }
 
-            qemu_log("ubc POST_MB CREATE_JFC: jfc_id=%u cq_buf=%#" PRIx64
-                     " cq_depth=%u\n", jfc->jfc_id, jfc->cq_buf_addr,
-                     jfc->cq_depth);
+        qemu_log("ubc POST_MB CREATE_JFC: jfc_id=%u cq_buf=%#" PRIx64
+                 " cq_depth=%u ceqn=%u owner_phase=%u\n",
+                 jfc->jfc_id, jfc->cq_buf_addr, jfc->cq_depth, jfc->ceqn,
+                 jfc->cq_owner_phase);
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_MODIFY_JFC_CONTEXT: {
+        if (tag >= UBC_MAX_JFCS || !ubc_dev->jfcs[tag].active) {
+            qemu_log("ubc POST_MB MODIFY_JFC: tag=%u invalid or inactive\n", tag);
+            mb.status = cpu_to_le32(0);
+            break;
+        }
+
+        UBCJfcState *jfc = &ubc_dev->jfcs[tag];
+        dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UDMA_JFC_CTX_SIZE);
+        if (dma_ret == MEMTX_OK) {
+            const uint32_t *dw = (const uint32_t *)ctx_buf;
+            uint32_t cqe_base_l = (dw[0] >> 12) & 0xFFFFF;
+            uint32_t cqe_base_h = dw[1];
+            uint32_t cqe_shift = (dw[0] >> 4) & 0xF;
+            uint32_t ceqn = (dw[2] >> 24) & 0xFF;
+            jfc->cq_buf_addr = ((uint64_t)cqe_base_h << 32) |
+                               ((uint64_t)cqe_base_l << 12);
+            jfc->cq_depth = 1u << (cqe_shift + 6);
+            if (ceqn < UBC_MAX_CEQS) {
+                jfc->ceqn = ceqn;
+            }
+        }
+
+        qemu_log("ubc POST_MB MODIFY_JFC: jfc_id=%u cq_buf=%#" PRIx64
+                 " cq_depth=%u ceqn=%u\n", jfc->jfc_id, jfc->cq_buf_addr,
+                 jfc->cq_depth, jfc->ceqn);
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_QUERY_JFC_CONTEXT: {
+        if (tag < UBC_MAX_JFCS && ubc_dev->jfcs[tag].active) {
+            UBCJfcState *jfc = &ubc_dev->jfcs[tag];
+            uint32_t *dw = (uint32_t *)ctx_buf;
+
+            dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UDMA_JFC_CTX_SIZE);
+            if (dma_ret == MEMTX_OK) {
+                /* Update state in DW0 bits [18:16] = READY */
+                dw[0] = (dw[0] & ~(0x7u << 16)) | (1u << 16);
+                /* Update CQ PI in DW18 bits [31:16] */
+                dw[18] = (dw[18] & 0xFFFFu) | ((uint32_t)jfc->cq_pi << 16);
+                /* Update CQ CI in DW20 bits [15:0] */
+                dw[20] = (dw[20] & ~0xFFFFu) | (jfc->cq_ci & 0xFFFFu);
+                ubc_dma_write(ubc_dev, dma_addr, ctx_buf, UDMA_JFC_CTX_SIZE);
+            }
+            qemu_log("ubc POST_MB QUERY_JFC: jfc_id=%u cq_pi=%u cq_ci=%u\n",
+                     tag, jfc->cq_pi, jfc->cq_ci);
         }
         mb.status = cpu_to_le32(0);
         break;
     }
+    case UBC_MB_DESTROY_JFC_CONTEXT: {
+        if (tag < UBC_MAX_JFCS) {
+            qemu_log("ubc POST_MB DESTROY_JFC: jfc_id=%u was_active=%d\n",
+                     tag, ubc_dev->jfcs[tag].active);
+            memset(&ubc_dev->jfcs[tag], 0, sizeof(UBCJfcState));
+        }
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+
+    /* ---- AEQ lifecycle ---- */
+    case UBC_MB_CREATE_AEQ_CONTEXT: {
+        UBCEqState *aeq;
+
+        if (tag >= UBC_MAX_AEQS) {
+            qemu_log("ubc POST_MB CREATE_AEQ: tag %u out of range\n", tag);
+            mb.status = cpu_to_le32(1);
+            break;
+        }
+
+        aeq = &ubc_dev->aeqs[tag];
+        memset(aeq, 0, sizeof(*aeq));
+        aeq->active = true;
+        aeq->eq_id = tag;
+        aeq->eq_owner_phase = 1;
+
+        dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UBASE_EQ_CTX_SIZE);
+        if (dma_ret == MEMTX_OK) {
+            ubc_parse_eq_ctx((const uint32_t *)ctx_buf, aeq);
+        }
+
+        qemu_log("ubc POST_MB CREATE_AEQ: eqn=%u buf=%#" PRIx64
+                 " depth=%u irq=%u owner_phase=%u\n",
+                 aeq->eq_id, aeq->eq_buf_addr, aeq->eq_depth,
+                 aeq->irq_num, aeq->eq_owner_phase);
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_QUERY_AEQ_CONTEXT: {
+        if (tag < UBC_MAX_AEQS && ubc_dev->aeqs[tag].active) {
+            UBCEqState *aeq = &ubc_dev->aeqs[tag];
+            uint32_t *dw = (uint32_t *)ctx_buf;
+
+            dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UBASE_EQ_CTX_SIZE);
+            if (dma_ret == MEMTX_OK) {
+                dw[0] = (dw[0] & 0xFFu) | ((aeq->eq_pi & 0xFFFFFFu) << 8);
+                dw[0] = (dw[0] & ~0x3u) | 0x1u;
+                dw[1] = (dw[1] & 0xFFu) | ((aeq->eq_ci & 0xFFFFFFu) << 8);
+                dw[11] = (dw[11] & ~0x3u) | 0x1u;
+                ubc_dma_write(ubc_dev, dma_addr, ctx_buf, UBASE_EQ_CTX_SIZE);
+            }
+            qemu_log("ubc POST_MB QUERY_AEQ: eqn=%u pi=%u ci=%u\n",
+                     tag, aeq->eq_pi, aeq->eq_ci);
+        }
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_DESTROY_AEQ_CONTEXT: {
+        if (tag < UBC_MAX_AEQS) {
+            qemu_log("ubc POST_MB DESTROY_AEQ: eqn=%u was_active=%d\n",
+                     tag, ubc_dev->aeqs[tag].active);
+            memset(&ubc_dev->aeqs[tag], 0, sizeof(UBCEqState));
+        }
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+
+    /* ---- CEQ lifecycle ---- */
+    case UBC_MB_CREATE_CEQ_CONTEXT: {
+        UBCEqState *ceq;
+
+        if (tag >= UBC_MAX_CEQS) {
+            qemu_log("ubc POST_MB CREATE_CEQ: tag %u out of range\n", tag);
+            mb.status = cpu_to_le32(1);
+            break;
+        }
+
+        ceq = &ubc_dev->ceqs[tag];
+        memset(ceq, 0, sizeof(*ceq));
+        ceq->active = true;
+        ceq->eq_id = tag;
+        ceq->eq_owner_phase = 1;
+
+        dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UBASE_EQ_CTX_SIZE);
+        if (dma_ret == MEMTX_OK) {
+            ubc_parse_eq_ctx((const uint32_t *)ctx_buf, ceq);
+        }
+
+        qemu_log("ubc POST_MB CREATE_CEQ: eqn=%u buf=%#" PRIx64
+                 " depth=%u irq=%u owner_phase=%u\n",
+                 ceq->eq_id, ceq->eq_buf_addr, ceq->eq_depth,
+                 ceq->irq_num, ceq->eq_owner_phase);
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_QUERY_CEQ_CONTEXT: {
+        if (tag < UBC_MAX_CEQS && ubc_dev->ceqs[tag].active) {
+            UBCEqState *ceq = &ubc_dev->ceqs[tag];
+            uint32_t *dw = (uint32_t *)ctx_buf;
+
+            dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UBASE_EQ_CTX_SIZE);
+            if (dma_ret == MEMTX_OK) {
+                dw[0] = (dw[0] & 0xFFu) | ((ceq->eq_pi & 0xFFFFFFu) << 8);
+                dw[0] = (dw[0] & ~0x3u) | 0x1u;
+                dw[1] = (dw[1] & 0xFFu) | ((ceq->eq_ci & 0xFFFFFFu) << 8);
+                dw[11] = (dw[11] & ~0x3u) | 0x1u;
+                ubc_dma_write(ubc_dev, dma_addr, ctx_buf, UBASE_EQ_CTX_SIZE);
+            }
+            qemu_log("ubc POST_MB QUERY_CEQ: eqn=%u pi=%u ci=%u\n",
+                     tag, ceq->eq_pi, ceq->eq_ci);
+        }
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_DESTROY_CEQ_CONTEXT: {
+        if (tag < UBC_MAX_CEQS) {
+            qemu_log("ubc POST_MB DESTROY_CEQ: eqn=%u was_active=%d\n",
+                     tag, ubc_dev->ceqs[tag].active);
+            memset(&ubc_dev->ceqs[tag], 0, sizeof(UBCEqState));
+        }
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+
+    /* ---- JFR (Receive Queue) lifecycle ---- */
     case UBC_MB_CREATE_JFR_CONTEXT: {
+        if (tag >= UBC_MAX_JFRS) {
+            qemu_log("ubc POST_MB CREATE_JFR: tag %u out of range\n", tag);
+            mb.status = cpu_to_le32(1);
+            break;
+        }
+
+        UBCJfrState *jfr = &ubc_dev->jfrs[tag];
+        memset(jfr, 0, sizeof(*jfr));
+        jfr->active = true;
+        jfr->jfr_id = tag;
+
+        dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UDMA_JFR_CTX_SIZE);
+        if (dma_ret == MEMTX_OK) {
+            const uint32_t *dw = (const uint32_t *)ctx_buf;
+            uint32_t rqe_base_l = (dw[1] >> 12) & 0xFFFFF;
+            uint32_t rqe_base_h = dw[2];
+            uint32_t rqe_bb_shift = (dw[0] >> 8) & 0xF;
+            jfr->rq_buf_addr = ((uint64_t)rqe_base_h << 32) |
+                               ((uint64_t)rqe_base_l << 12);
+            jfr->rq_depth = 1u << rqe_bb_shift;
+        }
+
+        qemu_log("ubc POST_MB CREATE_JFR: jfr_id=%u rq_buf=%#" PRIx64
+                 " rq_depth=%u\n", jfr->jfr_id, jfr->rq_buf_addr,
+                 jfr->rq_depth);
+
+        /* Flush any URMA RX data buffered for jetties using this JFR */
+        for (uint32_t ji = 0; ji < UBC_MAX_JETTIES; ji++) {
+            UBCJettyState *js = &ubc_dev->jetties[ji];
+            if (js->active && js->jfrn == tag) {
+                ubc_flush_urma_rx_buffer(ubc_dev, ji);
+            }
+        }
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_MODIFY_JFR_CONTEXT: {
+        if (tag >= UBC_MAX_JFRS || !ubc_dev->jfrs[tag].active) {
+            qemu_log("ubc POST_MB MODIFY_JFR: tag=%u invalid or inactive\n", tag);
+            mb.status = cpu_to_le32(0);
+            break;
+        }
+
+        UBCJfrState *jfr = &ubc_dev->jfrs[tag];
+        dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UDMA_JFR_CTX_SIZE);
+        if (dma_ret == MEMTX_OK) {
+            const uint32_t *dw = (const uint32_t *)ctx_buf;
+            uint32_t rqe_base_l = (dw[1] >> 12) & 0xFFFFF;
+            uint32_t rqe_base_h = dw[2];
+            uint32_t rqe_bb_shift = (dw[0] >> 8) & 0xF;
+            jfr->rq_buf_addr = ((uint64_t)rqe_base_h << 32) |
+                               ((uint64_t)rqe_base_l << 12);
+            jfr->rq_depth = 1u << rqe_bb_shift;
+        }
+
+        qemu_log("ubc POST_MB MODIFY_JFR: jfr_id=%u rq_buf=%#" PRIx64
+                 " rq_depth=%u\n", jfr->jfr_id, jfr->rq_buf_addr,
+                 jfr->rq_depth);
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_QUERY_JFR_CONTEXT: {
+        if (tag < UBC_MAX_JFRS && ubc_dev->jfrs[tag].active) {
+            UBCJfrState *jfr = &ubc_dev->jfrs[tag];
+            uint32_t *dw = (uint32_t *)ctx_buf;
+
+            dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UDMA_JFR_CTX_SIZE);
+            if (dma_ret == MEMTX_OK) {
+                /* Update state in DW0 bits [18:16] = READY */
+                dw[0] = (dw[0] & ~(0x7u << 16)) | (1u << 16);
+                /* Update RQ CI in DW18 bits [31:16] */
+                dw[18] = (dw[18] & 0xFFFFu) | ((uint32_t)jfr->rq_ci << 16);
+                /* Update RQ PI in DW20 bits [15:0] */
+                dw[20] = (dw[20] & ~0xFFFFu) | (jfr->rq_pi & 0xFFFFu);
+                ubc_dma_write(ubc_dev, dma_addr, ctx_buf, UDMA_JFR_CTX_SIZE);
+            }
+            qemu_log("ubc POST_MB QUERY_JFR: jfr_id=%u rq_pi=%u rq_ci=%u\n",
+                     tag, jfr->rq_pi, jfr->rq_ci);
+        }
+        mb.status = cpu_to_le32(0);
+        break;
+    }
+    case UBC_MB_DESTROY_JFR_CONTEXT: {
         if (tag < UBC_MAX_JFRS) {
             UBCJfrState *jfr = &ubc_dev->jfrs[tag];
-            memset(jfr, 0, sizeof(*jfr));
-            jfr->active = true;
-            jfr->jfr_id = tag;
-
-            dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf,
-                                   UDMA_JFR_CTX_SIZE);
-            if (dma_ret == MEMTX_OK) {
-                const uint32_t *dw = (const uint32_t *)ctx_buf;
-                uint32_t rqe_base_l = (dw[1] >> 12) & 0xFFFFF;
-                uint32_t rqe_base_h = dw[2];
-                uint32_t rqe_bb_shift = (dw[0] >> 8) & 0xF;
-                jfr->rq_buf_addr = ((uint64_t)rqe_base_h << 32) |
-                                   ((uint64_t)rqe_base_l << 12);
-                jfr->rq_depth = 1u << rqe_bb_shift;
-            }
-
-            qemu_log("ubc POST_MB CREATE_JFR: jfr_id=%u rq_buf=%#" PRIx64
-                     " rq_depth=%u\n", jfr->jfr_id, jfr->rq_buf_addr,
-                     jfr->rq_depth);
-
-            /* Flush any URMA RX data buffered for jetties using this JFR */
+            qemu_log("ubc POST_MB DESTROY_JFR: jfr_id=%u was_active=%d\n",
+                     tag, jfr->active);
+            /* Clear any jetty references to this JFR */
             for (uint32_t ji = 0; ji < UBC_MAX_JETTIES; ji++) {
                 UBCJettyState *js = &ubc_dev->jetties[ji];
                 if (js->active && js->jfrn == tag) {
-                    ubc_flush_urma_rx_buffer(ubc_dev, ji);
+                    js->jfrn = 0;
                 }
             }
+            memset(jfr, 0, sizeof(*jfr));
         }
         mb.status = cpu_to_le32(0);
         break;
     }
-    case 0x14: { /* sub_op 0x14 - likely page table / DMA region config */
+
+    /* ---- Other known sub-opcodes (passthrough) ---- */
+    case 0x00:  /* NOP / generic */
+        qemu_log("ubc POST_MB NOP: tag=%u\n", tag);
+        mb.status = cpu_to_le32(0);
+        break;
+    case 0x14:  /* page table / DMA region config */
         dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, sizeof(ctx_buf));
         if (dma_ret == MEMTX_OK) {
             const uint32_t *dw = (const uint32_t *)ctx_buf;
@@ -1698,44 +1787,10 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
                      " dw[0..7]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
                      tag, (uint64_t)dma_addr,
                      dw[0], dw[1], dw[2], dw[3], dw[4], dw[5], dw[6], dw[7]);
-            fprintf(stderr, "ubc POST_MB sub_op=0x14: tag=%u dw0-7=%08x %08x %08x %08x %08x %08x %08x %08x\n",
-                     tag, dw[0], dw[1], dw[2], dw[3], dw[4], dw[5], dw[6], dw[7]);
         }
         mb.status = cpu_to_le32(0);
         break;
-    }
-    case 0x44:  /* MODIFY_JFR_CONTEXT - stub: accept, return success */
-        qemu_log("ubc POST_MB MODIFY_JFR: tag=%u (stub success)\n", tag);
-        mb.status = cpu_to_le32(0);
-        break;
-    case 0x34:  /* DESTROY_JFS_CONTEXT - stub */
-        qemu_log("ubc POST_MB DESTROY_JFS: tag=%u (stub success)\n", tag);
-        mb.status = cpu_to_le32(0);
-        break;
-    case 0x55:  /* MODIFY_JFC_CONTEXT - stub */
-        qemu_log("ubc POST_MB MODIFY_JFC: tag=%u (stub success)\n", tag);
-        mb.status = cpu_to_le32(0);
-        break;
-    case 0x00:  /* generic / nop */
-        qemu_log("ubc POST_MB NOP: tag=%u (stub success)\n", tag);
-        mb.status = cpu_to_le32(0);
-        break;
-    case 0x10:  /* QUERY_JFS_CONTEXT - stub */
-        qemu_log("ubc POST_MB QUERY_JFS: tag=%u (stub success)\n", tag);
-        mb.status = cpu_to_le32(0);
-        break;
-    case 0x20:  /* QUERY_JFC_CONTEXT - stub */
-        qemu_log("ubc POST_MB QUERY_JFC: tag=%u (stub success)\n", tag);
-        mb.status = cpu_to_le32(0);
-        break;
-    case 0x50:  /* QUERY_JFR_CONTEXT - stub */
-        qemu_log("ubc POST_MB QUERY_JFR: tag=%u (stub success)\n", tag);
-        mb.status = cpu_to_le32(0);
-        break;
-    case 0x60:  /* DESTROY_JFR_CONTEXT - stub */
-        qemu_log("ubc POST_MB DESTROY_JFR: tag=%u (stub success)\n", tag);
-        mb.status = cpu_to_le32(0);
-        break;
+
     default:
         qemu_log("ubc POST_MB: unhandled sub_op=0x%02x tag=%u\n", sub_op, tag);
         mb.status = cpu_to_le32(0);
@@ -1750,7 +1805,7 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
 }
 
 static size_t ubc_cmd_fill_resp(uint16_t opcode, const uint8_t *req, size_t req_len,
-                                uint8_t *resp, size_t resp_cap)
+                                uint8_t *resp, size_t resp_cap, uint32_t entity_count)
 {
     size_t resp_len = 0;
 
@@ -1773,7 +1828,7 @@ static size_t ubc_cmd_fill_resp(uint16_t opcode, const uint8_t *req, size_t req_
         ue.max_jfs_inline_sz = cpu_to_le16(64);
         ue.max_jfc_inline_sz = cpu_to_le16(32);
         ue.trans_mode = 1;  /* UD mode */
-        ue.ue_cnt = cpu_to_le16(ubc_dev->entity_count);
+        ue.ue_cnt = cpu_to_le16(entity_count); /* dynamic entity count from device config */
         ue.ue_id = 1;
 
         /* BD1: address tables and SEID — critical for ubcore registration */
@@ -1821,7 +1876,7 @@ static size_t ubc_cmd_fill_resp(uint16_t opcode, const uint8_t *req, size_t req_
     }
     case UBASE_OPC_QUERY_COMM_RSRC_PARAM: {
         UBCResCmdResp res;
-        ubc_fill_res_caps(&res);
+        ubc_fill_res_caps(&res, entity_count);
         resp_len = MIN(sizeof(res), resp_cap);
         memcpy(resp, &res, resp_len);
         break;
@@ -1905,44 +1960,89 @@ static size_t ubc_cmd_fill_resp(uint16_t opcode, const uint8_t *req, size_t req_
     return resp_len;
 }
 
-static void ubc_raise_cmdq_event(BusControllerDev *ubc_dev)
+static bool ubc_notify_vector(BusControllerDev *ubc_dev, uint16_t usi_vector,
+                              uint16_t msi_vector, const char *name)
 {
     UBDevice *ub_dev = &ubc_dev->parent;
-    uint32_t src;
 
-    src = ubc_ers2_read32(ubc_dev, UBASE_VECTOR0_CMDQ_SRC_REG);
-    src |= BIT(UBASE_VECTOR0_RX_CMDQ_INT_B);
-    ubc_ers2_write32(ubc_dev, UBASE_VECTOR0_CMDQ_SRC_REG, src);
-
-    if (ub_dev->usi_entries_nr > 0) {
-        usi_notify(ub_dev, 0);
-    } else {
-        /*
-         * Some current ubc paths run without USI vector-table setup.
-         * Use PCI MSI if available, otherwise fallback to minimal poll-mode
-         * notification.
-         */
-        PCIDevice *pci_dev = PCI_DEVICE(ubc_dev);
-        if (msi_enabled(pci_dev)) {
-            MSIMessage msg = msi_get_message(pci_dev, 0);
-            USIMessage usi_msg = {
-                .address = msg.address,
-                .data = msg.data,
-            };
-            usi_send_message(&usi_msg, UBC_INTERRUPT_ID_START, ub_dev);
-            qemu_log("ubc cmdq pci msi notify addr=%#" PRIx64 " data=%#x\n",
-                     usi_msg.address, usi_msg.data);
-        } else {
-            /* Fallback for pure simulation without full PCI MSI setup */
-            USIMessage msg = {
-                .address = 0x8090040ULL, /* Legacy fallback, but logged */
-                .data = 0,
-            };
-            usi_send_message(&msg, UBC_INTERRUPT_ID_START, ub_dev);
-            qemu_log("ubc cmdq legacy fallback msi notify rid=0x%x\n",
-                     UBC_INTERRUPT_ID_START);
-        }
+    if (ub_dev->usi_entries_nr > usi_vector) {
+        usi_notify(ub_dev, usi_vector);
+        return true;
     }
+
+    /*
+     * INT_TYPE1 fallback: msi_data is vector-indexed (event id).
+     * Vector0 keeps behavior compatible with existing cmdq/ctrlq flow.
+     */
+    {
+        uint64_t cap_off =
+            ub_cfg_offset_to_emulated_offset(UB_CFG1_CAP3_INT_TYPE1, true);
+        UbCfg1IntType1Cap *int1 =
+            (UbCfg1IntType1Cap *)(ub_dev->config + cap_off);
+        uint8_t int_en = int1->interrupt_enable & 0x1;
+        uint32_t rid = int1->interrupt_id;
+        uint32_t data = int1->interrupt_data + msi_vector;
+        uint32_t addr_l = (uint32_t)(int1->interrupt_address & UINT32_MAX);
+        uint32_t addr_h = (uint32_t)(int1->interrupt_address >> 32);
+        USIMessage msg = {
+            .address = ((uint64_t)addr_h << 32) | addr_l,
+            .data = data,
+        };
+
+        if (int_en && msg.address) {
+            USIMessage kick = {
+                .address = 0x8090040ULL,
+                .data = data,
+            };
+            usi_send_message(&msg, rid, NULL);
+            /* Compatibility kick: some environments only route the low ITS doorbell. */
+            usi_send_message(&kick, rid, NULL);
+            qemu_log("ubc %s notify vector=%u rid=0x%x data=0x%x addr=%#" PRIx64 "\n",
+                     name, msi_vector, rid, data, (uint64_t)msg.address);
+            return true;
+        }
+
+        msg.address = 0x8090040ULL;
+        msg.data = msi_vector;
+        usi_send_message(&msg, UBC_INTERRUPT_ID_START + msi_vector, NULL);
+        qemu_log("ubc %s msi notify fallback vector=%u rid=0x%x\n",
+                 name, msi_vector, UBC_INTERRUPT_ID_START + msi_vector);
+    }
+    return true;
+}
+
+static void ubc_raise_queue_event(BusControllerDev *ubc_dev, hwaddr src_reg,
+                                  uint32_t src_bit, const char *name)
+{
+    UBDevice *ub_dev = &ubc_dev->parent;
+    BusControllerState *s = container_of_ubbus(ub_get_bus(ub_dev));
+    uint32_t src, new_src;
+
+    src = ubc_ers2_read32(ubc_dev, src_reg);
+    new_src = src | BIT(src_bit);
+    ubc_ers2_write32(ubc_dev, src_reg, new_src);
+    fprintf(stderr, "ubc raise %s event: src old=%#x new=%#x\n",
+            name, src, new_src);
+    ubc_notify_vector(ubc_dev, 0, 0, name);
+
+    /* Fallback edge on the wired IRQ line to avoid losing CRQ service kicks
+     * when MSI routing is not effective in the current simulation topology. */
+    if (s) {
+        qemu_set_irq(s->irq, 1);
+        qemu_set_irq(s->irq, 0);
+    }
+}
+
+static void ubc_raise_cmdq_event(BusControllerDev *ubc_dev)
+{
+    ubc_raise_queue_event(ubc_dev, UBASE_VECTOR0_CMDQ_SRC_REG,
+                          UBASE_VECTOR0_RX_CMDQ_INT_B, "cmdq");
+}
+
+static void ubc_raise_ctrlq_event(BusControllerDev *ubc_dev)
+{
+    ubc_raise_queue_event(ubc_dev, UBASE_VECTOR0_CTRLQ_SRC_REG,
+                          UBASE_VECTOR0_RX_CTRLQ_INT_B, "ctrlq");
 }
 
 static void ubc_sync_cmdq_regs(BusControllerDev *ubc_dev)
@@ -1954,10 +2054,6 @@ static void ubc_sync_cmdq_regs(BusControllerDev *ubc_dev)
     ubc_dev->cmd_csq.head = (uint16_t)ubc_ers2_read32(ubc_dev, UBASE_CSQ_HEAD_REG);
     ubc_dev->cmd_csq.tail = (uint16_t)ubc_ers2_read32(ubc_dev, UBASE_CSQ_TAIL_REG);
     if (old_csq_base != ubc_dev->cmd_csq.base) {
-        ubc_dev->csq_bias_valid = false;
-        ubc_dev->csq_bias_scanned = false;
-        ubc_dev->csq_bias_iova_base = ubc_dev->cmd_csq.base;
-        ubc_dev->csq_iova_to_gpa_bias = 0;
         /* Reset CMDQ base tracking when CSQ is cleared (guest resets queue) */
         if (ubc_dev->cmd_csq.base == 0) {
             ubc_dev->cmdq_last_csq_base = 0;
@@ -1974,11 +2070,6 @@ static void ubc_sync_cmdq_regs(BusControllerDev *ubc_dev)
              ubc_dev->cmd_csq.head, ubc_dev->cmd_csq.tail,
              (uint64_t)ubc_dev->cmd_crq.base, ubc_dev->cmd_crq.depth,
              ubc_dev->cmd_crq.head, ubc_dev->cmd_crq.tail);
-
-    /* Once CSQ bias is known and CRQ registers are written, learn CRQ GPA */
-    if (ubc_dev->csq_bias_valid && ubc_dev->cmd_crq.base) {
-        ubc_learn_crq_bias(ubc_dev);
-    }
 }
 
 static void ubc_process_cmdq(BusControllerDev *ubc_dev)
@@ -1989,6 +2080,9 @@ static void ubc_process_cmdq(BusControllerDev *ubc_dev)
     if (!csq->base || !csq->depth) {
         return;
     }
+
+    fprintf(stderr, "ubc_process_cmdq: ENTER base=%#lx depth=%u head=%u tail=%u\n",
+            (unsigned long)csq->base, csq->depth, csq->head, csq->tail);
 
     while (csq->head != csq->tail && guard++ < csq->depth) {
         UBCCmdqDesc *descs;
@@ -2004,22 +2098,19 @@ static void ubc_process_cmdq(BusControllerDev *ubc_dev)
         size_t copy_len;
         int ret = 0;
         int i;
-        bool need_bias_relearn;
+        MemTxResult rdret;
 
-        if (ubc_read_desc(csq, ubc_dev, csq->head, &head_desc) != MEMTX_OK) {
+        dma_addr_t desc_addr = csq->base + (dma_addr_t)csq->head * sizeof(head_desc);
+        rdret = ubc_read_desc(csq, ubc_dev, csq->head, &head_desc);
+        if (rdret != MEMTX_OK) {
+            fprintf(stderr, "ubc_process_cmdq: DMA read FAILED addr=%#llx"
+                    " base=%#llx idx=%u ret=%d as=%p\n",
+                    (unsigned long long)desc_addr,
+                    (unsigned long long)csq->base, csq->head, (int)rdret,
+                    ubc_dma_as(ubc_dev));
             break;
         }
         opcode = le16_to_cpu(head_desc.opcode);
-        need_bias_relearn = csq->head == 0 && csq->tail != 0 &&
-                            !ubc_dev->csq_bias_valid && !ubc_dev->csq_bias_scanned &&
-                            ubc_head_desc_suspicious(&head_desc);
-        if (need_bias_relearn) {
-            ubc_dev->csq_bias_scanned = true;
-            if (ubc_learn_csq_bias(ubc_dev) &&
-                ubc_read_desc(csq, ubc_dev, csq->head, &head_desc) == MEMTX_OK) {
-                opcode = le16_to_cpu(head_desc.opcode);
-            }
-        }
         qemu_log("ubc cmdq process opcode=0x%x bd=%u head=%u tail=%u depth=%u\n",
                  opcode, head_desc.bd_num, csq->head, csq->tail, csq->depth);
         bd_num = head_desc.bd_num ? head_desc.bd_num : 1;
@@ -2081,7 +2172,7 @@ static void ubc_process_cmdq(BusControllerDev *ubc_dev)
         } else if (opcode == UBASE_OPC_POST_MB) {
             ret = ubc_handle_post_mb(ubc_dev, req_flat, req_len, resp_flat, cap);
         } else {
-            (void)ubc_cmd_fill_resp(opcode, req_flat, req_len, resp_flat, cap);
+            (void)ubc_cmd_fill_resp(opcode, req_flat, req_len, resp_flat, cap, ubc_dev->entity_count);
         }
 
         if (cap) {
@@ -2433,7 +2524,7 @@ static void ubc_process_ctrlq(BusControllerDev *ubc_dev)
             crq->tail = crq_next2;
 
             ubc_ers2_write32(ubc_dev, UBASE_CTRLQ_CRQ_TAIL_REG, crq->tail);
-            ubc_raise_cmdq_event(ubc_dev);
+            ubc_raise_ctrlq_event(ubc_dev);
             qemu_log("ubc ctrlq seid resp: 1 eid fe80::1 (2 BDs)\n");
             continue;
         } else if (req_bb.service_type == UBASE_CTRLQ_SER_TYPE_TP_ACL &&
@@ -2478,7 +2569,7 @@ static void ubc_process_ctrlq(BusControllerDev *ubc_dev)
         crq->tail = crq_next;
         ubc_ers2_write32(ubc_dev, UBASE_CTRLQ_CRQ_TAIL_REG, crq->tail);
         fprintf(stderr, "ubc ctrlq resp done: crq_tail=%u\n", crq->tail);
-        ubc_raise_cmdq_event(ubc_dev);
+        ubc_raise_ctrlq_event(ubc_dev);
     }
 }
 
@@ -2506,6 +2597,17 @@ static void ubc_ers2_mmio_write(BusControllerDev *ubc_dev, hwaddr addr,
         switch (addr) {
         case UBASE_VECTOR0_CMDQ_SRC_REG:
             cur = ubc_ers2_read32(ubc_dev, addr);
+            fprintf(stderr,
+                    "ubc ers2 WRITE CMDQ_SRC clear_mask=%#x old=%#x new=%#x\n",
+                    (uint32_t)val, cur, cur & ~(uint32_t)val);
+            cur &= ~(uint32_t)val;
+            ubc_ers2_write32(ubc_dev, addr, cur);
+            return;
+        case UBASE_VECTOR0_CTRLQ_SRC_REG:
+            cur = ubc_ers2_read32(ubc_dev, addr);
+            fprintf(stderr,
+                    "ubc ers2 WRITE CTRLQ_SRC clear_mask=%#x old=%#x new=%#x\n",
+                    (uint32_t)val, cur, cur & ~(uint32_t)val);
             cur &= ~(uint32_t)val;
             ubc_ers2_write32(ubc_dev, addr, cur);
             return;
@@ -2581,6 +2683,31 @@ static void ubc_ers2_mmio_write(BusControllerDev *ubc_dev, hwaddr addr,
 static uint64_t ub_ers_region_read(void *opaque, hwaddr addr, unsigned len)
 {
     typeof(((BusControllerDev *)0)->ers[0]) *ers = opaque;
+    BusControllerDev *ubc_dev = ers->owner;
+    uint32_t entity_idx = 0;
+
+    /* Multi-entity routing for ERS0 (Config), ERS1 (Doorbell), and ERS2 (Resource) */
+    if ((ers->idx == 0 || ers->idx == 1 || ers->idx == 2) && addr >= 0x400000) {
+        entity_idx = (uint32_t)(addr / 0x400000);
+        addr %= 0x400000;
+        
+        if (ubc_dev && entity_idx < ubc_dev->entity_count) {
+            if (ers->idx == 0) {
+                uint8_t *cfg = ubc_dev->entity_cfg_spaces[entity_idx].cfg_base;
+                uint32_t cfg_size = ubc_dev->entity_cfg_spaces[entity_idx].cfg_size;
+                if (cfg && addr < cfg_size) {
+                    switch (len) {
+                    case 1: return cfg[addr];
+                    case 2: return lduw_le_p(cfg + addr);
+                    case 4: return ldl_le_p(cfg + addr);
+                    case 8: return ldq_le_p(cfg + addr);
+                    }
+                }
+            }
+            /* Note: ERS1 (Doorbell) reads for entities > 0 return 0 for now as it's write-only */
+        }
+        return 0;
+    }
 
     if (!ers->storage || addr > ers->storage_size || len > ers->storage_size - addr) {
         return 0;
@@ -2600,6 +2727,84 @@ static uint64_t ub_ers_region_read(void *opaque, hwaddr addr, unsigned len)
     }
 }
 
+static void ubc_fill_remote_dcna_from_link(UBDevice *ub_dev,
+                                           UBFMManagedLink *fm_link,
+                                           uint32_t *dcna)
+{
+    UBLinkState *link;
+
+    if (!ub_dev || !fm_link || !dcna || *dcna) {
+        return;
+    }
+
+    link = fm_link->runtime;
+    if (!link) {
+        return;
+    }
+
+    if (link->a.device == ub_dev && link->b.device) {
+        *dcna = link->b.device->cna;
+    } else if (link->b.device == ub_dev && link->a.device) {
+        *dcna = link->a.device->cna;
+    } else if (link->a.device && link->a.device != ub_dev) {
+        *dcna = link->a.device->cna;
+    } else if (link->b.device && link->b.device != ub_dev) {
+        *dcna = link->b.device->cna;
+    }
+}
+
+static UBFMManagedLink *ubc_find_fm_link(UBDevice *ub_dev, uint32_t *dcna)
+{
+    UBFMManagedLink *fm_link = NULL;
+    uint32_t i;
+
+    if (!ub_dev) {
+        return NULL;
+    }
+    qemu_log("ubc_find_fm_link: dev=%s local_cna=%#x input_dcna=%#x\n",
+             ub_dev->qdev.id ? ub_dev->qdev.id : "<null>", ub_dev->cna,
+             dcna ? *dcna : 0);
+
+    if (dcna && *dcna) {
+        fm_link = ub_fm_find_link_by_cna(*dcna);
+        if (fm_link) {
+            ubc_fill_remote_dcna_from_link(ub_dev, fm_link, dcna);
+            qemu_log("ubc_find_fm_link: matched input dcna=%#x\n", dcna ? *dcna : 0);
+            return fm_link;
+        }
+    }
+
+    for (i = 0; i < ub_dev->port.port_num; i++) {
+        NeighborInfo *ni = &ub_dev->port.neighbors[i];
+
+        if (!ni->is_remote_neighbor || !ni->remote_primary_cna_valid) {
+            continue;
+        }
+        fm_link = ub_fm_find_link_by_cna(ni->remote_primary_cna);
+        if (fm_link) {
+            if (dcna && !*dcna) {
+                *dcna = ni->remote_primary_cna;
+            }
+            ubc_fill_remote_dcna_from_link(ub_dev, fm_link, dcna);
+            qemu_log("ubc_find_fm_link: matched neighbor[%u] remote_cna=%#x final_dcna=%#x\n",
+                     i, ni->remote_primary_cna, dcna ? *dcna : 0);
+            return fm_link;
+        }
+    }
+
+    fm_link = ub_fm_find_link_by_cna(ub_dev->cna);
+    if (fm_link) {
+        ubc_fill_remote_dcna_from_link(ub_dev, fm_link, dcna);
+        qemu_log("ubc_find_fm_link: matched by local_cna final_dcna=%#x\n",
+                 dcna ? *dcna : 0);
+    }
+    if (!fm_link) {
+        qemu_log("ubc_find_fm_link: miss dev=%s local_cna=%#x\n",
+                 ub_dev->qdev.id ? ub_dev->qdev.id : "<null>", ub_dev->cna);
+    }
+    return fm_link;
+}
+
 /*
  * Send URMA data payload over ub_link to the remote node.
  * Wraps the data in a MsgPktHeader with msg_code=UB_MSG_CODE_URMA_DATA
@@ -2609,34 +2814,29 @@ static uint64_t ub_ers_region_read(void *opaque, hwaddr addr, unsigned len)
  * The URMA data payload starts at offset 32 and contains the raw data.
  * src_jetty is in MsgPktHeader.sjetty, dst_jetty is in MsgPktHeader.djetty
  * (using the sjetty/rjetty fields at DW6).
+ *
+ * For RDMA WRITE: if remote_addr != 0, uses UB_MSG_CODE_URMA_WRITE and
+ * prepends UBCWritePayloadHdr before the actual data.
  */
-static void ubc_send_data_to_remote(BusControllerDev *ubc_dev, UBCJettyState *js,
+static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState *js,
                                        const uint8_t *payload, uint32_t payload_len,
-                                       uint32_t rmt_obj_id, const uint8_t *rmt_eid)
+                                       uint32_t rmt_obj_id, const uint8_t *rmt_eid,
+                                       uint64_t remote_addr, bool is_write)
 {
     UBDevice *ub_dev = &ubc_dev->parent;
     UBFMManagedLink *fm_link = NULL;
     UBLinkState *link;
     Error *local_err = NULL;
     uint32_t dcna = 0;
-    uint32_t i;
 
     qemu_log("ubc SEND: jetty=%u rmt_obj_id=%u payload_len=%u\n",
              js->jetty_id, rmt_obj_id, payload_len);
 
-    /* Find the FM link to the remote node */
-    for (i = 0; i < ub_dev->port.port_num && !fm_link; i++) {
-        NeighborInfo *ni = &ub_dev->port.neighbors[i];
-        if (ni->is_remote_neighbor && ni->remote_primary_cna_valid) {
-            fm_link = ub_fm_find_link_by_cna(ni->remote_primary_cna);
-            if (fm_link) {
-                dcna = ni->remote_primary_cna;
-            }
-        }
-    }
+    fm_link = ubc_find_fm_link(ub_dev, &dcna);
 
     if (!fm_link) {
-        qemu_log("ubc SEND: no FM link found, skipping send\n");
+        qemu_log("ubc SEND: no FM link found (local_cna=%#x), skipping send\n",
+                 ub_dev->cna);
         return;
     }
 
@@ -2650,15 +2850,18 @@ static void ubc_send_data_to_remote(BusControllerDev *ubc_dev, UBCJettyState *js
      * Build a MsgPktHeader-wrapped URMA data packet.
      * The URMA data payload goes in the payload[] section of MsgPktHeader.
      * We use msg_code=7 for the receive side to distinguish from control messages.
+     *
+     * For WRITE: prepend UBCWritePayloadHdr (8 bytes) before payload
      */
     {
-        size_t total_len = sizeof(MsgPktHeader) + payload_len;
+        size_t write_hdr_len = is_write ? sizeof(UBCWritePayloadHdr) : 0;
+        size_t total_len = sizeof(MsgPktHeader) + write_hdr_len + payload_len;
         uint8_t *pkt = g_malloc0(total_len);
         MsgPktHeader *hdr = (MsgPktHeader *)pkt;
 
         /* Fill UbLinkHeader (DW0) */
         hdr->ulh.cfg = UB_CLAN_LINK_CFG;
-        hdr->ulh.plen = payload_len;
+        hdr->ulh.plen = write_hdr_len + payload_len;
 
         /* Fill ClanNetworkHeader (DW1-DW2) */
         hdr->nth.scna = ub_dev->cna;
@@ -2667,22 +2870,25 @@ static void ubc_send_data_to_remote(BusControllerDev *ubc_dev, UBCJettyState *js
         /* DW6: sjetty/rjetty */
         hdr->sjetty = js->jetty_id;
         hdr->jetty_en = 1;
-        /* Store dst_jetty in the djetty field (bits [20:0] of DW6)
-         * Actually sjetty uses [20:0], but we also need rjetty.
-         * Use the rsv1/odr bits or a separate field. For simplicity,
-         * encode dst_jetty as (rmt_obj_id << 20) in sjetty field area.
-         * Better: store in the deid field (DW4) which is normally the
-         * destination EID but can carry our dst_jetty.
-         */
+        /* Store dst_jetty in the deid field (DW4) */
         hdr->deid = rmt_obj_id & 0xFFFFF;
 
-        /* MsgExtendedHeader (DW7) */
-        hdr->msgetah.msg_code = UB_MSG_CODE_URMA_DATA;
+        /* MsgExtendedHeader (DW7): use different msg_code for WRITE vs SEND */
+        hdr->msgetah.msg_code = is_write ? UB_MSG_CODE_URMA_WRITE : UB_MSG_CODE_URMA_DATA;
         hdr->msgetah.type = 1;  /* data (not request) */
-        hdr->msgetah.plen = payload_len & 0xFFF;
+        hdr->msgetah.plen = (write_hdr_len + payload_len) & 0xFFF;
 
-        /* Copy payload after the MsgPktHeader */
-        memcpy(pkt + sizeof(MsgPktHeader), payload, payload_len);
+        /* For WRITE: prepend remote_addr header */
+        if (is_write) {
+            UBCWritePayloadHdr *write_hdr = (UBCWritePayloadHdr *)(pkt + sizeof(MsgPktHeader));
+            write_hdr->remote_addr = remote_addr;
+            memcpy(pkt + sizeof(MsgPktHeader) + sizeof(UBCWritePayloadHdr), payload, payload_len);
+            qemu_log("ubc SEND WRITE: remote_addr=%#" PRIx64 " payload_len=%u\n",
+                     remote_addr, payload_len);
+        } else {
+            /* Copy payload after the MsgPktHeader */
+            memcpy(pkt + sizeof(MsgPktHeader), payload, payload_len);
+        }
 
         int rc = ub_link_write_message(link, pkt, total_len, &local_err);
         if (rc < 0) {
@@ -2699,6 +2905,14 @@ static void ubc_send_data_to_remote(BusControllerDev *ubc_dev, UBCJettyState *js
 
         g_free(pkt);
     }
+}
+
+/* Wrapper for backward compatibility (SEND operation) */
+static void ubc_send_data_to_remote(BusControllerDev *ubc_dev, UBCJettyState *js,
+                                       const uint8_t *payload, uint32_t payload_len,
+                                       uint32_t rmt_obj_id, const uint8_t *rmt_eid)
+{
+    ubc_send_data_to_remote_ex(ubc_dev, js, payload, payload_len, rmt_obj_id, rmt_eid, 0, false);
 }
 
 /*
@@ -2721,45 +2935,258 @@ static void ubc_send_data_to_remote(BusControllerDev *ubc_dev, UBCJettyState *js
  *
  * For inline SEND: data starts at byte 64 (after the 64-byte header).
  */
+
+/*
+ * Send an RDMA READ request to the remote node.
+ * The remote node will read from its guest memory at remote_addr and
+ * send back the data via a READ_RESP message.
+ */
+
+/* Forward declaration: ubc_generate_cqe is defined after ubc_process_sq_wqe */
+static void ubc_generate_cqe(BusControllerDev *ubc_dev, UBCJettyState *js,
+                              uint32_t jfc_id, uint32_t wqe_idx,
+                              uint32_t byte_cnt, uint32_t status, bool is_send);
+
+static void ubc_send_read_request(BusControllerDev *ubc_dev, UBCJettyState *js,
+                                   uint32_t rmt_obj_id, const uint8_t *rmt_eid,
+                                   uint64_t remote_addr, uint32_t read_len,
+                                   uint32_t req_id)
+{
+    UBDevice *ub_dev = &ubc_dev->parent;
+    UBFMManagedLink *fm_link = NULL;
+    UBLinkState *link;
+    Error *local_err = NULL;
+    uint32_t dcna = 0;
+
+    fm_link = ubc_find_fm_link(ub_dev, &dcna);
+
+    if (!fm_link) {
+        qemu_log("ubc READ_REQ: no FM link found (local_cna=%#x)\n", ub_dev->cna);
+        return;
+    }
+
+    link = fm_link->runtime;
+    if (!link || !link->link_up || !link->ioc) {
+        qemu_log("ubc READ_REQ: link not up\n");
+        return;
+    }
+
+    size_t total_len = sizeof(MsgPktHeader) + sizeof(UBCReadReqPld);
+    uint8_t *pkt = g_malloc0(total_len);
+    MsgPktHeader *hdr = (MsgPktHeader *)pkt;
+    UBCReadReqPld *req = (UBCReadReqPld *)(pkt + sizeof(MsgPktHeader));
+
+    hdr->ulh.cfg = UB_CLAN_LINK_CFG;
+    hdr->ulh.plen = sizeof(UBCReadReqPld);
+    hdr->nth.scna = ub_dev->cna;
+    hdr->nth.dcna = dcna;
+    hdr->sjetty = js->jetty_id;
+    hdr->jetty_en = 1;
+    hdr->deid = rmt_obj_id & 0xFFFFF;
+    hdr->msgetah.msg_code = UB_MSG_CODE_URMA_READ_REQ;
+    hdr->msgetah.type = 1;
+    hdr->msgetah.plen = sizeof(UBCReadReqPld) & 0xFFF;
+
+    req->req_id = req_id;
+    req->src_jetty_id = js->jetty_id;
+    req->remote_addr = remote_addr;
+    req->read_len = read_len;
+    req->rmt_obj_id = rmt_obj_id;
+
+    int rc = ub_link_write_message(link, pkt, total_len, &local_err);
+    if (rc < 0) {
+        qemu_log("ubc READ_REQ: ub_link write failed: %s\n",
+                 local_err ? error_get_pretty(local_err) : "unknown");
+        if (local_err) {
+            error_free(local_err);
+        }
+    } else {
+        qemu_log("ubc READ_REQ: sent req_id=%u remote_addr=%#" PRIx64
+                 " len=%u via ub_link\n", req_id, remote_addr, read_len);
+        ub_link_kick_remote(link, NULL);
+    }
+    g_free(pkt);
+}
+
+/*
+ * Handle an incoming RDMA READ request from a remote node.
+ * Read data from local guest memory and send a READ_RESP back.
+ */
+void ubc_handle_read_request(BusControllerDev *ubc_dev,
+                              const UBCReadReqPld *req,
+                              uint32_t dcna)
+{
+    UBDevice *ub_dev = &ubc_dev->parent;
+    UBFMManagedLink *fm_link = NULL;
+    UBLinkState *link;
+    Error *local_err = NULL;
+    uint32_t read_len = req->read_len;
+    uint32_t status = 0;
+
+    /* Limit read length to prevent excessive memory allocation */
+    #define UBC_MAX_READ_LEN (256 * 1024)  /* 256KB max per READ */
+    if (read_len > UBC_MAX_READ_LEN) {
+        qemu_log("ubc READ_RESP: read_len %u > max %u, truncating\n",
+                 read_len, UBC_MAX_READ_LEN);
+        read_len = UBC_MAX_READ_LEN;
+    }
+
+    fm_link = ubc_find_fm_link(ub_dev, &dcna);
+
+    if (!fm_link) {
+        qemu_log("ubc READ_RESP: no FM link found (local_cna=%#x req_dcna=%#x)\n",
+                 ub_dev->cna, dcna);
+        return;
+    }
+
+    link = fm_link->runtime;
+    if (!link || !link->link_up || !link->ioc) {
+        qemu_log("ubc READ_RESP: link not up\n");
+        return;
+    }
+
+    /* Build READ response packet */
+    size_t resp_pld_len = sizeof(UBCReadRespPld) + read_len;
+    size_t total_len = sizeof(MsgPktHeader) + resp_pld_len;
+    uint8_t *pkt = g_malloc0(total_len);
+    MsgPktHeader *hdr = (MsgPktHeader *)pkt;
+    UBCReadRespPld *resp = (UBCReadRespPld *)(pkt + sizeof(MsgPktHeader));
+    uint8_t *data_out = pkt + sizeof(MsgPktHeader) + sizeof(UBCReadRespPld);
+
+    hdr->ulh.cfg = UB_CLAN_LINK_CFG;
+    hdr->ulh.plen = resp_pld_len;
+    hdr->nth.scna = ub_dev->cna;
+    hdr->nth.dcna = dcna;
+    hdr->msgetah.msg_code = UB_MSG_CODE_URMA_READ_RESP;
+    hdr->msgetah.type = 1;
+    hdr->msgetah.plen = resp_pld_len & 0xFFF;
+
+    resp->req_id = req->req_id;
+    resp->src_jetty_id = req->src_jetty_id;
+    resp->data_len = read_len;
+    resp->status = status;
+
+    /* Read from guest memory at the requested address */
+    MemTxResult ret = ubc_dma_read(ubc_dev, req->remote_addr, data_out, read_len);
+    if (ret != MEMTX_OK) {
+        qemu_log("ubc READ_RESP: DMA read from %#" PRIx64 " failed\n",
+                 (uint64_t)req->remote_addr);
+        resp->status = 1;  /* error */
+        resp->data_len = 0;
+    }
+
+    int rc = ub_link_write_message(link, pkt, total_len, &local_err);
+    if (rc < 0) {
+        qemu_log("ubc READ_RESP: ub_link write failed: %s\n",
+                 local_err ? error_get_pretty(local_err) : "unknown");
+        if (local_err) {
+            error_free(local_err);
+        }
+    } else {
+        qemu_log("ubc READ_RESP: sent req_id=%u data_len=%u\n",
+                 req->req_id, resp->data_len);
+        ub_link_kick_remote(link, NULL);
+    }
+    g_free(pkt);
+}
+
+/*
+ * Handle an incoming RDMA READ response from a remote node.
+ * Write data to the local SGE buffer and generate a READ completion CQE.
+ */
+void ubc_handle_read_response(BusControllerDev *ubc_dev,
+                                const UBCReadRespPld *resp,
+                                const uint8_t *data, uint32_t data_len)
+{
+    uint32_t req_id = resp->req_id;
+    int i;
+
+    /* Find the pending read request by req_id */
+    for (i = 0; i < UBC_MAX_PENDING_READS; i++) {
+        if (ubc_dev->pending_reads.entries[i].pending &&
+            ubc_dev->pending_reads.entries[i].req_id == req_id) {
+            break;
+        }
+    }
+
+    if (i >= UBC_MAX_PENDING_READS) {
+        qemu_log("ubc READ_RESP: no pending request for req_id=%u\n", req_id);
+        return;
+    }
+
+    uint32_t jetty_id = ubc_dev->pending_reads.entries[i].jetty_id;
+    uint32_t wqe_idx = ubc_dev->pending_reads.entries[i].wqe_idx;
+    uint32_t jfc_id = ubc_dev->pending_reads.entries[i].jfc_id;
+    uint64_t local_va = ubc_dev->pending_reads.entries[i].local_va;
+    uint32_t local_len = ubc_dev->pending_reads.entries[i].local_len;
+    uint32_t cqe_status = CQE_STATUS_SUCCESS;
+    uint32_t actual_len = data_len;
+
+    /* Clear the pending entry */
+    ubc_dev->pending_reads.entries[i].pending = false;
+    ubc_dev->pending_reads.count--;
+
+    /* Validate jetty */
+    if (jetty_id >= UBC_MAX_JETTIES || !ubc_dev->jetties[jetty_id].active) {
+        qemu_log("ubc READ_RESP: jetty %u not active\n", jetty_id);
+        return;
+    }
+
+    UBCJettyState *js = &ubc_dev->jetties[jetty_id];
+
+    /* Check for error status from remote */
+    if (resp->status != 0) {
+        qemu_log("ubc READ_RESP: remote error status=%u\n", resp->status);
+        cqe_status = CQE_STATUS_REMOTE_ERR;
+        actual_len = 0;
+    } else if (actual_len > local_len) {
+        actual_len = local_len;
+        cqe_status = CQE_STATUS_LOCAL_LEN_ERR;
+    }
+
+    /* Write data to local SGE buffer */
+    if (actual_len > 0 && local_va != 0) {
+        MemTxResult ret = ubc_dma_write(ubc_dev, local_va, data, actual_len);
+        if (ret != MEMTX_OK) {
+            qemu_log("ubc READ_RESP: DMA write to local VA failed\n");
+            cqe_status = CQE_STATUS_DMA_ERR;
+            actual_len = 0;
+        }
+    }
+
+    /* Generate READ completion CQE */
+    ubc_generate_cqe(ubc_dev, js, jfc_id, wqe_idx, actual_len, cqe_status, true);
+
+    qemu_log("ubc READ_RESP complete: jetty=%u wqe=%u byte_cnt=%u status=%u\n",
+             jetty_id, wqe_idx, actual_len, cqe_status);
+}
+
 static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
                                 uint32_t wqe_idx)
 {
     uint8_t wqe_buf[UDMA_SQE_SIZE];
     dma_addr_t wqe_addr = js->sq_buf_addr + (dma_addr_t)wqe_idx * UDMA_SQE_SIZE;
     MemTxResult ret;
-    uint32_t opcode, inline_en, sge_num, inline_msg_len;
+    uint32_t opcode, inline_en, sge_num, inline_msg_len, token_en;
     uint32_t rmt_obj_id;
     uint8_t rmt_eid[16];
     uint32_t i;
-    dma_addr_t gpa_scan;
+    uint32_t byte_cnt = 0;
+    uint32_t cqe_status = CQE_STATUS_SUCCESS;
 
     /* DMA-read the 64-byte WQE header */
     ret = ubc_dma_read(ubc_dev, wqe_addr, wqe_buf, UDMA_SQE_SIZE);
     if (ret != MEMTX_OK) {
         qemu_log("ubc WQE: DMA read failed addr=%#" PRIx64 "\n", (uint64_t)wqe_addr);
+        ubc_generate_cqe(ubc_dev, js, js->tx_jfcn, wqe_idx, 0, CQE_STATUS_DMA_ERR, true);
         return;
     }
-
-    /* Debug: if WQE is all zeros, scan nearby GPAs to find the actual data */
     {
         const uint32_t *dw = (const uint32_t *)wqe_buf;
-        bool all_zero = true;
-        for (int j = 0; j < 16; j++) {
-            if (dw[j] != 0) { all_zero = false; break; }
-        }
-        if (all_zero && ubc_kva_to_gpa(wqe_addr, &gpa_scan)) {
-            uint32_t test_val;
-            /* Sanity check: read from RAM base to verify address_space works */
-            address_space_read(&address_space_memory, UBC_GUEST_RAM_BASE,
-                              MEMTXATTRS_UNSPECIFIED, &test_val, 4);
-            fprintf(stderr, "ubc WQE: all zeros at iova=%#lx gpa=%#lx, RAM_BASE[0]=%#x\n",
-                    (unsigned long)wqe_addr, (unsigned long)gpa_scan, test_val);
-            /* Try reading from address as-is (raw GPA without KVA translation) */
-            address_space_read(&address_space_memory, wqe_addr & 0xFFFFFFFFFFFF,
-                              MEMTXATTRS_UNSPECIFIED, &test_val, 4);
-            fprintf(stderr, "ubc WQE: raw iova&mask=%#lx val=%#x\n",
-                    (unsigned long)(wqe_addr & 0xFFFFFFFFFFFF), test_val);
-        }
+        qemu_log("ubc WQE RAW: jetty=%u idx=%u addr=%#" PRIx64
+                 " dw0=%08x dw1=%08x dw2=%08x dw3=%08x dw4=%08x dw5=%08x dw6=%08x dw7=%08x\n",
+                 js->jetty_id, wqe_idx, (uint64_t)wqe_addr,
+                 dw[0], dw[1], dw[2], dw[3], dw[4], dw[5], dw[6], dw[7]);
     }
 
     /* Parse DW0-DW1 fields (little-endian bitfield layout):
@@ -2772,14 +3199,12 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
      */
     {
         const uint32_t *dw = (const uint32_t *)wqe_buf;
-        fprintf(stderr, "ubc WQE raw: dw0=%#x dw1=%#x dw2=%#x dw3=%#x dw4=%#x dw5=%#x dw6=%#x dw7=%#x\n",
-                dw[0], dw[1], dw[2], dw[3], dw[4], dw[5], dw[6], dw[7]);
         inline_en = (dw[0] >> 22) & 0x1;
+        token_en = (dw[0] >> 28) & 0x1;
         opcode = (dw[1] >> 8) & 0xFF;
         inline_msg_len = (dw[1] >> 22) & 0x3FF;
         sge_num = (dw[2] >> 24) & 0xFF;
         rmt_obj_id = dw[3] & 0xFFFFF;
-        /* rmt_eid at DW4-7 */
         memcpy(rmt_eid, &dw[4], 16);
     }
 
@@ -2788,129 +3213,357 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
              js->jetty_id, wqe_idx, opcode, inline_en, sge_num,
              inline_msg_len, rmt_obj_id);
 
-    /* Only handle SEND opcode for now */
-    if (opcode != UDMA_SQE_OPCODE_SEND) {
-        qemu_log("ubc WQE: unhandled opcode 0x%02x\n", opcode);
+    /* Opcode dispatch */
+    switch (opcode) {
+    case UDMA_SQE_OPCODE_SEND:
+    case UDMA_SQE_OPCODE_SEND_WITH_IMM:
+    case UDMA_SQE_OPCODE_SEND_WITH_INVALID: {
+        /*
+         * Extract payload from inline data or SGEs.
+         * For inline: data starts at offset 48 in the SQ buffer.
+         * For SGE: each SGE has {length, token_id, va} and we DMA-read from va.
+         */
+        if (inline_en && inline_msg_len > 0) {
+            uint8_t *payload = g_malloc(inline_msg_len);
+            dma_addr_t payload_addr = js->sq_buf_addr +
+                (dma_addr_t)wqe_idx * UDMA_SQE_SIZE + UDMA_SQE_CTL_LEN_SEND;
+
+            ret = ubc_dma_read(ubc_dev, payload_addr, payload, inline_msg_len);
+            if (ret != MEMTX_OK) {
+                qemu_log("ubc WQE SEND inline: DMA read payload failed len=%u\n",
+                         inline_msg_len);
+                cqe_status = CQE_STATUS_DMA_ERR;
+                g_free(payload);
+            } else {
+                byte_cnt = inline_msg_len;
+                ubc_send_data_to_remote(ubc_dev, js, payload, byte_cnt,
+                                        rmt_obj_id, rmt_eid);
+                g_free(payload);
+            }
+        } else if (sge_num > 0) {
+            for (i = 0; i < sge_num && i < 8; i++) {
+                dma_addr_t sge_addr = js->sq_buf_addr +
+                    (dma_addr_t)wqe_idx * UDMA_SQE_SIZE + UDMA_SQE_CTL_LEN_SEND +
+                    (dma_addr_t)i * UDMA_JFS_SGE_SIZE;
+                uint8_t sge_buf[UDMA_JFS_SGE_SIZE];
+                uint32_t sge_len;
+                uint64_t sge_va;
+                uint32_t token_id;
+
+                ret = ubc_dma_read(ubc_dev, sge_addr, sge_buf, UDMA_JFS_SGE_SIZE);
+                if (ret != MEMTX_OK) {
+                    qemu_log("ubc WQE SEND SGE[%u]: DMA read failed\n", i);
+                    cqe_status = CQE_STATUS_DMA_ERR;
+                    continue;
+                }
+
+                /* Parse udma_normal_sge: length(4) token_id(4) va(8) */
+                memcpy(&sge_len, sge_buf, 4);
+                memcpy(&token_id, sge_buf + 4, 4);
+                memcpy(&sge_va, sge_buf + 8, 8);
+
+                if (sge_len == 0 || sge_va == 0) {
+                    continue;
+                }
+
+                /* Token validation: if WQE has token_en=1, observe token_id.
+                 * For simulation: non-zero token_id is allowed, zero is logged
+                 * as a warning but not rejected (graceful degradation). */
+                if (token_en && token_id == 0) {
+                    qemu_log("ubc WQE SEND SGE[%u]: token_en=1 but token_id=0 "
+                             "(warning: no access token)\n", i);
+                } else if (token_id != 0) {
+                    qemu_log("ubc WQE SEND SGE[%u]: token_id=%u (valid)\n",
+                             i, token_id);
+                }
+
+                qemu_log("ubc WQE SEND SGE[%u]: va=%#" PRIx64 " len=%u\n",
+                         i, sge_va, sge_len);
+
+                uint8_t *payload = g_malloc(sge_len);
+                ret = ubc_dma_read(ubc_dev, sge_va, payload, sge_len);
+                if (ret != MEMTX_OK) {
+                    qemu_log("ubc WQE SEND SGE[%u]: data DMA read failed\n", i);
+                    cqe_status = CQE_STATUS_DMA_ERR;
+                    g_free(payload);
+                    continue;
+                }
+
+                ubc_send_data_to_remote(ubc_dev, js, payload, sge_len,
+                                        rmt_obj_id, rmt_eid);
+                byte_cnt += sge_len;
+                g_free(payload);
+                /* For simplicity, send only the first SGE's data */
+                break;
+            }
+        }
+        break;
+    }
+
+    case UDMA_SQE_OPCODE_WRITE:
+    case UDMA_SQE_OPCODE_WRITE_WITH_IMM: {
+        /*
+         * RDMA WRITE: writes to remote memory directly at the specified address.
+         * DW10-DW11 contain the remote address (rmt_addr_l/rmt_addr_h).
+         */
+        const uint32_t *wqe_dw = (const uint32_t *)wqe_buf;
+        uint32_t sqe_ctl_len = (opcode == UDMA_SQE_OPCODE_WRITE_WITH_IMM) ?
+                               UDMA_SQE_SIZE : UDMA_SQE_CTL_LEN_SEND;
+        uint64_t remote_addr = ((uint64_t)wqe_dw[11] << 32) | wqe_dw[10];
+
+        qemu_log("ubc WQE WRITE: jetty=%u idx=%u remote_addr=%#" PRIx64 "\n",
+                 js->jetty_id, wqe_idx, remote_addr);
+
+        if (remote_addr == 0) {
+            qemu_log("ubc WQE WRITE: remote_addr is zero, failing\n");
+            cqe_status = CQE_STATUS_LOCAL_OP_ERR;
+            break;
+        }
+
+        if (inline_en && inline_msg_len > 0) {
+            uint8_t *payload = g_malloc(inline_msg_len);
+            dma_addr_t payload_addr = js->sq_buf_addr +
+                (dma_addr_t)wqe_idx * UDMA_SQE_SIZE + sqe_ctl_len;
+            ret = ubc_dma_read(ubc_dev, payload_addr, payload, inline_msg_len);
+            if (ret == MEMTX_OK) {
+                byte_cnt = inline_msg_len;
+                ubc_send_data_to_remote_ex(ubc_dev, js, payload, byte_cnt,
+                                           rmt_obj_id, rmt_eid, remote_addr, true);
+            } else {
+                cqe_status = CQE_STATUS_DMA_ERR;
+            }
+            g_free(payload);
+        } else if (sge_num > 0) {
+            for (i = 0; i < sge_num && i < 8; i++) {
+                dma_addr_t sge_addr = js->sq_buf_addr +
+                    (dma_addr_t)wqe_idx * UDMA_SQE_SIZE + sqe_ctl_len +
+                    (dma_addr_t)i * UDMA_JFS_SGE_SIZE;
+                uint8_t sge_buf[UDMA_JFS_SGE_SIZE];
+                uint32_t sge_len;
+                uint64_t sge_va;
+
+                ret = ubc_dma_read(ubc_dev, sge_addr, sge_buf, UDMA_JFS_SGE_SIZE);
+                if (ret != MEMTX_OK) {
+                    continue;
+                }
+                memcpy(&sge_len, sge_buf, 4);
+                memcpy(&sge_va, sge_buf + 8, 8);
+                if (sge_len == 0 || sge_va == 0) {
+                    continue;
+                }
+                uint8_t *payload = g_malloc(sge_len);
+                ret = ubc_dma_read(ubc_dev, sge_va, payload, sge_len);
+                if (ret == MEMTX_OK) {
+                    ubc_send_data_to_remote_ex(ubc_dev, js, payload, sge_len,
+                                               rmt_obj_id, rmt_eid, remote_addr, true);
+                    byte_cnt = sge_len;
+                } else {
+                    cqe_status = CQE_STATUS_DMA_ERR;
+                }
+                g_free(payload);
+                break;
+            }
+        }
+        break;
+    }
+
+    case UDMA_SQE_OPCODE_READ: {
+        /*
+         * RDMA READ: send a READ request to the remote node.
+         * The remote node reads from its guest memory and sends back a
+         * READ_RESP. On response receipt, data is written to local SGE
+         * and a completion CQE is generated.
+         *
+         * WQE layout for READ:
+         *   DW10: rmt_addr_l (remote address low bits)
+         *   DW11: rmt_addr_h (remote address high bits)
+         *   SGE[0]: local buffer { length, token_id, va }
+         */
+        const uint32_t *wqe_dw = (const uint32_t *)wqe_buf;
+        uint64_t remote_addr = ((uint64_t)wqe_dw[11] << 32) | wqe_dw[10];
+        uint32_t sge_len = 0;
+        uint64_t local_va = 0;
+        uint32_t req_id;
+        int slot = -1;
+
+        /* Parse local SGE to know where to write response data */
+        if (sge_num > 0) {
+            dma_addr_t sge_addr = js->sq_buf_addr +
+                (dma_addr_t)wqe_idx * UDMA_SQE_SIZE + UDMA_SQE_CTL_LEN_SEND;
+            uint8_t sge_buf[UDMA_JFS_SGE_SIZE];
+            ret = ubc_dma_read(ubc_dev, sge_addr, sge_buf, UDMA_JFS_SGE_SIZE);
+            if (ret == MEMTX_OK) {
+                memcpy(&sge_len, sge_buf, 4);
+                memcpy(&local_va, sge_buf + 8, 8);
+            }
+        }
+
+        if (sge_len == 0 || local_va == 0) {
+            qemu_log("ubc WQE READ: no valid local SGE\n");
+            cqe_status = CQE_STATUS_LOCAL_LEN_ERR;
+            break;
+        }
+
+        /* Find a free pending read slot */
+        for (int si = 0; si < UBC_MAX_PENDING_READS; si++) {
+            if (!ubc_dev->pending_reads.entries[si].pending) {
+                slot = si;
+                break;
+            }
+        }
+
+        if (slot < 0) {
+            qemu_log("ubc WQE READ: no free pending read slots\n");
+            cqe_status = CQE_STATUS_LOCAL_OP_ERR;
+            break;
+        }
+
+        /* Allocate request ID and register pending read */
+        req_id = ubc_dev->next_read_req_id++;
+        ubc_dev->pending_reads.entries[slot].pending = true;
+        ubc_dev->pending_reads.entries[slot].jetty_id = js->jetty_id;
+        ubc_dev->pending_reads.entries[slot].wqe_idx = wqe_idx;
+        ubc_dev->pending_reads.entries[slot].jfc_id = js->tx_jfcn;
+        ubc_dev->pending_reads.entries[slot].local_va = local_va;
+        ubc_dev->pending_reads.entries[slot].local_len = sge_len;
+        ubc_dev->pending_reads.entries[slot].req_id = req_id;
+        ubc_dev->pending_reads.count++;
+
+        /* Send READ request to remote node */
+        ubc_send_read_request(ubc_dev, js, rmt_obj_id, rmt_eid,
+                              remote_addr, sge_len, req_id);
+
+        qemu_log("ubc WQE READ: jetty=%u idx=%u remote_addr=%#" PRIx64
+                 " len=%u req_id=%u (pending)\n",
+                 js->jetty_id, wqe_idx, remote_addr, sge_len, req_id);
+
+        /* Return WITHOUT generating CQE — CQE will be generated when
+         * READ response arrives via ubc_handle_read_response. */
         return;
     }
 
-    /*
-     * Extract payload from inline data or SGEs.
-     * For inline: data starts at offset 64 in the SQ buffer (next WQEBB).
-     * For SGE: each SGE has {length, token_id, va} and we DMA-read from va.
-     */
-    if (inline_en && inline_msg_len > 0) {
-        /* Inline data: starts right after the 48-byte sqe_ctl header */
-        uint8_t *payload = g_malloc(inline_msg_len);
-        dma_addr_t payload_addr = js->sq_buf_addr +
-            (dma_addr_t)wqe_idx * UDMA_SQE_SIZE + UDMA_SQE_CTL_LEN_SEND;
+    case UDMA_SQE_OPCODE_CAS:
+    case UDMA_SQE_OPCODE_FAA: {
+        /*
+         * Atomic operations (CAS/FAA): currently only local memory ATOMIC
+         * is supported in simulation. Remote ATOMIC would require a
+         * request-response protocol similar to READ.
+         */
+        const uint32_t *wqe_dw = (const uint32_t *)wqe_buf;
+        uint64_t remote_addr = ((uint64_t)wqe_dw[11] << 32) | wqe_dw[10];
+        /*
+        uint64_t atomic_arg1 = ((uint64_t)wqe_dw[13] << 32) | wqe_dw[12];
+        uint64_t atomic_arg2 = ((uint64_t)wqe_dw[15] << 32) | wqe_dw[14];
+        */
 
-        ret = ubc_dma_read(ubc_dev, payload_addr, payload, inline_msg_len);
-        if (ret != MEMTX_OK) {
-            qemu_log("ubc WQE inline: DMA read payload failed len=%u\n",
-                     inline_msg_len);
-            g_free(payload);
-            return;
-        }
+        qemu_log("ubc WQE ATOMIC op=0x%02x: jetty=%u idx=%u remote=%#" PRIx64
+                 " (remote ATOMIC not yet implemented)\n",
+                 opcode, js->jetty_id, wqe_idx, remote_addr);
 
-        qemu_log("ubc WQE inline: jetty=%u len=%u first_bytes=%02x %02x %02x %02x\n",
-                 js->jetty_id, inline_msg_len,
-                 inline_msg_len > 0 ? payload[0] : 0,
-                 inline_msg_len > 1 ? payload[1] : 0,
-                 inline_msg_len > 2 ? payload[2] : 0,
-                 inline_msg_len > 3 ? payload[3] : 0);
-
-        /* Send payload over ub_link */
-        ubc_send_data_to_remote(ubc_dev, js, payload, inline_msg_len,
-                                rmt_obj_id, rmt_eid);
-        g_free(payload);
-    } else if (sge_num > 0) {
-        /* SGE mode: SGEs start at offset 48 (after the 48-byte sqe_ctl header for SEND) */
-        for (i = 0; i < sge_num && i < 8; i++) {
-            dma_addr_t sge_addr = js->sq_buf_addr +
-                (dma_addr_t)wqe_idx * UDMA_SQE_SIZE + UDMA_SQE_CTL_LEN_SEND +
-                (dma_addr_t)i * UDMA_JFS_SGE_SIZE;
-            uint8_t sge_buf[UDMA_JFS_SGE_SIZE];
-            uint32_t sge_len;
-            uint64_t sge_va;
-
-            ret = ubc_dma_read(ubc_dev, sge_addr, sge_buf, UDMA_JFS_SGE_SIZE);
-            if (ret != MEMTX_OK) {
-                qemu_log("ubc WQE SGE[%u]: DMA read failed\n", i);
-                continue;
-            }
-
-            /* Parse udma_normal_sge: length(4) token_id(4) va(8) */
-            memcpy(&sge_len, sge_buf, 4);
-            memcpy(&sge_va, sge_buf + 8, 8);
-
-            if (sge_len == 0) {
-                continue;
-            }
-
-            qemu_log("ubc WQE SGE[%u]: va=%#" PRIx64 " len=%u\n",
-                     i, sge_va, sge_len);
-
-            /* DMA-read the actual data from SGE VA */
-            uint8_t *payload = g_malloc(sge_len);
-            ret = ubc_dma_read(ubc_dev, sge_va, payload, sge_len);
-            if (ret != MEMTX_OK) {
-                qemu_log("ubc WQE SGE[%u]: data DMA read failed\n", i);
-                g_free(payload);
-                continue;
-            }
-
-            ubc_send_data_to_remote(ubc_dev, js, payload, sge_len,
-                                    rmt_obj_id, rmt_eid);
-            g_free(payload);
-            /* For simplicity, send only the first SGE's data */
-            break;
-        }
+        /* TODO: Implement remote ATOMIC using request-response protocol */
+        cqe_status = CQE_STATUS_LOCAL_OP_ERR;
+        byte_cnt = 0;
+        break;
     }
+
+    default:
+        qemu_log("ubc WQE: unhandled opcode 0x%02x jetty=%u idx=%u\n",
+                 opcode, js->jetty_id, wqe_idx);
+        cqe_status = CQE_STATUS_LOCAL_OP_ERR;
+        break;
+    }
+
+    /* Generate TX completion CQE */
+    ubc_generate_cqe(ubc_dev, js, js->tx_jfcn, wqe_idx, byte_cnt, cqe_status, true);
 }
 
 /*
- * Generate a send CQE in the CQ buffer associated with the jetty's TX JFC.
- * CQE format (64 bytes, 16 DWORDs):
- *   DW0: s_r=0 | is_jetty=1 | owner | ... | status=0 | entry_idx
- *   DW1: entry_idx[15:0] | local_num_l
+ * Generate a CQE in the specified JFC's CQ buffer.
+ *
+ * CQE layout (struct cdma_jfc_cqe, little-endian bitfield):
+ *   DW0: s_r[0] | is_jetty[1] | owner[2] | inline_en[3] | opcode[6:4]
+ *        | fd[7] | rsv[15:8] | substatus[23:16] | status[31:24]
+ *   DW1: entry_idx[15:0] | local_num_l[31:16]
+ *   DW2: local_num_h[3:0] | rmt_idx[23:4] | rsv1[31:24]
+ *   DW3: tpn[23:0] | rsv2[31:24]
  *   DW4: byte_cnt
- *   DW5-DW6: user_data (from WQE)
- * After writing, update cq_pi and raise a CEQ interrupt.
+ *   DW5: user_data_l
+ *   DW6: user_data_h
+ *
+ * Owner bit semantics (from driver cdma_get_next_cqe):
+ *   valid_owner = (ci >> entry_cnt_mask_ilog2) & 1
+ *   CQE is NEW when cqe->owner != valid_owner
+ *   Round 0 (ci 0..depth-1): valid_owner=0, so CQE owner must be 1
+ *   Round 1 (ci depth..2*depth-1): valid_owner=1, so CQE owner must be 0
+ *   Owner flips each round; tracked by cq_owner_phase counter.
  */
-static void ubc_generate_send_cqe(BusControllerDev *ubc_dev, UBCJettyState *js,
-                                   uint32_t wqe_idx, uint32_t byte_cnt)
+static void ubc_generate_cqe(BusControllerDev *ubc_dev, UBCJettyState *js,
+                              uint32_t jfc_id, uint32_t wqe_idx,
+                              uint32_t byte_cnt, uint32_t status, bool is_send)
 {
     UBCJfcState *jfc;
     uint8_t cqe[64];
     uint32_t *dw = (uint32_t *)cqe;
     dma_addr_t cqe_addr;
     MemTxResult ret;
+    uint32_t owner;
 
-    if (js->tx_jfcn >= UBC_MAX_JFCS) {
-        qemu_log("ubc CQE: tx_jfcn=%u out of range\n", js->tx_jfcn);
+    if (jfc_id >= UBC_MAX_JFCS) {
+        qemu_log("ubc CQE: jfc_id=%u out of range\n", jfc_id);
         return;
     }
 
-    jfc = &ubc_dev->jfcs[js->tx_jfcn];
+    jfc = &ubc_dev->jfcs[jfc_id];
     if (!jfc->active) {
-        qemu_log("ubc CQE: tx JFC %u not active\n", js->tx_jfcn);
+        qemu_log("ubc CQE: JFC %u not active\n", jfc_id);
+        return;
+    }
+
+    if (!jfc->cq_depth) {
+        qemu_log("ubc CQE: JFC %u cq_depth=0\n", jfc_id);
         return;
     }
 
     memset(cqe, 0, sizeof(cqe));
 
-    /* DW0: s_r=0(send), is_jetty=1, owner=1, status=0(success) */
-    dw[0] = (0 << 0)    /* s_r: send */
-          | (1 << 1)    /* is_jetty */
-          | (1 << 2)    /* owner */
-          | (0 << 24);  /* status = 0 (success) */
+    /*
+     * Owner bit: initial phase is 1 (so first round CQEs have owner=1,
+     * matching driver's expectation that valid_owner=0 in round 0).
+     * Flip each time cq_pi wraps to 0.
+     */
+    owner = jfc->cq_owner_phase;
 
-    /* DW1: entry_idx = wqe_idx */
-    dw[1] = wqe_idx & 0xFFFF;
+    /* DW0 bitfield: s_r | is_jetty | owner | inline_en | opcode | fd | rsv | substatus | status */
+    dw[0] = ((is_send ? 0 : 1) << 0)    /* s_r: 0=send, 1=recv */
+          | (1 << 1)                     /* is_jetty = 1 */
+          | (owner << 2)                 /* owner/phase bit */
+          | (0 << 3)                     /* inline_en = 0 */
+          | (0 << 4)                     /* opcode = 0 (3 bits) */
+          | (0 << 7)                     /* fd = 0 */
+          | (0 << 8)                     /* rsv (8 bits) */
+          | ((status & 0xFF) << 16)      /* substatus (8 bits) - use status as substatus for now */
+          | ((status & 0xFF) << 24);     /* status (8 bits) */
+
+    /* DW1: entry_idx[15:0] | local_num_l[31:16]
+     * local_num is the jetty_id for identifying the queue pair */
+    dw[1] = (wqe_idx & 0xFFFF) | ((js ? js->jetty_id : 0) << 16);
+
+    /* DW2: rmt_idx[15:0] | local_num_h[31:16]
+     * rmt_idx: remote jetty index (not stored in jetty state, use 0 for simulation) */
+    dw[2] = 0;
+
+    /* DW3: tpn[23:0] | rsv[31:24]
+     * tpn: transport port number (use jetty_id as tpn for simulation) */
+    dw[3] = js ? (js->jetty_id & 0xFFFFFF) : 0;
 
     /* DW4: byte_cnt */
     dw[4] = byte_cnt;
+
+    /* DW5-DW6: user_data from jetty context (jfs kernel addr) */
+    if (js) {
+        dw[5] = js->user_data_l;
+        dw[6] = js->user_data_h;
+    }
 
     /* Write CQE to CQ buffer at cq_pi */
     cqe_addr = jfc->cq_buf_addr + (dma_addr_t)jfc->cq_pi * 64;
@@ -2920,16 +3573,28 @@ static void ubc_generate_send_cqe(BusControllerDev *ubc_dev, UBCJettyState *js,
         return;
     }
 
+    /* Advance cq_pi and flip owner on wrap */
     jfc->cq_pi = (jfc->cq_pi + 1) % jfc->cq_depth;
-    qemu_log("ubc CQE: jetty=%u wqe_idx=%u byte_cnt=%u cq_pi=%u jfc=%u\n",
-             js->jetty_id, wqe_idx, byte_cnt, jfc->cq_pi, js->tx_jfcn);
+    if (jfc->cq_pi == 0) {
+        jfc->cq_owner_phase ^= 1;
+    }
 
-    /* Raise CEQ interrupt via USI */
-    ubc_raise_cmdq_event(ubc_dev);
+    qemu_log("ubc CQE: jfc=%u wqe_idx=%u byte_cnt=%u status=%u owner=%u cq_pi=%u\n",
+             jfc_id, wqe_idx, byte_cnt, status, owner, jfc->cq_pi);
+
+    /*
+     * Completion path expected by guest:
+     *   JFC CQE in JFC buffer + CEQE(jfcn) in CEQ buffer + CEQ vector interrupt.
+     * Keep CMDQ event as fallback when CEQ state is not available yet.
+     */
+    if (!ubc_push_ceq_event(ubc_dev, jfc->ceqn, jfc_id)) {
+        ubc_raise_cmdq_event(ubc_dev);
+    }
 }
 
 /*
  * Process all pending WQEs on a jetty's SQ from sq_ci up to sq_pi.
+ * Each WQE is dispatched by opcode; a CQE is generated for each.
  */
 static void ubc_process_sq(BusControllerDev *ubc_dev, UBCJettyState *js)
 {
@@ -2938,8 +3603,6 @@ static void ubc_process_sq(BusControllerDev *ubc_dev, UBCJettyState *js)
 
     while (ci != pi) {
         ubc_process_sq_wqe(ubc_dev, js, ci);
-        /* Generate send CQE for this WQE */
-        ubc_generate_send_cqe(ubc_dev, js, ci, 0);
         ci = (ci + 1) % js->sq_depth;
     }
     js->sq_ci = ci;
@@ -2953,9 +3616,7 @@ static void ubc_process_sq(BusControllerDev *ubc_dev, UBCJettyState *js)
  * The guest kernel's ipourma driver will process the received data through
  * the normal URMA completion path.
  */
-/* --- URMA RX buffering for early-arriving packets --- */
-#define UBC_URMA_RX_BUF_MAX 64
-#define UBC_URMA_RX_BUF_DATA_MAX 4096
+/* Note: UBC_URMA_RX_BUF_* macros are defined at the top of this file */
 
 static void ubc_buffer_urma_rx(BusControllerDev *ubc_dev, uint32_t dst_jetty,
                                    const uint8_t *data, uint32_t data_len)
@@ -3012,17 +3673,15 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
 {
     UBCJettyState *js;
     UBCJfrState  *jfr;
-    UBCJfcState  *jfc;
-    uint32_t rx_jfcn;
     uint8_t sge_buf[16];
     dma_addr_t rqe_addr;
     uint64_t sge_va;
     uint32_t sge_len;
-    uint8_t cqe_buf[64];
-    dma_addr_t cqe_addr;
-    uint32_t *dw;
+    uint32_t rq_wqe_idx;
+    uint32_t cqe_status = CQE_STATUS_SUCCESS;
+    uint32_t actual_len;
 
-    fprintf(stderr, "ubc URMA RX: dst_jetty=%u len=%u\n", dst_jetty, data_len);
+    qemu_log("ubc URMA RX: dst_jetty=%u len=%u\n", dst_jetty, data_len);
 
     if (!ubc_dev || dst_jetty >= UBC_MAX_JETTIES) {
         qemu_log("ubc URMA RX: dst_jetty %u out of range\n", dst_jetty);
@@ -3044,16 +3703,22 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
     }
 
     jfr = &ubc_dev->jfrs[js->jfrn];
-    if (!jfr->rq_buf_addr) {
+    if (!jfr->rq_buf_addr || !jfr->rq_depth) {
         qemu_log("ubc URMA RX: no RQ buffer for JFR %u\n", js->jfrn);
         return;
     }
 
+    /* Boundary check: RQ full (rq_ci == rq_pi means empty, but if RQ has no
+     * posted receives, rq_ci may equal rq_depth - 1 after wrapping). */
+    rq_wqe_idx = jfr->rq_ci;
+
     /* DMA-read the next RECV WQE (16-byte SGE) from the RQ */
-    rqe_addr = jfr->rq_buf_addr + (dma_addr_t)jfr->rq_ci * 16;
+    rqe_addr = jfr->rq_buf_addr + (dma_addr_t)rq_wqe_idx * 16;
     if (ubc_dma_read(ubc_dev, rqe_addr, sge_buf, 16) != MEMTX_OK) {
         qemu_log("ubc URMA RX: RQE DMA read failed at ci=%u addr=%#" PRIx64 "\n",
                  jfr->rq_ci, rqe_addr);
+        ubc_generate_cqe(ubc_dev, js, js->rx_jfcn, rq_wqe_idx, 0,
+                         CQE_STATUS_DMA_ERR, false);
         return;
     }
 
@@ -3064,97 +3729,148 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
     qemu_log("ubc URMA RX: RQE ci=%u sge_va=%#" PRIx64 " sge_len=%u data_len=%u\n",
              jfr->rq_ci, sge_va, sge_len, data_len);
 
-    if (sge_len < data_len || !sge_va) {
-        qemu_log("ubc URMA RX: RQE buffer too small (%u < %u) or null va\n",
-                 sge_len, data_len);
+    /* Boundary check: null VA or zero length → RQ empty error */
+    if (!sge_va || sge_len == 0) {
+        qemu_log("ubc URMA RX: RQE null va or zero len at ci=%u\n", jfr->rq_ci);
+        ubc_generate_cqe(ubc_dev, js, js->rx_jfcn, rq_wqe_idx, 0,
+                         CQE_STATUS_RQ_EMPTY_ERR, false);
         return;
+    }
+
+    /* Length mismatch: truncate and set error if SGE buffer too small */
+    actual_len = data_len;
+    if (sge_len < data_len) {
+        qemu_log("ubc URMA RX: RQE buffer too small (%u < %u), truncating\n",
+                 sge_len, data_len);
+        actual_len = sge_len;
+        cqe_status = CQE_STATUS_LOCAL_LEN_ERR;
     }
 
     /* DMA-write the received data into the guest's RECV buffer */
-    if (ubc_dma_write(ubc_dev, sge_va, data, data_len) != MEMTX_OK) {
+    if (ubc_dma_write(ubc_dev, sge_va, data, actual_len) != MEMTX_OK) {
         qemu_log("ubc URMA RX: data DMA write failed\n");
+        ubc_generate_cqe(ubc_dev, js, js->rx_jfcn, rq_wqe_idx, 0,
+                         CQE_STATUS_DMA_ERR, false);
         return;
     }
 
-    /* Generate a receive CQE in the RX JFC's CQ */
-    rx_jfcn = js->rx_jfcn;
-    if (rx_jfcn >= UBC_MAX_JFCS || !ubc_dev->jfcs[rx_jfcn].active) {
-        qemu_log("ubc URMA RX: RX JFC %u not active\n", rx_jfcn);
-        return;
-    }
-
-    jfc = &ubc_dev->jfcs[rx_jfcn];
-    memset(cqe_buf, 0, 64);
-    dw = (uint32_t *)cqe_buf;
-    /* CQE: wqe_idx at [15:0], owner bit at [31] */
-    dw[0] = (jfr->rq_ci & 0xFFFF) | (1u << 31);
-    /* byte_cnt at DW4 */
-    dw[4] = data_len;
-
-    cqe_addr = jfc->cq_buf_addr + (dma_addr_t)jfc->cq_pi * 64;
-    if (ubc_dma_write(ubc_dev, cqe_addr, cqe_buf, 64) != MEMTX_OK) {
-        qemu_log("ubc URMA RX: CQE DMA write failed\n");
-        return;
-    }
-
-    jfc->cq_pi = (jfc->cq_pi + 1) % jfc->cq_depth;
+    /* Advance RQ consumer index */
     jfr->rq_ci = (jfr->rq_ci + 1) % jfr->rq_depth;
 
-    qemu_log("ubc URMA RX: CQE written jetty=%u rq_ci=%u cq_pi=%u byte_cnt=%u\n",
-             dst_jetty, jfr->rq_ci, jfc->cq_pi, data_len);
-    fprintf(stderr, "ubc URMA RX: CQE done jetty=%u rq_ci=%u cq_pi=%u len=%u\n",
-            dst_jetty, jfr->rq_ci, jfc->cq_pi, data_len);
+    /* Generate RX completion CQE using shared function */
+    ubc_generate_cqe(ubc_dev, js, js->rx_jfcn, rq_wqe_idx, actual_len,
+                     cqe_status, false);
 
-    /* Raise interrupt to notify guest */
-    ubc_raise_cmdq_event(ubc_dev);
+    qemu_log("ubc URMA RX: CQE done jetty=%u rq_ci=%u byte_cnt=%u status=%u\n",
+             dst_jetty, jfr->rq_ci, actual_len, cqe_status);
+}
+
+/*
+ * Handle RDMA WRITE data from remote node.
+ * Unlike SEND/RECV, WRITE writes directly to the specified remote_addr
+ * without consuming an RQ entry.
+ */
+void ubc_handle_urma_rx_write(BusControllerDev *ubc_dev, uint32_t dst_jetty,
+                              uint64_t remote_addr, const uint8_t *data,
+                              uint32_t data_len)
+{
+    qemu_log("ubc URMA RX WRITE: dst_jetty=%u remote_addr=%#" PRIx64 " len=%u\n",
+             dst_jetty, remote_addr, data_len);
+
+    if (!ubc_dev || dst_jetty >= UBC_MAX_JETTIES) {
+        qemu_log("ubc URMA RX WRITE: dst_jetty %u out of range\n", dst_jetty);
+        return;
+    }
+
+    if (!ubc_dev->jetties[dst_jetty].active) {
+        qemu_log("ubc URMA RX WRITE: dst jetty %u not active\n", dst_jetty);
+        return;
+    }
+
+    /* For WRITE: directly write to remote_addr, no RQ consumption */
+    if (ubc_dma_write(ubc_dev, remote_addr, data, data_len) != MEMTX_OK) {
+        qemu_log("ubc URMA RX WRITE: DMA write to %#" PRIx64 " failed\n",
+                 remote_addr);
+        return;
+    }
+
+    qemu_log("ubc URMA RX WRITE: wrote %u bytes to %#" PRIx64 "\n",
+             data_len, remote_addr);
+    /* No CQE generated for WRITE on the receive side (sender gets completion) */
 }
 
 static void ub_ers_region_write(void *opaque, hwaddr addr, uint64_t val, unsigned len)
 {
     typeof(((BusControllerDev *)0)->ers[0]) *ers = opaque;
     BusControllerDev *ubc_dev = ers->owner;
+    uint32_t entity_idx = 0;
 
-    /* Diagnostic: log ALL ERS2 writes */
-    if (ubc_dev && ers->idx == 2) {
-        static int ers2_log_count = 0;
-        if (ers2_log_count < 200) {
-            fprintf(stderr, "ubc ERS2 WRITE addr=0x%lx val=0x%lx len=%u"
-                    " storage=%p storage_size=0x%lx\n",
-                    (unsigned long)addr, (unsigned long)val, len,
-                    ers->storage, (unsigned long)ers->storage_size);
-            ers2_log_count++;
-        }
+    /* Multi-entity routing: each entity has a 4MB aperture in the alias window */
+    if ((ers->idx == 0 || ers->idx == 1 || ers->idx == 2) && addr >= 0x400000) {
+        entity_idx = (uint32_t)(addr / 0x400000);
+        addr %= 0x400000;
     }
 
-    /*
-     * ERS1 doorbell intercept (must be BEFORE storage bounds check):
-     * The doorbell/MMIO region is ERS1 (resource index 1 = MEM_RESOURCE).
-     * ERS1 storage is small (1 page), but doorbells write at high offsets.
-     * Doorbell offset = 0x1000 + jetty_id * 0x1000 + 0x80
-     */
-    if (ubc_dev && ers->idx == 1 && len == DWORD_SIZE &&
-        addr >= 0x1080 && (addr & 0xFFF) == 0x80) {
-        uint32_t jetty_id = ((addr & ~0xFFFULL) - 0x1000) >> 12;
-
-        fprintf(stderr, "ubc doorbell: jetty_id=%u addr=0x%lx val=%lu active=%d\n",
-                jetty_id, (unsigned long)addr, (unsigned long)val,
-                jetty_id < UBC_MAX_JETTIES ? (int)ubc_dev->jetties[jetty_id].active : -1);
-        if (jetty_id < UBC_MAX_JETTIES && ubc_dev->jetties[jetty_id].active) {
-            UBCJettyState *js = &ubc_dev->jetties[jetty_id];
-            js->sq_pi = (uint32_t)val;
-            fprintf(stderr, "ubc doorbell: jetty_id=%u new_pi=%u sq_ci=%u\n",
-                     jetty_id, js->sq_pi, js->sq_ci);
-            ubc_process_sq(ubc_dev, js);
-            return; /* doorbell is write-only, don't store */
-        }
-    }
-
-    if (!ers->storage || addr > ers->storage_size || len > ers->storage_size - addr) {
+    if (!ubc_dev || entity_idx >= ubc_dev->entity_count) {
         return;
     }
 
-    if (ubc_dev && ers->idx == 2) {
+    /* ERS0 (Config) routing: Direct access to per-entity shadow config space */
+    if (ers->idx == 0) {
+        uint8_t *cfg = ubc_dev->entity_cfg_spaces[entity_idx].cfg_base;
+        uint32_t cfg_size = ubc_dev->entity_cfg_spaces[entity_idx].cfg_size;
+        if (cfg && addr < cfg_size) {
+            switch (len) {
+            case 1: cfg[addr] = (uint8_t)val; break;
+            case 2: stw_le_p(cfg + addr, (uint16_t)val); break;
+            case 4: stl_le_p(cfg + addr, (uint32_t)val); break;
+            case 8: stq_le_p(cfg + addr, val); break;
+            }
+        }
+        return;
+    }
+
+    if (ers->idx == 1 && (len == sizeof(uint64_t) || len == sizeof(uint32_t)) &&
+        addr >= UDMA_JETTY_DSQE_OFFSET) {
+        uint32_t local_jetty_id = ((addr & ~(UDMA_HW_PAGE_SIZE - 1)) -
+                                   UDMA_JETTY_DSQE_OFFSET) / UDMA_HW_PAGE_SIZE;
+        uint32_t within_page = addr & (UDMA_HW_PAGE_SIZE - 1);
+
+        if (within_page < UDMA_SQE_SIZE) {
+            qemu_log("ubc ERS1 DSQE write: entity=%u jetty_local=%u off=0x%x val=%#" PRIx64 "\n",
+                     entity_idx, local_jetty_id, within_page, val);
+        }
+    }
+
+    /* ERS1 Doorbell logic (with entity isolation)
+     * Doorbell offset = JETTY_DSQE_OFFSET + (jetty_id * 4K) + DOORBELL_OFFSET
+     */
+    if (ers->idx == 1 && len == DWORD_SIZE &&
+        addr >= (UDMA_JETTY_DSQE_OFFSET + UDMA_DOORBELL_OFFSET) &&
+        (addr & (UDMA_HW_PAGE_SIZE - 1)) == UDMA_DOORBELL_OFFSET) {
+        
+        uint32_t local_jetty_id = ((addr & ~(UDMA_HW_PAGE_SIZE - 1)) - UDMA_JETTY_DSQE_OFFSET) / UDMA_HW_PAGE_SIZE;
+        /* Map local jetty space to global array: each entity gets 128 jetties */
+        uint32_t global_jetty_id = local_jetty_id + (entity_idx * 128);
+
+        if (global_jetty_id < UBC_MAX_JETTIES && ubc_dev->jetties[global_jetty_id].active) {
+            UBCJettyState *js = &ubc_dev->jetties[global_jetty_id];
+            qemu_log("ubc ERS1 doorbell: entity=%u jetty=%u new_pi=%u sq_ci=%u sq_depth=%u\n",
+                     entity_idx, global_jetty_id, (uint32_t)val, js->sq_ci, js->sq_depth);
+            js->sq_pi = (uint32_t)val;
+            ubc_process_sq(ubc_dev, js);
+            return;
+        }
+    }
+
+    /* ERS2 custom handling */
+    if (ers->idx == 2) {
         ubc_ers2_mmio_write(ubc_dev, addr, val, len);
+        return;
+    }
+
+    /* Standard storage fallback (only for non-routed accesses within bounds) */
+    if (!ers->storage || addr > ers->storage_size || len > ers->storage_size - addr) {
         return;
     }
 
@@ -3170,8 +3886,6 @@ static void ub_ers_region_write(void *opaque, hwaddr addr, uint64_t val, unsigne
         break;
     case sizeof(uint64_t):
         ub_set_quad(ers->storage + addr, val);
-        break;
-    default:
         break;
     }
 }
@@ -3195,16 +3909,23 @@ static void ub_bus_controller_init_ers_regions(UBDevice *dev)
         "ubc-ers1",
         "ubc-ers2",
     };
+    /*
     static const uint64_t ers_start_addr[UB_NUM_REGIONS] = {
         UBC_ERS0_SPACE_ADDR,
         UBC_ERS1_SPACE_ADDR,
         UBC_ERS2_SPACE_ADDR,
     };
+    */
     uint8_t i;
 
     for (i = 0; i < UB_NUM_REGIONS; i++) {
         typeof(ubc_dev->ers[0]) *ers = &ubc_dev->ers[i];
         uint64_t region_size = ers_size_pages[i] * UBC_ERS_PAGE_SIZE;
+
+        /* For ERS0, ERS1, and ERS2, expand size to cover all entity apertures (4MB per entity) */
+        if ((i == 0 || i == 1 || i == 2) && ubc_dev->entity_count > 1) {
+            region_size = (uint64_t)ubc_dev->entity_count * 0x400000ULL;
+        }
 
         ers->owner = ubc_dev;
         ers->idx = i;
@@ -3223,15 +3944,23 @@ static void ub_bus_controller_activate_ers_mappings(UBDevice *dev)
 {
     UbCfg1Basic *cfg1_basic;
     uint64_t emulated_offset;
-    static const uint64_t ers_ubba[UB_NUM_REGIONS] = {
-        UBC_ERS0_SPACE_ADDR,
-        UBC_ERS1_SPACE_ADDR,
-        UBC_ERS2_SPACE_ADDR,
-    };
+    uint64_t ers_base = ub_ers_phys_base();
+    uint64_t ers_ubba[UB_NUM_REGIONS];
     uint8_t i;
 
+    ers_ubba[0] = ers_base;
+    ers_ubba[1] = ers_base + 0x100000ULL;
+    ers_ubba[2] = ers_base + 0x200000ULL;
+
+    /* 
+     * Limit Addressing Capability: 
+     * Many platforms (like macOS) have issues mapping physical addresses 
+     * near the 64-bit boundary. Force guest to use lower memory for CMDQ/EVTQ.
+     */
     emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG1_BASIC_START, true);
     cfg1_basic = (UbCfg1Basic *)(dev->config + emulated_offset);
+    /* Set address width capability to 40 bits (instead of 64) */
+    *(uint32_t *)(dev->config + emulated_offset + 0x80) = 40; 
     cfg1_basic->dev_rs_access_en = 1;
 
     for (i = 0; i < UB_NUM_REGIONS; i++) {
@@ -3485,12 +4214,15 @@ static void ub_bus_controller_space_cfg1_init(UBDevice *ub_dev)
     cfg1_basic->ers_space_size[0] = UBC_ERS0_SPACE_SIZE;
     cfg1_basic->ers_space_size[1] = UBC_ERS1_SPACE_SIZE;
     cfg1_basic->ers_space_size[2] = UBC_ERS2_SPACE_SIZE;
-    cfg1_basic->ers_start_addr[0] = UBC_ERS0_SPACE_ADDR;
-    cfg1_basic->ers_start_addr[1] = UBC_ERS1_SPACE_ADDR;
-    cfg1_basic->ers_start_addr[2] = UBC_ERS2_SPACE_ADDR;
-    cfg1_basic->ers_ubba[0] = UBC_ERS0_SPACE_ADDR;
-    cfg1_basic->ers_ubba[1] = UBC_ERS1_SPACE_ADDR;
-    cfg1_basic->ers_ubba[2] = UBC_ERS2_SPACE_ADDR;
+    {
+        uint64_t ers_base = ub_ers_phys_base();
+        cfg1_basic->ers_start_addr[0] = ers_base;
+        cfg1_basic->ers_start_addr[1] = ers_base + 0x100000ULL;
+        cfg1_basic->ers_start_addr[2] = ers_base + 0x200000ULL;
+        cfg1_basic->ers_ubba[0] = ers_base;
+        cfg1_basic->ers_ubba[1] = ers_base + 0x100000ULL;
+        cfg1_basic->ers_ubba[2] = ers_base + 0x200000ULL;
+    }
     cfg1_basic->eid_upi_ten = UBC_EID_UPI_TEN_DEFAULT_VAL;
     cfg1_basic->class_code = UBC_CLASS_CODE;
     /*
@@ -3502,22 +4234,31 @@ static void ub_bus_controller_space_cfg1_init(UBDevice *ub_dev)
     *(uint32_t *)(cfg1_raw + 0x34) = UBC_ERS0_SPACE_SIZE;
     *(uint32_t *)(cfg1_raw + 0x38) = UBC_ERS1_SPACE_SIZE;
     *(uint32_t *)(cfg1_raw + 0x3c) = UBC_ERS2_SPACE_SIZE;
-    *(uint32_t *)(cfg1_raw + 0x40) = (uint32_t)(UBC_ERS0_SPACE_ADDR & UINT32_MAX);
-    *(uint32_t *)(cfg1_raw + 0x44) = (uint32_t)(UBC_ERS0_SPACE_ADDR >> 32);
-    *(uint32_t *)(cfg1_raw + 0x48) = (uint32_t)(UBC_ERS1_SPACE_ADDR & UINT32_MAX);
-    *(uint32_t *)(cfg1_raw + 0x4c) = (uint32_t)(UBC_ERS1_SPACE_ADDR >> 32);
-    *(uint32_t *)(cfg1_raw + 0x50) = (uint32_t)(UBC_ERS2_SPACE_ADDR & UINT32_MAX);
-    *(uint32_t *)(cfg1_raw + 0x54) = (uint32_t)(UBC_ERS2_SPACE_ADDR >> 32);
-    *(uint32_t *)(cfg1_raw + 0x58) = (uint32_t)(UBC_ERS0_SPACE_ADDR & UINT32_MAX);
-    *(uint32_t *)(cfg1_raw + 0x5c) = (uint32_t)(UBC_ERS0_SPACE_ADDR >> 32);
-    *(uint32_t *)(cfg1_raw + 0x60) = (uint32_t)(UBC_ERS1_SPACE_ADDR & UINT32_MAX);
-    *(uint32_t *)(cfg1_raw + 0x64) = (uint32_t)(UBC_ERS1_SPACE_ADDR >> 32);
-    *(uint32_t *)(cfg1_raw + 0x68) = (uint32_t)(UBC_ERS2_SPACE_ADDR & UINT32_MAX);
-    *(uint32_t *)(cfg1_raw + 0x6c) = (uint32_t)(UBC_ERS2_SPACE_ADDR >> 32);
+    {
+        uint64_t eb = ub_ers_phys_base();
+        /* ers_start_addr[0..2] at cfg1_raw+0x40 */
+        *(uint32_t *)(cfg1_raw + 0x40) = (uint32_t)(eb & UINT32_MAX);
+        *(uint32_t *)(cfg1_raw + 0x44) = (uint32_t)(eb >> 32);
+        *(uint32_t *)(cfg1_raw + 0x48) = (uint32_t)((eb + 0x100000ULL) & UINT32_MAX);
+        *(uint32_t *)(cfg1_raw + 0x4c) = (uint32_t)((eb + 0x100000ULL) >> 32);
+        *(uint32_t *)(cfg1_raw + 0x50) = (uint32_t)((eb + 0x200000ULL) & UINT32_MAX);
+        *(uint32_t *)(cfg1_raw + 0x54) = (uint32_t)((eb + 0x200000ULL) >> 32);
+        /* ers_ubba[0..2] at cfg1_raw+0x58 */
+        *(uint32_t *)(cfg1_raw + 0x58) = (uint32_t)(eb & UINT32_MAX);
+        *(uint32_t *)(cfg1_raw + 0x5c) = (uint32_t)(eb >> 32);
+        *(uint32_t *)(cfg1_raw + 0x60) = (uint32_t)((eb + 0x100000ULL) & UINT32_MAX);
+        *(uint32_t *)(cfg1_raw + 0x64) = (uint32_t)((eb + 0x100000ULL) >> 32);
+        *(uint32_t *)(cfg1_raw + 0x68) = (uint32_t)((eb + 0x200000ULL) & UINT32_MAX);
+        *(uint32_t *)(cfg1_raw + 0x6c) = (uint32_t)((eb + 0x200000ULL) >> 32);
+    }
     cfg1_basic->dev_rs_access_en = 1;
     *(uint32_t *)(cfg1_raw + 0xbc) = 1;
     *(uint32_t *)(cfg1_raw + 0x90) = UBC_EID_UPI_TEN_DEFAULT_VAL;
     *(uint32_t *)(cfg1_raw + 0xa4) = UBC_CLASS_CODE;
+    
+    /* LIMIT ADDRESS WIDTH: Set addr_width_cap (at offset 0x80 in CFG1) to 40 bits */
+    *(uint32_t *)(cfg1_raw + 0x80) = 40; 
+    
     cfg1_raw[0x04 + (CFG1_INT_CAP_INDEX / BITS_PER_BYTE)] |=
         1 << (CFG1_INT_CAP_INDEX % BITS_PER_BYTE);
     /* decoder cap */
@@ -3689,8 +4430,24 @@ static int ub_bus_instance_process(BusControllerDev *ubc_dev, Error **errp)
     int lock_fd;
 
     if (ub_guid_is_none(&ubc_dev->bus_instance_guid)) {
-        error_setg(errp, "ubc bus instance guid is required");
-        return -1;
+        const char *node_id = g_getenv("UB_FM_NODE_ID");
+        if (node_id) {
+            /* Generate a stable GUID from node_id */
+            uint32_t hash = g_str_hash(node_id);
+            ubc_dev->bus_instance_guid.seq_num = hash;
+            ubc_dev->bus_instance_guid.vendor = 0xCC08;
+            ubc_dev->bus_instance_guid.device_id = 0x0541;
+            ubc_dev->bus_instance_guid.version = 0;
+            ubc_dev->bus_instance_guid.type = UB_TYPE_BUS_INSTANCE;
+            
+            char guid_str[UB_DEV_GUID_STRING_LENGTH + 1];
+            ub_device_get_str_from_guid(&ubc_dev->bus_instance_guid, guid_str, sizeof(guid_str));
+            qemu_log("ubc: auto-generated bus_instance_guid from node_id %s: %s\n",
+                     node_id, guid_str);
+        } else {
+            error_setg(errp, "ubc bus instance guid is required (or UB_FM_NODE_ID)");
+            return -1;
+        }
     }
 
     lock_fd = ub_bus_instance_guid_lock(&ubc_dev->bus_instance_guid);
@@ -3712,27 +4469,44 @@ void ub_entity_table_init(BusControllerDev *ubc_dev)
         UBEntityDesc *e = &ubc_dev->entities[i];
         e->entity_idx = i;
         e->device_id = (i == 0) ? 0x0541 : 0x0542;
-        e->state = UB_ENTITY_STATE_PRESENT;
+        /* entity_idx=0 (controller) is statically enumerated by the guest,
+         * so it starts PRESENT.  entity_idx>=1 must be injected via msgq
+         * by the entity_plan diff logic, so they start ABSENT. */
+        e->state = (i == 0) ? UB_ENTITY_STATE_PRESENT : UB_ENTITY_STATE_ABSENT;
         e->upi = 1;
-        e->cna = ubc_dev->parent.cna ? ubc_dev->parent.cna : (0x200 + i);
-        e->eid[0] = (i == 0) ? ubc_dev->parent.eid : (0x10001 + i - 1);
-        e->ueid[0] = (i == 0) ? ubc_dev->parent.eid : (0x10001 + i - 1);
-        e->guid[0] = (uint32_t)ubc_dev->parent.guid.seq_num;
-        e->guid[1] = 0;
-        e->guid[2] = (ubc_dev->parent.guid.rsv << 8) |
-                     (ubc_dev->parent.guid.type) |
-                     (ubc_dev->parent.guid.version << 4) |
-                     (e->device_id << 16);
-        e->guid[3] = ubc_dev->parent.guid.vendor;
+        e->cna = ubc_dev->parent.cna ? (ubc_dev->parent.cna + i) : (0x200 + i);
+        e->eid[0] = ubc_dev->parent.eid + i;
+        e->ueid[0] = ubc_dev->parent.eid;
+        e->guid[0] = (uint32_t)ubc_dev->parent.guid.seq_num + i;
+        e->guid[1] = (uint32_t)((ubc_dev->parent.guid.seq_num + i) >> 32);
+        /*
+         * GUID DW2 layout (matches guest struct ub_guid bits):
+         *   bits 28-31: version (4 bits)
+         *   bits 24-27: type (4 bits)
+         *   bits 0-23:  reserved (24 bits)
+         * GUID DW3 layout:
+         *   bits 0-15:  vendor
+         *   bits 16-31: device_id
+         *
+         * For FE entities, type must be UB_GUID_TYPE_BUS_CONTROLLER (=1)
+         * because the guest's ub_entity_reg_check expects guid type ==
+         * UB_TYPE_CONTROLLER (== 1).  The parent IBUS_CONTROLLER (type=2)
+         * is only for the bus controller entity itself (entity_idx=0).
+         */
+        e->guid[2] = ((uint32_t)ubc_dev->parent.guid.version << 28) |
+                     ((uint32_t)UB_GUID_TYPE_BUS_CONTROLLER << 24) |
+                     ((uint32_t)ubc_dev->parent.guid.rsv);
+        e->guid[3] = ((uint32_t)e->device_id << 16) |
+                     (uint32_t)ubc_dev->parent.guid.vendor;
         e->ers[0].ss = UBC_ERS0_SPACE_SIZE;
-        e->ers[0].sa_l = (uint32_t)(UBC_ERS0_SPACE_ADDR + i * 0x200000);
-        e->ers[0].sa_h = 0;
+        e->ers[0].sa_l = (uint32_t)((ub_ers_phys_base() + i * 0x400000ULL) & UINT32_MAX);
+        e->ers[0].sa_h = (uint32_t)((ub_ers_phys_base() + i * 0x400000ULL) >> 32);
         e->ers[1].ss = UBC_ERS1_SPACE_SIZE;
-        e->ers[1].sa_l = (uint32_t)(UBC_ERS1_SPACE_ADDR + i * 0x200000);
-        e->ers[1].sa_h = 0;
+        e->ers[1].sa_l = (uint32_t)((ub_ers_phys_base() + 0x100000ULL + i * 0x400000ULL) & UINT32_MAX);
+        e->ers[1].sa_h = (uint32_t)((ub_ers_phys_base() + 0x100000ULL + i * 0x400000ULL) >> 32);
         e->ers[2].ss = UBC_ERS2_SPACE_SIZE;
-        e->ers[2].sa_l = (uint32_t)(UBC_ERS2_SPACE_ADDR + i * 0x200000);
-        e->ers[2].sa_h = 0;
+        e->ers[2].sa_l = (uint32_t)((ub_ers_phys_base() + 0x200000ULL + i * 0x400000ULL) & UINT32_MAX);
+        e->ers[2].sa_h = (uint32_t)((ub_ers_phys_base() + 0x200000ULL + i * 0x400000ULL) >> 32);
         qemu_log("entity_table_init: [%u] device_id=0x%04x eid=0x%x ueid=0x%x "
                  "cna=0x%x upi=%u state=%s\n",
                  i, e->device_id, e->eid[0], e->ueid[0], e->cna, e->upi,
@@ -3784,6 +4558,11 @@ void ub_entity_cfg_spaces_init(BusControllerDev *ubc_dev)
         uint32_t *eid_ptr = (uint32_t *)(space->cfg_base + emulated_offset);
         *eid_ptr = cpu_to_le32(e->eid[0]);
 
+        /* 修改 UEID (device UEID — used by UMMU for address translation) */
+        emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_DEV_UEID_OFFSET, true);
+        uint32_t *ueid_ptr = (uint32_t *)(space->cfg_base + emulated_offset);
+        *ueid_ptr = cpu_to_le32(e->ueid[0]);
+
         /* 修改 UPICNA */
         emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_UPI_OFFSET, true);
         uint32_t *upi_cna_ptr = (uint32_t *)(space->cfg_base + emulated_offset);
@@ -3794,8 +4573,46 @@ void ub_entity_cfg_spaces_init(BusControllerDev *ubc_dev)
         uint32_t *cna_ptr = (uint32_t *)(space->cfg_base + emulated_offset);
         *cna_ptr = cpu_to_le32(e->cna);
 
-        qemu_log("entity_cfg_spaces_init: [%u] eid=%#x cna=%#x upi=%u cfg_size=%u\n",
-                 i, space->eid, space->cna, space->upi, space->cfg_size);
+        /* FE entity (entity_idx > 0) config space overrides.
+         * The controller config (entity_idx=0) is correct as-is;
+         * FE entities need different GUID, class_code to pass guest
+         * validation in ub_setup_ent + ub_entity_type_init. */
+        if (i > 0) {
+            /* Override GUID — must match what UB_DEV_REG carries */
+            emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_BASIC_GUID_START, true);
+            memcpy(space->cfg_base + emulated_offset, e->guid, sizeof(e->guid));
+
+            /* Override DeviceID and VendorID in CFG0 (DW0) */
+            emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG0_BASIC_START, true);
+            stl_le_p(space->cfg_base + emulated_offset, (e->device_id << 16) | 0xCC08);
+
+            /* Override entity_idx and type in CFG0 (DW1) 
+             * Layout: [31:24] type | [23:16] rsvd | [15:0] entity_idx
+             * type=1 (PERIPHERAL) for all entities > 0
+             */
+            stl_le_p(space->cfg_base + emulated_offset + 4, (1 << 24) | (i & 0xFFFF));
+
+            /* Override class_code in CFG1 (0x02 = UB_BASE_CODE_NETWORK) */
+            emulated_offset = ub_cfg_offset_to_emulated_offset(UB_CFG1_BASIC_START, true);
+            stl_le_p(space->cfg_base + emulated_offset + 0xa4, 0x0002);
+
+            /* Enable device and bus access for this entity */
+            *(space->cfg_base + emulated_offset + 0xb8) = 1; /* bus_access_en */
+            *(space->cfg_base + emulated_offset + 0xbc) = 1; /* dev_rs_access_en */
+
+            /* Override ERS base addresses in CFG1 for this entity's view */
+            uint64_t entity_ers_base = ub_ers_phys_base() + (uint64_t)i * 0x400000ULL;
+            for (int r = 0; r < 3; r++) {
+                uint64_t reg_off = emulated_offset + offsetof(UbCfg1Basic, ers_ubba) + r * 8;
+                uint64_t r_addr = entity_ers_base + r * 0x100000ULL;
+                stq_le_p(space->cfg_base + reg_off, r_addr);
+            }
+        }
+
+        qemu_log("entity_cfg_spaces_init: [%u] eid=%#x cna=%#x upi=%u cfg_size=%u"
+                 " guid=[%08x %08x %08x %08x]\n",
+                 i, space->eid, space->cna, space->upi, space->cfg_size,
+                 e->guid[0], e->guid[1], e->guid[2], e->guid[3]);
     }
 
     qemu_log("entity_cfg_spaces_init: %u entity cfg spaces initialized\n",
@@ -3818,8 +4635,9 @@ void ub_entity_cfg_spaces_cleanup(BusControllerDev *ubc_dev)
 
 int ub_inject_entity_reg(BusControllerState *s, const UBEntityDesc *e, Error **errp)
 {
+    static uint16_t msn_seed = 1;
     BusControllerDev *ubc_dev = s->ubc_dev;
-    UBPoolEntityRegMsg *reg_msg;
+    uint32_t *dw;
     uint8_t *msg_buf;
     uint32_t msg_size;
     uint32_t pi;
@@ -3830,36 +4648,60 @@ int ub_inject_entity_reg(BusControllerState *s, const UBEntityDesc *e, Error **e
         return -1;
     }
 
-    if (!ubc_dev) {
-        error_setg(errp, "ubc_dev not initialized");
-        return -1;
-    }
-
-    msg_size = MSG_PKT_HEADER_SIZE + UB_POOL_ENTITY_REG_SIZE;
+    /* Total size: 32 (header) + 92 (payload) = 124 */
+    msg_size = 124;
     msg_buf = g_malloc0(msg_size);
 
     /* 构造消息头 */
     MsgPktHeader *header = (MsgPktHeader *)msg_buf;
-    header->msgetah.msg_code = UB_MSG_CODE_POOL;
-    header->msgetah.sub_msg_code = UB_DEV_REG;
-    header->msgetah.code = MSG_RSP;
-    header->msgetah.rsp_status = UB_MSG_RSP_SUCCESS;
-    header->msgetah.plen = UB_POOL_ENTITY_REG_SIZE;
+    header->ta_opcode = TAH_OPCODE_MSG;
+    
+    /* Routing info */
+    header->nth.dcna = cpu_to_le16(ubc_dev->parent.cna & 0xFFFF);
+    header->nth.scna = header->nth.dcna;
+    header->nth.mgmt = 1;
+    
+    /* EID info: SEID is typically controller's EID for local management cmds */
+    uint32_t bus_eid = ubc_dev->parent.eid;
+    header->seid_l = bus_eid & 0xFFF;
+    header->seid_h = (bus_eid >> 12) & 0xFF;
+    header->deid = bus_eid & 0xFFFFF;
 
-    /* 构造 entity_base_info */
-    reg_msg = (UBPoolEntityRegMsg *)(msg_buf + MSG_PKT_HEADER_SIZE);
-    reg_msg->base.entity_idx = e->entity_idx;
-    reg_msg->base.upi = e->upi;
-    reg_msg->base.cna = e->cna;
-    memcpy(reg_msg->base.eid, e->eid, sizeof(e->eid));
-    memcpy(reg_msg->base.ueid, e->ueid, sizeof(e->ueid));
-    memcpy(reg_msg->base.guid, e->guid, sizeof(e->guid));
+    /* 
+     * Manually construct DW7 (MsgExtendedHeader) to match guest bitfields precisely:
+     * DW7 layout: [code:8 | rsp_status:8 | rsvd:4 | plen:12]
+     * In UB, plen is payload size (excluding header). So 92 bytes.
+     */
+    uint32_t code = (MSG_REQ << 7) | (UB_MSG_CODE_POOL << 4) | UB_DEV_REG;
+    uint32_t dw7 = (code << 24) | (92 & 0xFFF); 
+    header->msgetah_dw = cpu_to_le32(dw7);
 
-    /* 构造 entity_rs_info */
-    for (uint32_t i = 0; i < UB_ENTITY_MAX_RES_NUM; i++) {
-        reg_msg->ers[i].ss = e->ers[i].ss;
-        reg_msg->ers[i].sa_l = e->ers[i].sa_l;
-        reg_msg->ers[i].sa_h = e->ers[i].sa_h;
+    /* 
+     * Correct payload offset: MSG_PKT_HEADER_SIZE is 32 in the guest kernel.
+     * DW0 of payload starts at msg_buf + 32.
+     */
+    dw = (uint32_t *)(msg_buf + 32);
+
+    /* DW0: entity_idx[15:0], upi[30:16] */
+    dw[0] = cpu_to_le32((e->entity_idx & 0xFFFF) | ((e->upi & 0x7FFF) << 16));
+    
+    /* DW1-4: EID */
+    for (int i = 0; i < 4; i++) dw[1+i] = cpu_to_le32(e->eid[i]);
+    
+    /* DW5-8: GUID */
+    for (int i = 0; i < 4; i++) dw[5+i] = cpu_to_le32(e->guid[i]);
+    
+    /* DW9: CNA[23:0] */
+    dw[9] = cpu_to_le32(e->cna & 0xFFFFFF);
+    
+    /* DW10-13: UEID */
+    for (int i = 0; i < 4; i++) dw[10+i] = cpu_to_le32(e->ueid[i]);
+
+    /* DW14-22: ERS (3 entries * 3 DW each) */
+    for (int i = 0; i < 3; i++) {
+        dw[14 + i*3] = cpu_to_le32(e->ers[i].ss);
+        dw[15 + i*3] = cpu_to_le32(e->ers[i].sa_l);
+        dw[16 + i*3] = cpu_to_le32(e->ers[i].sa_h);
     }
 
     /* 注入到 RQ */
@@ -3871,11 +4713,16 @@ int ub_inject_entity_reg(BusControllerState *s, const UBEntityDesc *e, Error **e
         return -1;
     }
 
-    /* 填充 CQE */
+    /* 填充 CQE — matches cfg_cpl_notify pattern */
     memset(&cqe, 0, sizeof(cqe));
-    cqe.status = CQE_SUCCESS;
-    cqe.rq_pi = pi;
+    cqe.task_type = PROTOCOL_MSG;
+    cqe.type = MSG_REQ;
+    cqe.msg_code = UB_MSG_CODE_POOL;
+    cqe.sub_msg_code = UB_DEV_REG;
     cqe.p_len = msg_size;
+    cqe.msn = msn_seed++;
+    cqe.rq_pi = pi;
+    cqe.status = CQE_SUCCESS;
 
     if (fill_cq(s, &cqe) == UINT32_MAX) {
         error_setg(errp, "fill_cq failed");
@@ -3890,6 +4737,7 @@ int ub_inject_entity_reg(BusControllerState *s, const UBEntityDesc *e, Error **e
 
 int ub_inject_entity_rls(BusControllerState *s, uint32_t eid, uint8_t reason, Error **errp)
 {
+    static uint16_t msn_seed = 1;
     BusControllerDev *ubc_dev = s->ubc_dev;
     UBPoolEntityRlsMsg *rls_msg;
     uint8_t *msg_buf;
@@ -3910,12 +4758,12 @@ int ub_inject_entity_rls(BusControllerState *s, uint32_t eid, uint8_t reason, Er
     msg_size = MSG_PKT_HEADER_SIZE + UB_POOL_ENTITY_RLS_SIZE;
     msg_buf = g_malloc0(msg_size);
 
-    /* 构造消息头 */
+    /* 构造消息头 — CFM->guest request, matches cfg_cpl_notify pattern */
     MsgPktHeader *header = (MsgPktHeader *)msg_buf;
+    header->ta_opcode = TAH_OPCODE_MSG;
+    header->msgetah.type = MSG_REQ;
     header->msgetah.msg_code = UB_MSG_CODE_POOL;
     header->msgetah.sub_msg_code = UB_DEV_RLS;
-    header->msgetah.code = MSG_RSP;
-    header->msgetah.rsp_status = UB_MSG_RSP_SUCCESS;
     header->msgetah.plen = UB_POOL_ENTITY_RLS_SIZE;
 
     /* 构造 entity_rls_msg_pld */
@@ -3936,11 +4784,16 @@ int ub_inject_entity_rls(BusControllerState *s, uint32_t eid, uint8_t reason, Er
         return -1;
     }
 
-    /* 填充 CQE */
+    /* 填充 CQE — matches cfg_cpl_notify pattern */
     memset(&cqe, 0, sizeof(cqe));
-    cqe.status = CQE_SUCCESS;
-    cqe.rq_pi = pi;
+    cqe.task_type = PROTOCOL_MSG;
+    cqe.type = MSG_REQ;
+    cqe.msg_code = UB_MSG_CODE_POOL;
+    cqe.sub_msg_code = UB_DEV_RLS;
     cqe.p_len = msg_size;
+    cqe.msn = msn_seed++;
+    cqe.rq_pi = pi;
+    cqe.status = CQE_SUCCESS;
 
     if (fill_cq(s, &cqe) == UINT32_MAX) {
         error_setg(errp, "fill_cq failed");

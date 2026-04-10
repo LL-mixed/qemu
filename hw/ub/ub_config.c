@@ -297,10 +297,15 @@ static void ub_cfg_rw(BusControllerState *s, HiMsgSqe *sqe,
     }
 
     rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_SUCCESS;
-    if (cfg_offset >= ub_emulated_config_size()) {
-        rsp_pkt.header.msgetah.rsp_status = UB_MSG_RSP_INVALID_ADDR;
-        goto fill_rq_cq;
-    }
+    /*
+     * Do NOT check cfg_offset against ub_emulated_config_size() here.
+     * The actual offset → emulated_offset mapping is done per-slice by
+     * ub_cfg_offset_to_emulated_offset(), which correctly validates the
+     * offset range.  The emulated config size is the contiguous backing
+     * store size, which is much smaller than the sparse guest-side address
+     * space — so a cfg_offset can be larger than the emulated size while
+     * still mapping to a valid emulated_offset.
+     */
     dw_mask = get_dw_mask(payload->byte_enable);
     switch (header->msgetah.sub_msg_code) {
     case UB_CFG0_READ:

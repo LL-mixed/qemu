@@ -112,4 +112,6 @@ int ub_fm_load_entity_plan_from_file(const char *path, Error **errp);
 int ub_fm_apply_entity_plan(Error **errp);
 int ub_fm_reload_entity_plan(const char *path, Error **errp);
 void ub_fm_entity_plan_free(UBFMEntityPlan *plan);
+void ub_fm_entity_plan_refresh_start(const char *path);
+void ub_fm_try_inject_pending_entities(void);
 #endif
