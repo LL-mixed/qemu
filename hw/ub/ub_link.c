@@ -485,6 +485,31 @@ int ub_link_poll_kick(UBLinkState *s)
 
 int ub_link_kick_remote(UBLinkState *s, Error **errp)
 {
+    UBLinkEndpointDesc *local = NULL;
+    UBLinkEndpointDesc *remote = NULL;
+    g_autofree char *path = NULL;
+    int fd;
+
+    if (!s || !s->ioc) {
+        return 0;
+    }
+
+    /* Write a kick file on the remote endpoint's shared directory.
+     * The peer QEMU will detect this file in ub_link_poll_kick
+     * and process incoming data from the socket. */
+    ub_link_select_endpoints(s, &local, &remote);
+    if (!remote || !remote->device_id) {
+        return 0;
+    }
+
+    path = ub_link_kick_path(remote->device_id, remote->port_idx, false);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        const char marker[] = "1";
+        (void)write(fd, marker, sizeof(marker));
+        close(fd);
+    }
+
     return 0;
 }
 

@@ -32,6 +32,11 @@ static UBFMTopologyPopulateFn ub_fm_topology_populate;
 static void *ub_fm_topology_populate_opaque;
 static GPtrArray *ub_fm_snapshot_source_links;
 static QEMUTimer *ub_fm_pending_refresh_timer;
+static QEMUTimer *ub_fm_remote_link_retry_timer;
+static QEMUTimer *ub_fm_rx_poll_timer;
+
+#define UB_FM_REMOTE_LINK_RETRY_MS 2000  /* fast retry for remote endpoint .ini */
+#define UB_FM_RX_POLL_MS 500             /* poll connected sockets for incoming data */
 
 /* Entity plan dynamic refresh support */
 static QEMUTimer *ub_fm_entity_plan_refresh_timer;
@@ -173,7 +178,8 @@ static bool ub_fm_desc_matches_device(UBFMTopologyLinkDesc *desc, UBDevice *dev)
             !strcmp(desc->b.device_id, dev->qdev.id));
 }
 
-static void ub_fm_configure_remote_links(void);
+static bool ub_fm_configure_remote_links(void);
+static void ub_fm_rx_poll_start(void);
 
 void ub_fm_controller_register(BusControllerState *s)
 {
@@ -191,21 +197,28 @@ void ub_fm_controller_register(BusControllerState *s)
              s->ubc_dev->parent.guid.device_id,
              s->ubc_dev->parent.port.port_num);
 
+    /* Start rx poll early - it will detect when sockets connect */
+    ub_fm_rx_poll_start();
+
     if (ub_fm_refresh_topology(&local_err) < 0) {
         error_report_err(local_err);
     }
 }
 
-/* Configure remote links for all active links */
-static void ub_fm_configure_remote_links(void)
+/* Configure remote links for all active links.
+ * Returns true if all remote links were configured, false if some are
+ * still pending (remote .ini file not yet written by peer node). */
+static bool ub_fm_configure_remote_links(void)
 {
     guint i;
+
+    bool all_ok = true;
 
     qemu_log("ub_fm: configure_remote_links: ub_fm_active_links=%p len=%u\n",
              ub_fm_active_links, ub_fm_active_links ? ub_fm_active_links->len : 0);
 
     if (!ub_fm_active_links) {
-        return;
+        return true;
     }
 
     for (i = 0; i < ub_fm_active_links->len; i++) {
@@ -272,54 +285,51 @@ static void ub_fm_configure_remote_links(void)
         if (!g_key_file_load_from_file(keyfile, remote_path, G_KEY_FILE_NONE, &gerr)) {
             qemu_log("ub_fm: failed to load remote endpoint info from %s: %s\n",
                      remote_path, gerr ? gerr->message : "unknown");
+            all_ok = false;
             continue;
         }
         qemu_log("ub_fm: g_key_file_load_from_file succeeded\n");
 
         /* Get remote GUID */
-        fprintf(stderr, "ub_fm: about to call g_key_file_get_string\n"); fflush(stderr);
         remote_guid_str = g_key_file_get_string(keyfile, "endpoint", "guid", &gerr);
-        fprintf(stderr, "ub_fm: g_key_file_get_string returned %p, gerr=%p\n", remote_guid_str, gerr); fflush(stderr);
         if (!remote_guid_str || gerr) {
             qemu_log("ub_fm: remote endpoint %s missing guid\n", remote_path);
             continue;
         }
-        fprintf(stderr, "ub_fm: remote_guid_str=%s\n", remote_guid_str); fflush(stderr);
 
         /* Parse GUID string */
-        fprintf(stderr, "ub_fm: about to call ub_device_get_guid_from_str\n"); fflush(stderr);
         if (!ub_device_get_guid_from_str(&remote_guid, remote_guid_str)) {
             qemu_log("ub_fm: failed to parse remote guid %s\n", remote_guid_str);
             continue;
         }
-        fprintf(stderr, "ub_fm: ub_device_get_guid_from_str succeeded\n"); fflush(stderr);
 
         /* Configure device with remote endpoint info */
-        fprintf(stderr, "ub_fm: about to call ub_connect_device_port_remote\n"); fflush(stderr);
         if (ub_connect_device_port_remote(local_dev, local->port_idx,
                                            remote->device_id, &remote_guid,
                                            remote->port_idx, NULL) == 0) {
-            
+
             /* SYNC REMOTE CNA: Crucial for data plane addressing */
             uint64_t remote_cna = g_key_file_get_uint64(keyfile, "endpoint", "primary_cna", NULL);
             if (remote_cna) {
                 NeighborInfo *ni = &local_dev->port.neighbors[local->port_idx];
                 ni->remote_primary_cna = (uint32_t)remote_cna;
                 ni->remote_primary_cna_valid = true;
-                qemu_log("ub_fm: synced remote cna 0x%x for link %s:%u\n", 
+                qemu_log("ub_fm: synced remote cna 0x%x for link %s:%u\n",
                          (uint32_t)remote_cna, local->device_id, local->port_idx);
             }
 
             char guid_str[UB_DEV_GUID_STRING_LENGTH + 1];
             ub_device_get_str_from_guid(&remote_guid, guid_str, sizeof(guid_str));
-            fprintf(stderr, "ub_fm: configured remote link %s:%u -> %s:%u guid=%s\n",
+            qemu_log("ub_fm: configured remote link %s:%u -> %s:%u guid=%s\n",
                      local->device_id, local->port_idx,
                      remote->device_id, remote->port_idx,
-                     guid_str); fflush(stderr);
+                     guid_str);
         } else {
-            fprintf(stderr, "ub_fm: ub_connect_device_port_remote failed\n"); fflush(stderr);
+            qemu_log("ub_fm: ub_connect_device_port_remote failed for %s:%u\n",
+                     local->device_id, local->port_idx);
         }
     }
+    return all_ok;
 }
 
 void ub_fm_controller_unregister(BusControllerState *s)
@@ -787,6 +797,17 @@ static void ub_fm_pending_refresh_cb(void *opaque)
         error_report_err(local_err);
     }
 
+    /* Ensure rx poll is running for any connected links */
+    if (ub_fm_active_links) {
+        for (gsize li = 0; li < ub_fm_active_links->len; li++) {
+            UBFMManagedLink *ml = g_ptr_array_index(ub_fm_active_links, li);
+            if (ml->runtime && ml->runtime->ioc) {
+                ub_fm_rx_poll_start();
+                break;
+            }
+        }
+    }
+
     /* Retry entity plan injection if pending entities exist */
     if (ub_fm_current_entity_plan && ub_fm_registered_ubc) {
         Error *plan_err = NULL;
@@ -826,6 +847,108 @@ static void ub_fm_pending_refresh_cb(void *opaque)
     ub_fm_schedule_pending_refresh(has_pending_links || has_pending_entities);
 }
 
+static void ub_fm_remote_link_retry_cb(void *opaque)
+{
+    bool still_pending = !ub_fm_configure_remote_links();
+    if (still_pending) {
+        qemu_log("ub_fm: remote link config still pending, scheduling retry\n");
+        if (!ub_fm_remote_link_retry_timer) {
+            ub_fm_remote_link_retry_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                                         ub_fm_remote_link_retry_cb,
+                                                         NULL);
+        }
+        timer_mod(ub_fm_remote_link_retry_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + UB_FM_REMOTE_LINK_RETRY_MS);
+    } else {
+        qemu_log("ub_fm: remote link config completed\n");
+        /* Remote links now configured — reconcile fabric config + publish */
+        ub_fm_reconcile_local_fabric_config();
+        if (ub_fm_remote_link_retry_timer) {
+            timer_del(ub_fm_remote_link_retry_timer);
+        }
+        /* Start rx poll now that links have connected sockets */
+        if (ub_fm_active_links) {
+            guint j;
+            for (j = 0; j < ub_fm_active_links->len; j++) {
+                UBFMManagedLink *lk = g_ptr_array_index(ub_fm_active_links, j);
+                if (lk->runtime && lk->runtime->ioc) {
+                    ub_fm_rx_poll_start();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static void ub_fm_schedule_remote_link_retry(void)
+{
+    if (!ub_fm_remote_link_retry_timer) {
+        ub_fm_remote_link_retry_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                                     ub_fm_remote_link_retry_cb,
+                                                     NULL);
+    }
+    timer_mod(ub_fm_remote_link_retry_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + UB_FM_REMOTE_LINK_RETRY_MS);
+    qemu_log("ub_fm: scheduled remote link retry in %dms\n", UB_FM_REMOTE_LINK_RETRY_MS);
+}
+
+/* Fast poll for incoming data on connected ub_link sockets.
+ * This timer runs at 500ms intervals to read any URMA data that
+ * arrived from the peer QEMU without waiting for the slow 60s
+ * topology refresh timer. */
+static void ub_fm_rx_poll_cb(void *opaque)
+{
+    guint i;
+
+    if (!ub_fm_active_links) {
+        ub_fm_rx_poll_start();
+        return;
+    }
+
+    for (i = 0; i < ub_fm_active_links->len; i++) {
+        UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+        UBDevice *dev = NULL;
+
+        if (!link->runtime || !link->runtime->ioc) {
+            continue;
+        }
+
+        /* Use registered rx_cb if available, otherwise set it up */
+        if (!link->runtime->rx_cb) {
+            if (link->runtime->a.device) {
+                dev = link->runtime->a.device;
+            } else if (link->runtime->b.device) {
+                dev = link->runtime->b.device;
+            }
+            if (dev && object_dynamic_cast(OBJECT(dev), TYPE_BUS_CONTROLLER_DEV)) {
+                BusControllerState *ubc = container_of_ubbus(
+                    UB_BUS(qdev_get_parent_bus(DEVICE(dev))));
+                link->runtime->rx_cb =
+                    (void (*)(void *, UBLinkState *))ub_link_process_incoming_message;
+                link->runtime->rx_cb_opaque = ubc;
+            }
+        }
+
+        if (link->runtime->rx_cb) {
+            link->runtime->rx_cb(link->runtime->rx_cb_opaque, link->runtime);
+        }
+    }
+
+    /* Reschedule the poll timer */
+    ub_fm_rx_poll_start();
+}
+
+static void ub_fm_rx_poll_start(void)
+{
+    if (!ub_fm_rx_poll_timer) {
+        ub_fm_rx_poll_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                            ub_fm_rx_poll_cb, NULL);
+    }
+    timer_mod(ub_fm_rx_poll_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + UB_FM_RX_POLL_MS);
+    fprintf(stderr, "ub_fm: rx_poll_start scheduled\n"); fflush(stderr);
+}
+
 static void ub_fm_schedule_pending_refresh(bool needed)
 {
     if (!ub_fm_pending_refresh_timer) {
@@ -838,6 +961,10 @@ static void ub_fm_schedule_pending_refresh(bool needed)
             needed, (void *)ub_fm_pending_refresh_timer);
     fflush(stderr);
     if (needed) {
+        /*
+         * Keep the refresh cadence short so socket-backed link traffic
+         * continues to be drained during guest demo handshakes.
+         */
         timer_mod(ub_fm_pending_refresh_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 500);
     } else {
@@ -1278,10 +1405,25 @@ int ub_fm_apply_declared_topology(Error **errp)
     }
 
     /* Configure remote links after topology is applied */
-    ub_fm_configure_remote_links();
+    if (!ub_fm_configure_remote_links()) {
+        /* Peer endpoint .ini files not yet written - schedule fast retry */
+        ub_fm_schedule_remote_link_retry();
+    }
 
     ub_fm_reconcile_local_fabric_config();
     ub_fm_schedule_pending_refresh(has_pending || ub_fm_has_pending_links());
+
+    /* Start fast rx poll whenever there are connected sockets */
+    if (ub_fm_active_links) {
+        for (i = 0; i < ub_fm_active_links->len; i++) {
+            UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+            if (link->runtime && link->runtime->ioc) {
+                ub_fm_rx_poll_start();
+                break;
+            }
+        }
+    }
+
     return 0;
 }
 
