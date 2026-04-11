@@ -100,6 +100,8 @@ static const char *const ummu_event_type_strings[EVT_MAX] = {
 };
 
 QLIST_HEAD(, UMMUState) ub_umms;
+static bool g_dma_tid_override_valid;
+static uint32_t g_dma_tid_override;
 UMMUState *ummu_find_by_bus_num(uint8_t bus_num)
 {
     UMMUState *ummu;
@@ -109,6 +111,25 @@ UMMUState *ummu_find_by_bus_num(uint8_t bus_num)
         }
     }
     return NULL;
+}
+
+UMMUTidOverrideScope ummu_dma_tid_override_enter(UMMUState *ummu, uint32_t tid)
+{
+    UMMUTidOverrideScope scope = { 0 };
+
+    (void)ummu;
+    scope.valid = g_dma_tid_override_valid;
+    scope.tid = g_dma_tid_override;
+    g_dma_tid_override_valid = true;
+    g_dma_tid_override = tid;
+    return scope;
+}
+
+void ummu_dma_tid_override_leave(UMMUState *ummu, UMMUTidOverrideScope scope)
+{
+    (void)ummu;
+    g_dma_tid_override_valid = scope.valid;
+    g_dma_tid_override = scope.tid;
 }
 
 /* Forward declarations for IOTLB invalidation */
@@ -2278,7 +2299,13 @@ static int ummu_tect_parse_sparse_table(UMMUDevice *ummu_dev, UMMUTransCfg *cfg,
     TECTE tecte;
     TCTE tcte;
     uint32_t tecte_tag;
-    uint32_t tid = ub_dev_get_token_id(ummu_dev->udev);
+    uint32_t tid;
+
+    if (g_dma_tid_override_valid) {
+        tid = g_dma_tid_override;
+    } else {
+        tid = ub_dev_get_token_id(ummu_dev->udev);
+    }
 
     tecte_tag = ummu_get_tecte_tag_by_dest_eid(ummu, dest_eid);
     if (tecte_tag == UINT32_MAX) {
@@ -2404,6 +2431,21 @@ static UMMUTransCfg *ummu_get_config(UMMUDevice *ummu_dev, UMMUEventInfo *event)
     }
 
     return cfg;
+}
+
+static UMMUTransCfg *ummu_get_config_for_translate(UMMUDevice *ummu_dev,
+                                                   UMMUEventInfo *event,
+                                                   UMMUTransCfg *override_cfg)
+{
+    if (g_dma_tid_override_valid) {
+        memset(override_cfg, 0, sizeof(*override_cfg));
+        if (!ummu_decode_config(ummu_dev, override_cfg, event)) {
+            return override_cfg;
+        }
+        return NULL;
+    }
+
+    return ummu_get_config(ummu_dev, event);
 }
 
 static int get_pte(dma_addr_t baseaddr, uint32_t index, uint64_t *pte)
@@ -2638,6 +2680,7 @@ static IOMMUTLBEntry ummu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
 {
     UMMUDevice *ummu_dev = container_of(mr, UMMUDevice, iommu);
     UMMUTransCfg *cfg = NULL;
+    UMMUTransCfg override_cfg = { 0 };
     IOMMUTLBEntry entry = {
         .target_as = &address_space_memory,
         .iova = addr,
@@ -2667,7 +2710,7 @@ static IOMMUTLBEntry ummu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
      * use it regardless of the enable bit.  Only fall back to the bypass
      * when no config is available.
      */
-    cfg = ummu_get_config(ummu_dev, &event);
+    cfg = ummu_get_config_for_translate(ummu_dev, &event, &override_cfg);
     if (cfg) {
         fprintf(stderr, "ummu_translate: dev=%s addr=%#llx cfg found st_mode=%u\n",
                  ummu_dev->udev->qdev.id ? ummu_dev->udev->qdev.id : "?",
@@ -2712,7 +2755,7 @@ static IOMMUTLBEntry ummu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
     }
 
     /* UMMU enabled but no cached config — retry lookup */
-    cfg = ummu_get_config(ummu_dev, &event);
+    cfg = ummu_get_config_for_translate(ummu_dev, &event, &override_cfg);
     if (!cfg) {
         goto epilogue;
     }

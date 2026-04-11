@@ -67,6 +67,11 @@ typedef struct UMMUEventQueue {
     bool event_que_int_en;
 } UMMUEventQueue;
 
+typedef struct UMMUTidOverrideScope {
+    bool valid;
+    uint32_t tid;
+} UMMUTidOverrideScope;
+
 typedef struct UMMUGlbErr {
     uint64_t usi_addr;
     uint32_t usi_data;
@@ -145,6 +150,10 @@ struct UMMUState {
     /* IOTLB cache */
     GHashTable *iotlb;
     uint32_t iotlb_max_size;
+
+    /* Optional per-DMA-call translation tid override for UBC data path */
+    bool dma_tid_override_valid;
+    uint32_t dma_tid_override;
 };
 
 struct UMMUBaseClass {
@@ -154,4 +163,6 @@ struct UMMUBaseClass {
 
 UMMUState *ummu_find_by_bus_num(uint8_t bus_num);
 int ummu_associating_with_ubc(BusControllerState *ubc);
+UMMUTidOverrideScope ummu_dma_tid_override_enter(UMMUState *ummu, uint32_t tid);
+void ummu_dma_tid_override_leave(UMMUState *ummu, UMMUTidOverrideScope scope);
 #endif

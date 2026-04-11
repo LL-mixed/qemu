@@ -95,6 +95,7 @@ typedef struct UBCJettyState {
     bool     jfs_mode;       /* true=JFS send-only, false=JETTY send+recv */
     uint32_t seid_idx;       /* EID index */
     uint32_t sqe_bb_shift;   /* log2(sq_depth) */
+    uint32_t sqe_token_id;   /* SQ buffer token/tid */
     uint32_t jetty_state;    /* jetty state machine: RESET/READY/ERROR/SUSPEND */
     uint32_t user_data_l;    /* from JFS context DW7 — copied to CQE */
     uint32_t user_data_h;    /* from JFS context DW8 — copied to CQE */
@@ -105,6 +106,7 @@ typedef struct UBCJfcState {
     uint32_t jfc_id;
     uint64_t cq_buf_addr;    /* CQ buffer guest physical address */
     uint32_t cq_depth;
+    uint32_t cqe_token_id;   /* CQ buffer token/tid */
     uint32_t cq_pi;
     uint32_t cq_ci;
     uint32_t ceqn;           /* completion EQ index used by this JFC */
@@ -116,6 +118,7 @@ typedef struct UBCJfrState {
     uint32_t jfr_id;
     uint64_t rq_buf_addr;    /* RQ buffer guest physical address */
     uint32_t rq_depth;
+    uint32_t rqe_token_id;   /* RQ buffer token/tid */
     uint32_t rq_pi;
     uint32_t rq_ci;
 } UBCJfrState;
@@ -160,6 +163,13 @@ typedef struct BusControllerDev {
      * the queue has been repurposed and ubc_process_cmdq must be skipped.
      */
     uint64_t cmdq_last_csq_base;
+    /*
+     * UMMU fallback gate:
+     * - true: ctrl-path DMA may use compatibility fallback (CPU PTW/direct/alias)
+     * - false: no fallback (strict IOMMU/UMMU translation only)
+     * Data-path DMA is always strict regardless of this flag.
+     */
+    bool dma_fallback_init_window;
 
     /* URMA jetty / JFC / JFR state tracking (populated by mailbox cmds) */
     UBCJettyState jetties[UBC_MAX_JETTIES];
@@ -192,6 +202,7 @@ typedef struct BusControllerDev {
             uint32_t jfc_id;      /* TX JFC for completion */
             uint64_t local_va;    /* local SGE VA to write response data */
             uint32_t local_len;   /* local SGE buffer length */
+            uint32_t local_token_id; /* local SGE token/tid */
             uint32_t req_id;      /* request ID for matching */
         } entries[UBC_MAX_PENDING_READS];
     } pending_reads;
@@ -292,4 +303,11 @@ void ubc_handle_read_request(BusControllerDev *ubc_dev, const UBCReadReqPld *req
                               uint32_t dcna);
 void ubc_handle_read_response(BusControllerDev *ubc_dev, const UBCReadRespPld *resp,
                                 const uint8_t *data, uint32_t data_len);
+
+/* SIM Decoder (SIM_DEC) protocol for cross-node memory access */
+int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
+                                uint8_t *resp, uint32_t *resp_len);
+int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
+                         uint32_t *token_id, uint32_t *src_eid);
+
 #endif

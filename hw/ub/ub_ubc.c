@@ -43,6 +43,117 @@
 #include "hw/ub/ubus_instance.h"
 #include "hw/ub/ub_pool_msg.h"
 
+/*
+ * ============================================================================
+ * SIM_DEC: Simulation Decoder Protocol for Cross-Node Memory Access
+ * ============================================================================
+ */
+
+/* SIM_DEC protocol version */
+#define SIM_DEC_PROTO_VERSION       1
+
+/* SIM_DEC opcodes */
+#define SIM_DEC_OP_MAP              0x01
+#define SIM_DEC_OP_UNMAP            0x02
+#define SIM_DEC_OP_SYNC             0x03
+#define SIM_DEC_OP_QUERY            0x04
+
+/* SIM_DEC status codes */
+#define SIM_DEC_STATUS_SUCCESS          0x00
+#define SIM_DEC_STATUS_INVALID_PARAM    0x01
+#define SIM_DEC_STATUS_RESOURCE_BUSY    0x02
+#define SIM_DEC_STATUS_BACKEND_ERROR    0x03
+#define SIM_DEC_STATUS_TIMEOUT          0x04
+#define SIM_DEC_STATUS_NOT_SUPPORTED    0x05
+
+/* SIM_DEC message header */
+typedef struct QEMU_PACKED SimDecMsgHdr {
+    uint8_t  version;
+    uint8_t  opcode;
+    uint16_t seq;
+    uint16_t status;
+    uint16_t payload_len;
+} SimDecMsgHdr;
+
+/* SIM_DEC MAP request */
+typedef struct QEMU_PACKED SimDecMapReq {
+    uint64_t local_pa;
+    uint64_t size;
+    uint64_t remote_uba;
+    uint32_t token_id;
+    uint32_t token_value;
+    uint32_t scna;
+    uint32_t dcna;
+    uint8_t  seid[16];
+    uint8_t  deid[16];
+    uint32_t upi;
+    uint32_t src_eid;
+} SimDecMapReq;
+
+/* SIM_DEC MAP response */
+typedef struct QEMU_PACKED SimDecMapResp {
+    uint64_t map_id;
+    uint32_t status;
+    uint32_t rsvd;
+} SimDecMapResp;
+
+/* SIM_DEC UNMAP request */
+typedef struct QEMU_PACKED SimDecUnmapReq {
+    uint64_t map_id;
+} SimDecUnmapReq;
+
+/* SIM_DEC SYNC request */
+typedef struct QEMU_PACKED SimDecSyncReq {
+    uint64_t map_id;
+    uint64_t offset;
+    uint64_t len;
+} SimDecSyncReq;
+
+/* SIM_DEC QUERY request/response */
+typedef struct QEMU_PACKED SimDecQueryReq {
+    uint64_t map_id;
+} SimDecQueryReq;
+
+typedef struct QEMU_PACKED SimDecQueryResp {
+    uint64_t local_pa;
+    uint64_t size;
+    uint32_t status;
+    uint32_t ref_count;
+} SimDecQueryResp;
+
+/* Decoder map entry for simulation backend */
+typedef struct SimDecMapEntry {
+    uint64_t map_id;
+    uint64_t local_pa;
+    uint64_t size;
+    uint64_t remote_uba;
+    uint32_t token_id;
+    uint32_t token_value;
+    uint32_t scna;
+    uint32_t dcna;
+    uint8_t  seid[16];
+    uint8_t  deid[16];
+    uint32_t upi;
+    uint32_t src_eid;
+    bool     active;
+    QTAILQ_ENTRY(SimDecMapEntry) next;
+} SimDecMapEntry;
+
+/* Decoder simulation context */
+typedef struct SimDecoderState {
+    BusControllerState *bcs;
+    uint64_t next_map_id;
+    QTAILQ_HEAD(, SimDecMapEntry) map_list;
+    QemuMutex lock;
+    bool enabled;
+} SimDecoderState;
+
+static SimDecoderState *g_sim_decoder;
+
+/* Forward declarations for SIM decoder */
+static void sim_dec_init(BusControllerState *bcs);
+static void sim_dec_cleanup(void);
+
 #define UBC_ERS_PAGE_SIZE (4 * KiB)
 #define UBC_ERS2_MMIO_SIZE (UBC_ERS2_SPACE_SIZE * UBC_ERS_PAGE_SIZE)
 
@@ -709,6 +820,13 @@ static inline AddressSpace *ubc_dma_as(BusControllerDev *ubc_dev)
     return as ? as : &address_space_memory;
 }
 
+typedef enum UBCDmaAccessPath {
+    UBC_DMA_ACCESS_CTRL = 0,
+    UBC_DMA_ACCESS_DATA = 1,
+} UBCDmaAccessPath;
+
+#define UBC_DMA_TID_AUTO UINT32_MAX
+
 /*
  * Kernel-side UDMA paths program queue/context addresses as virtual addresses.
  * In simulation, if UMMU translation misses, recover by aliasing the low 32 bits
@@ -808,31 +926,59 @@ static bool ubc_dma_alias_addr(dma_addr_t iova, dma_addr_t *alias)
     return true;
 }
 
+static inline bool ubc_dma_fallback_allowed(BusControllerDev *ubc_dev,
+                                            UBCDmaAccessPath path)
+{
+    return path == UBC_DMA_ACCESS_CTRL &&
+           ubc_dev && ubc_dev->dma_fallback_init_window;
+}
+
+static inline void ubc_close_dma_fallback_window(BusControllerDev *ubc_dev,
+                                                 const char *reason)
+{
+    if (!ubc_dev || !ubc_dev->dma_fallback_init_window) {
+        return;
+    }
+    ubc_dev->dma_fallback_init_window = false;
+    qemu_log("ubc dma fallback: init window closed (%s)\n",
+             reason ? reason : "unspecified");
+}
+
 /*
  * General-purpose DMA read from an IOVA address.
  * Tries IOMMU address space first, then CSQ learned bias,
  * then linear IOVA mapping and low-bits mapping.
  */
-static MemTxResult ubc_dma_read(BusControllerDev *ubc_dev, dma_addr_t iova,
-                                 void *buf, size_t len)
+static MemTxResult ubc_dma_read_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
+                                   void *buf, size_t len, UBCDmaAccessPath path,
+                                   uint32_t tid)
 {
     AddressSpace *as = ubc_dma_as(ubc_dev);
     dma_addr_t alias;
     bool is_kva = ubc_is_kernel_linear_va(iova);
     bool try_ptw = is_kva || (iova >= 0xFFFF000000000000ULL);
     bool has_alias = ubc_dma_alias_addr(iova, &alias);
+    bool allow_fallback = ubc_dma_fallback_allowed(ubc_dev, path);
     MemTxResult ret;
     bool trace_iova = ((iova & 0xFFFFFFFFFFFFF000ULL) == 0xFFFF8000805E6000ULL);
+    bool tid_override_active = false;
+    UMMUTidOverrideScope tid_scope = { 0 };
+
+    if (ubc_dev && ubc_dev->ummu && tid != UBC_DMA_TID_AUTO) {
+        tid_scope = ummu_dma_tid_override_enter(ubc_dev->ummu, tid);
+        tid_override_active = true;
+    }
 
     ret = address_space_read(as, iova, MEMTXATTRS_UNSPECIFIED, buf, len);
     if (trace_iova) {
-        qemu_log("ubc dma read trace: iova=%#" PRIx64 " len=%zu as=%s ret=%d is_kva=%d try_ptw=%d has_alias=%d alias=%#" PRIx64 "\n",
+        qemu_log("ubc dma read trace: iova=%#" PRIx64 " len=%zu as=%s ret=%d path=%s is_kva=%d try_ptw=%d has_alias=%d alias=%#" PRIx64 "\n",
                  (uint64_t)iova, len,
                  (as == &address_space_memory) ? "memory" : "iommu", ret,
+                 path == UBC_DMA_ACCESS_DATA ? "data" : "ctrl",
                  is_kva, try_ptw, has_alias, (uint64_t)alias);
     }
 
-    if (ret != MEMTX_OK && try_ptw) {
+    if (ret != MEMTX_OK && allow_fallback && try_ptw) {
         ret = ubc_dma_read_via_cpu_ptw(iova, buf, len);
         if (trace_iova) {
             qemu_log("ubc dma read trace: cpu_ptw iova=%#" PRIx64 " ret=%d\n",
@@ -840,7 +986,7 @@ static MemTxResult ubc_dma_read(BusControllerDev *ubc_dev, dma_addr_t iova,
         }
     }
 
-    if (ret != MEMTX_OK && as != &address_space_memory) {
+    if (ret != MEMTX_OK && allow_fallback && as != &address_space_memory) {
         /* IOMMU translation failed — fall back to direct physical access.
          * This handles the early-boot case where the guest kernel's DMA layer
          * allocates IOVAs from the IOMMU aperture but the UMMU has not yet
@@ -853,7 +999,7 @@ static MemTxResult ubc_dma_read(BusControllerDev *ubc_dev, dma_addr_t iova,
                      (uint64_t)iova, ret);
         }
     }
-    if (ret != MEMTX_OK && has_alias) {
+    if (ret != MEMTX_OK && allow_fallback && has_alias) {
         ret = address_space_read(&address_space_memory, alias,
                                  MEMTXATTRS_UNSPECIFIED, buf, len);
         if (ret == MEMTX_OK) {
@@ -861,29 +1007,47 @@ static MemTxResult ubc_dma_read(BusControllerDev *ubc_dev, dma_addr_t iova,
                      " len=%zu\n", (uint64_t)iova, (uint64_t)alias, len);
         }
     }
+    if (ret != MEMTX_OK && path == UBC_DMA_ACCESS_DATA) {
+        qemu_log("ubc dma strict read failed: iova=%#" PRIx64
+                 " len=%zu ret=%d tid=%u auto=%u has_ummu=%u\n",
+                 (uint64_t)iova, len, ret, tid,
+                 tid == UBC_DMA_TID_AUTO, ubc_dev && ubc_dev->ummu);
+    }
+    if (tid_override_active) {
+        ummu_dma_tid_override_leave(ubc_dev->ummu, tid_scope);
+    }
     return ret;
 }
 
-static MemTxResult ubc_dma_write(BusControllerDev *ubc_dev, dma_addr_t iova,
-                                  const void *buf, size_t len)
+static MemTxResult ubc_dma_write_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
+                                    const void *buf, size_t len,
+                                    UBCDmaAccessPath path, uint32_t tid)
 {
     AddressSpace *as = ubc_dma_as(ubc_dev);
     dma_addr_t alias;
     bool is_kva = ubc_is_kernel_linear_va(iova);
     bool try_ptw = is_kva || (iova >= 0xFFFF000000000000ULL);
     bool has_alias = ubc_dma_alias_addr(iova, &alias);
+    bool allow_fallback = ubc_dma_fallback_allowed(ubc_dev, path);
     MemTxResult ret;
+    bool tid_override_active = false;
+    UMMUTidOverrideScope tid_scope = { 0 };
+
+    if (ubc_dev && ubc_dev->ummu && tid != UBC_DMA_TID_AUTO) {
+        tid_scope = ummu_dma_tid_override_enter(ubc_dev->ummu, tid);
+        tid_override_active = true;
+    }
 
     ret = address_space_write(as, iova, MEMTXATTRS_UNSPECIFIED, buf, len);
 
-    if (ret != MEMTX_OK && try_ptw) {
+    if (ret != MEMTX_OK && allow_fallback && try_ptw) {
         ret = ubc_dma_write_via_cpu_ptw(iova, buf, len);
     }
-    if (ret != MEMTX_OK && as != &address_space_memory) {
+    if (ret != MEMTX_OK && allow_fallback && as != &address_space_memory) {
         ret = address_space_write(&address_space_memory, iova,
                                   MEMTXATTRS_UNSPECIFIED, buf, len);
     }
-    if (ret != MEMTX_OK && has_alias) {
+    if (ret != MEMTX_OK && allow_fallback && has_alias) {
         ret = address_space_write(&address_space_memory, alias,
                                   MEMTXATTRS_UNSPECIFIED, buf, len);
         if (ret == MEMTX_OK) {
@@ -891,7 +1055,77 @@ static MemTxResult ubc_dma_write(BusControllerDev *ubc_dev, dma_addr_t iova,
                      " len=%zu\n", (uint64_t)iova, (uint64_t)alias, len);
         }
     }
+    if (ret != MEMTX_OK && path == UBC_DMA_ACCESS_DATA) {
+        qemu_log("ubc dma strict write failed: iova=%#" PRIx64
+                 " len=%zu ret=%d tid=%u auto=%u has_ummu=%u\n",
+                 (uint64_t)iova, len, ret, tid,
+                 tid == UBC_DMA_TID_AUTO, ubc_dev && ubc_dev->ummu);
+    }
+    if (tid_override_active) {
+        ummu_dma_tid_override_leave(ubc_dev->ummu, tid_scope);
+    }
     return ret;
+}
+
+static inline MemTxResult ubc_dma_read_ctrl(BusControllerDev *ubc_dev,
+                                            dma_addr_t iova, void *buf,
+                                            size_t len)
+{
+    return ubc_dma_read_ex(ubc_dev, iova, buf, len, UBC_DMA_ACCESS_CTRL,
+                           UBC_DMA_TID_AUTO);
+}
+
+static inline MemTxResult ubc_dma_read_data_tid(BusControllerDev *ubc_dev,
+                                                dma_addr_t iova, void *buf,
+                                                size_t len, uint32_t tid)
+{
+    return ubc_dma_read_ex(ubc_dev, iova, buf, len, UBC_DMA_ACCESS_DATA, tid);
+}
+
+static inline uint32_t ubc_tid_or_auto(uint32_t tid)
+{
+    return tid ? tid : UBC_DMA_TID_AUTO;
+}
+
+static inline MemTxResult ubc_dma_write_ctrl(BusControllerDev *ubc_dev,
+                                             dma_addr_t iova, const void *buf,
+                                             size_t len)
+{
+    return ubc_dma_write_ex(ubc_dev, iova, buf, len, UBC_DMA_ACCESS_CTRL,
+                            UBC_DMA_TID_AUTO);
+}
+
+static inline MemTxResult ubc_dma_write_data(BusControllerDev *ubc_dev,
+                                             dma_addr_t iova, const void *buf,
+                                             size_t len)
+{
+    return ubc_dma_write_ex(ubc_dev, iova, buf, len, UBC_DMA_ACCESS_DATA,
+                            UBC_DMA_TID_AUTO);
+}
+
+static inline MemTxResult ubc_dma_write_data_tid(BusControllerDev *ubc_dev,
+                                                 dma_addr_t iova,
+                                                 const void *buf, size_t len,
+                                                 uint32_t tid)
+{
+    return ubc_dma_write_ex(ubc_dev, iova, buf, len, UBC_DMA_ACCESS_DATA, tid);
+}
+
+/*
+ * Keep existing helper names as ctrl-path default to avoid touching all
+ * mailbox/cmdq call sites. Data-path call sites use *_data explicitly.
+ */
+static inline MemTxResult ubc_dma_read(BusControllerDev *ubc_dev,
+                                       dma_addr_t iova, void *buf, size_t len)
+{
+    return ubc_dma_read_ctrl(ubc_dev, iova, buf, len);
+}
+
+static inline MemTxResult ubc_dma_write(BusControllerDev *ubc_dev,
+                                        dma_addr_t iova, const void *buf,
+                                        size_t len)
+{
+    return ubc_dma_write_ctrl(ubc_dev, iova, buf, len);
 }
 
 static MemTxResult ubc_read_desc(const UBCmdQueueState *q,
@@ -1195,11 +1429,14 @@ static void ubc_parse_jetty_ctx(const uint32_t *dw, UBCJettyState *js)
 {
     uint32_t sqe_base_addr_l = (dw[1] >> 12) & 0xFFFFF;
     uint32_t sqe_base_addr_h = dw[2];
+    uint32_t sqe_tid_l = (dw[0] >> 20) & 0xFFF;
+    uint32_t sqe_tid_h = dw[1] & 0xFF;
 
     js->sq_buf_addr = ((uint64_t)sqe_base_addr_h << 32) |
                       ((uint64_t)sqe_base_addr_l << 12);
     js->sqe_bb_shift = (dw[0] >> 8) & 0xF;
     js->sq_depth = 1u << js->sqe_bb_shift;
+    js->sqe_token_id = sqe_tid_l | (sqe_tid_h << 12);
     js->jfs_mode = (dw[0] >> 19) & 0x1;
     js->tx_jfcn = dw[4] & 0xFFFFF;
     js->jfrn = ((dw[4] >> 20) & 0xFFF) | ((dw[5] & 0xFF) << 12);
@@ -1254,7 +1491,7 @@ static bool ubc_push_ceq_event(BusControllerDev *ubc_dev, uint32_t ceqn,
     memcpy(ceqe, &comp, sizeof(comp));
 
     ceqe_addr = ceq->eq_buf_addr + (dma_addr_t)ceq->eq_pi * UBASE_EQE_SIZE;
-    ret = ubc_dma_write(ubc_dev, ceqe_addr, ceqe, sizeof(ceqe));
+    ret = ubc_dma_write_data(ubc_dev, ceqe_addr, ceqe, sizeof(ceqe));
     if (ret != MEMTX_OK) {
         qemu_log("ubc CEQE: DMA write failed ceqn=%u addr=%#" PRIx64 "\n",
                  ceqn, (uint64_t)ceqe_addr);
@@ -1361,9 +1598,9 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
         ubc_parse_jetty_ctx((const uint32_t *)ctx_buf, js);
 
         qemu_log("ubc POST_MB CREATE_JFS: jetty_id=%u sq_buf=%#" PRIx64
-                 " sq_depth=%u tx_jfcn=%u jfs_mode=%d seid_idx=%u state=READY\n",
+                 " sq_depth=%u sq_tid=%u tx_jfcn=%u jfs_mode=%d seid_idx=%u state=READY\n",
                  js->jetty_id, js->sq_buf_addr, js->sq_depth,
-                 js->tx_jfcn, js->jfs_mode, js->seid_idx);
+                 js->sqe_token_id, js->tx_jfcn, js->jfs_mode, js->seid_idx);
 
         /* Flush any buffered URMA RX packets for this jetty now active */
         ubc_flush_urma_rx_buffer(ubc_dev, tag);
@@ -1390,7 +1627,8 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
             js->jetty_state = JETTY_STATE_READY;
         }
 
-        qemu_log("ubc POST_MB MODIFY_JFS: jetty_id=%u state=READY\n", tag);
+        qemu_log("ubc POST_MB MODIFY_JFS: jetty_id=%u sq_tid=%u state=READY\n",
+                 tag, js->sqe_token_id);
         mb.status = cpu_to_le32(0);
         break;
     }
@@ -1483,18 +1721,20 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
             uint32_t cqe_base_h = dw[1];
             uint32_t cqe_shift = (dw[0] >> 4) & 0xF;
             uint32_t ceqn = (dw[2] >> 24) & 0xFF;
+            uint32_t cqe_tid = dw[2] & 0xFFFFF;
             jfc->cq_buf_addr = ((uint64_t)cqe_base_h << 32) |
                                ((uint64_t)cqe_base_l << 12);
             jfc->cq_depth = 1u << (cqe_shift + 6);
+            jfc->cqe_token_id = cqe_tid;
             if (ceqn < UBC_MAX_CEQS) {
                 jfc->ceqn = ceqn;
             }
         }
 
         qemu_log("ubc POST_MB CREATE_JFC: jfc_id=%u cq_buf=%#" PRIx64
-                 " cq_depth=%u ceqn=%u owner_phase=%u\n",
-                 jfc->jfc_id, jfc->cq_buf_addr, jfc->cq_depth, jfc->ceqn,
-                 jfc->cq_owner_phase);
+                 " cq_depth=%u cq_tid=%u ceqn=%u owner_phase=%u\n",
+                 jfc->jfc_id, jfc->cq_buf_addr, jfc->cq_depth,
+                 jfc->cqe_token_id, jfc->ceqn, jfc->cq_owner_phase);
         mb.status = cpu_to_le32(0);
         break;
     }
@@ -1513,17 +1753,20 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
             uint32_t cqe_base_h = dw[1];
             uint32_t cqe_shift = (dw[0] >> 4) & 0xF;
             uint32_t ceqn = (dw[2] >> 24) & 0xFF;
+            uint32_t cqe_tid = dw[2] & 0xFFFFF;
             jfc->cq_buf_addr = ((uint64_t)cqe_base_h << 32) |
                                ((uint64_t)cqe_base_l << 12);
             jfc->cq_depth = 1u << (cqe_shift + 6);
+            jfc->cqe_token_id = cqe_tid;
             if (ceqn < UBC_MAX_CEQS) {
                 jfc->ceqn = ceqn;
             }
         }
 
         qemu_log("ubc POST_MB MODIFY_JFC: jfc_id=%u cq_buf=%#" PRIx64
-                 " cq_depth=%u ceqn=%u\n", jfc->jfc_id, jfc->cq_buf_addr,
-                 jfc->cq_depth, jfc->ceqn);
+                 " cq_depth=%u cq_tid=%u ceqn=%u\n", jfc->jfc_id,
+                 jfc->cq_buf_addr, jfc->cq_depth, jfc->cqe_token_id,
+                 jfc->ceqn);
         mb.status = cpu_to_le32(0);
         break;
     }
@@ -1691,14 +1934,16 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
             uint32_t rqe_base_l = (dw[1] >> 12) & 0xFFFFF;
             uint32_t rqe_base_h = dw[2];
             uint32_t rqe_bb_shift = (dw[0] >> 8) & 0xF;
+            uint32_t rqe_tid = ((dw[0] >> 18) & 0x3FFF) | ((dw[1] & 0x3F) << 14);
             jfr->rq_buf_addr = ((uint64_t)rqe_base_h << 32) |
                                ((uint64_t)rqe_base_l << 12);
             jfr->rq_depth = 1u << rqe_bb_shift;
+            jfr->rqe_token_id = rqe_tid;
         }
 
         qemu_log("ubc POST_MB CREATE_JFR: jfr_id=%u rq_buf=%#" PRIx64
-                 " rq_depth=%u\n", jfr->jfr_id, jfr->rq_buf_addr,
-                 jfr->rq_depth);
+                 " rq_depth=%u rq_tid=%u\n", jfr->jfr_id, jfr->rq_buf_addr,
+                 jfr->rq_depth, jfr->rqe_token_id);
 
         /* Flush any URMA RX data buffered for jetties using this JFR */
         for (uint32_t ji = 0; ji < UBC_MAX_JETTIES; ji++) {
@@ -1724,14 +1969,16 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
             uint32_t rqe_base_l = (dw[1] >> 12) & 0xFFFFF;
             uint32_t rqe_base_h = dw[2];
             uint32_t rqe_bb_shift = (dw[0] >> 8) & 0xF;
+            uint32_t rqe_tid = ((dw[0] >> 18) & 0x3FFF) | ((dw[1] & 0x3F) << 14);
             jfr->rq_buf_addr = ((uint64_t)rqe_base_h << 32) |
                                ((uint64_t)rqe_base_l << 12);
             jfr->rq_depth = 1u << rqe_bb_shift;
+            jfr->rqe_token_id = rqe_tid;
         }
 
         qemu_log("ubc POST_MB MODIFY_JFR: jfr_id=%u rq_buf=%#" PRIx64
-                 " rq_depth=%u\n", jfr->jfr_id, jfr->rq_buf_addr,
-                 jfr->rq_depth);
+                 " rq_depth=%u rq_tid=%u\n", jfr->jfr_id, jfr->rq_buf_addr,
+                 jfr->rq_depth, jfr->rqe_token_id);
         mb.status = cpu_to_le32(0);
         break;
     }
@@ -3022,6 +3269,9 @@ void ubc_handle_read_request(BusControllerDev *ubc_dev,
     Error *local_err = NULL;
     uint32_t read_len = req->read_len;
     uint32_t status = 0;
+    uint32_t dma_tid = UBC_DMA_TID_AUTO;
+
+    ubc_close_dma_fallback_window(ubc_dev, "read_request");
 
     /* Limit read length to prevent excessive memory allocation */
     #define UBC_MAX_READ_LEN (256 * 1024)  /* 256KB max per READ */
@@ -3066,8 +3316,14 @@ void ubc_handle_read_request(BusControllerDev *ubc_dev,
     resp->data_len = read_len;
     resp->status = status;
 
+    if (req->rmt_obj_id < UBC_MAX_JETTIES &&
+        ubc_dev->jetties[req->rmt_obj_id].active) {
+        dma_tid = ubc_tid_or_auto(ubc_dev->jetties[req->rmt_obj_id].sqe_token_id);
+    }
+
     /* Read from guest memory at the requested address */
-    MemTxResult ret = ubc_dma_read(ubc_dev, req->remote_addr, data_out, read_len);
+    MemTxResult ret = ubc_dma_read_data_tid(ubc_dev, req->remote_addr,
+                                            data_out, read_len, dma_tid);
     if (ret != MEMTX_OK) {
         qemu_log("ubc READ_RESP: DMA read from %#" PRIx64 " failed\n",
                  (uint64_t)req->remote_addr);
@@ -3101,6 +3357,8 @@ void ubc_handle_read_response(BusControllerDev *ubc_dev,
     uint32_t req_id = resp->req_id;
     int i;
 
+    ubc_close_dma_fallback_window(ubc_dev, "read_response");
+
     /* Find the pending read request by req_id */
     for (i = 0; i < UBC_MAX_PENDING_READS; i++) {
         if (ubc_dev->pending_reads.entries[i].pending &&
@@ -3119,6 +3377,7 @@ void ubc_handle_read_response(BusControllerDev *ubc_dev,
     uint32_t jfc_id = ubc_dev->pending_reads.entries[i].jfc_id;
     uint64_t local_va = ubc_dev->pending_reads.entries[i].local_va;
     uint32_t local_len = ubc_dev->pending_reads.entries[i].local_len;
+    uint32_t local_token_id = ubc_dev->pending_reads.entries[i].local_token_id;
     uint32_t cqe_status = CQE_STATUS_SUCCESS;
     uint32_t actual_len = data_len;
 
@@ -3146,7 +3405,12 @@ void ubc_handle_read_response(BusControllerDev *ubc_dev,
 
     /* Write data to local SGE buffer */
     if (actual_len > 0 && local_va != 0) {
-        MemTxResult ret = ubc_dma_write(ubc_dev, local_va, data, actual_len);
+        if (local_token_id == 0) {
+            local_token_id = js->sqe_token_id;
+        }
+        MemTxResult ret = ubc_dma_write_data_tid(ubc_dev, local_va, data,
+                                                 actual_len,
+                                                 ubc_tid_or_auto(local_token_id));
         if (ret != MEMTX_OK) {
             qemu_log("ubc READ_RESP: DMA write to local VA failed\n");
             cqe_status = CQE_STATUS_DMA_ERR;
@@ -3174,8 +3438,11 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
     uint32_t byte_cnt = 0;
     uint32_t cqe_status = CQE_STATUS_SUCCESS;
 
+    ubc_close_dma_fallback_window(ubc_dev, "first_sq_wqe");
+
     /* DMA-read the 64-byte WQE header */
-    ret = ubc_dma_read(ubc_dev, wqe_addr, wqe_buf, UDMA_SQE_SIZE);
+    ret = ubc_dma_read_data_tid(ubc_dev, wqe_addr, wqe_buf, UDMA_SQE_SIZE,
+                                ubc_tid_or_auto(js->sqe_token_id));
     if (ret != MEMTX_OK) {
         qemu_log("ubc WQE: DMA read failed addr=%#" PRIx64 "\n", (uint64_t)wqe_addr);
         ubc_generate_cqe(ubc_dev, js, js->tx_jfcn, wqe_idx, 0, CQE_STATUS_DMA_ERR, true);
@@ -3228,7 +3495,9 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
             dma_addr_t payload_addr = js->sq_buf_addr +
                 (dma_addr_t)wqe_idx * UDMA_SQE_SIZE + UDMA_SQE_CTL_LEN_SEND;
 
-            ret = ubc_dma_read(ubc_dev, payload_addr, payload, inline_msg_len);
+            ret = ubc_dma_read_data_tid(ubc_dev, payload_addr, payload,
+                                        inline_msg_len,
+                                        ubc_tid_or_auto(js->sqe_token_id));
             if (ret != MEMTX_OK) {
                 qemu_log("ubc WQE SEND inline: DMA read payload failed len=%u\n",
                          inline_msg_len);
@@ -3250,7 +3519,9 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
                 uint64_t sge_va;
                 uint32_t token_id;
 
-                ret = ubc_dma_read(ubc_dev, sge_addr, sge_buf, UDMA_JFS_SGE_SIZE);
+                ret = ubc_dma_read_data_tid(ubc_dev, sge_addr, sge_buf,
+                                            UDMA_JFS_SGE_SIZE,
+                                            ubc_tid_or_auto(js->sqe_token_id));
                 if (ret != MEMTX_OK) {
                     qemu_log("ubc WQE SEND SGE[%u]: DMA read failed\n", i);
                     cqe_status = CQE_STATUS_DMA_ERR;
@@ -3281,7 +3552,10 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
                          i, sge_va, sge_len);
 
                 uint8_t *payload = g_malloc(sge_len);
-                ret = ubc_dma_read(ubc_dev, sge_va, payload, sge_len);
+                ret = ubc_dma_read_data_tid(ubc_dev, sge_va, payload, sge_len,
+                                            ubc_tid_or_auto(token_id ?
+                                                            token_id :
+                                                            js->sqe_token_id));
                 if (ret != MEMTX_OK) {
                     qemu_log("ubc WQE SEND SGE[%u]: data DMA read failed\n", i);
                     cqe_status = CQE_STATUS_DMA_ERR;
@@ -3324,7 +3598,9 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
             uint8_t *payload = g_malloc(inline_msg_len);
             dma_addr_t payload_addr = js->sq_buf_addr +
                 (dma_addr_t)wqe_idx * UDMA_SQE_SIZE + sqe_ctl_len;
-            ret = ubc_dma_read(ubc_dev, payload_addr, payload, inline_msg_len);
+            ret = ubc_dma_read_data_tid(ubc_dev, payload_addr, payload,
+                                        inline_msg_len,
+                                        ubc_tid_or_auto(js->sqe_token_id));
             if (ret == MEMTX_OK) {
                 byte_cnt = inline_msg_len;
                 ubc_send_data_to_remote_ex(ubc_dev, js, payload, byte_cnt,
@@ -3340,19 +3616,26 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
                     (dma_addr_t)i * UDMA_JFS_SGE_SIZE;
                 uint8_t sge_buf[UDMA_JFS_SGE_SIZE];
                 uint32_t sge_len;
+                uint32_t token_id;
                 uint64_t sge_va;
 
-                ret = ubc_dma_read(ubc_dev, sge_addr, sge_buf, UDMA_JFS_SGE_SIZE);
+                ret = ubc_dma_read_data_tid(ubc_dev, sge_addr, sge_buf,
+                                            UDMA_JFS_SGE_SIZE,
+                                            ubc_tid_or_auto(js->sqe_token_id));
                 if (ret != MEMTX_OK) {
                     continue;
                 }
                 memcpy(&sge_len, sge_buf, 4);
+                memcpy(&token_id, sge_buf + 4, 4);
                 memcpy(&sge_va, sge_buf + 8, 8);
                 if (sge_len == 0 || sge_va == 0) {
                     continue;
                 }
                 uint8_t *payload = g_malloc(sge_len);
-                ret = ubc_dma_read(ubc_dev, sge_va, payload, sge_len);
+                ret = ubc_dma_read_data_tid(ubc_dev, sge_va, payload, sge_len,
+                                            ubc_tid_or_auto(token_id ?
+                                                            token_id :
+                                                            js->sqe_token_id));
                 if (ret == MEMTX_OK) {
                     ubc_send_data_to_remote_ex(ubc_dev, js, payload, sge_len,
                                                rmt_obj_id, rmt_eid, remote_addr, true);
@@ -3382,6 +3665,7 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
         const uint32_t *wqe_dw = (const uint32_t *)wqe_buf;
         uint64_t remote_addr = ((uint64_t)wqe_dw[11] << 32) | wqe_dw[10];
         uint32_t sge_len = 0;
+        uint32_t local_token_id = 0;
         uint64_t local_va = 0;
         uint32_t req_id;
         int slot = -1;
@@ -3391,9 +3675,12 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
             dma_addr_t sge_addr = js->sq_buf_addr +
                 (dma_addr_t)wqe_idx * UDMA_SQE_SIZE + UDMA_SQE_CTL_LEN_SEND;
             uint8_t sge_buf[UDMA_JFS_SGE_SIZE];
-            ret = ubc_dma_read(ubc_dev, sge_addr, sge_buf, UDMA_JFS_SGE_SIZE);
+            ret = ubc_dma_read_data_tid(ubc_dev, sge_addr, sge_buf,
+                                        UDMA_JFS_SGE_SIZE,
+                                        ubc_tid_or_auto(js->sqe_token_id));
             if (ret == MEMTX_OK) {
                 memcpy(&sge_len, sge_buf, 4);
+                memcpy(&local_token_id, sge_buf + 4, 4);
                 memcpy(&local_va, sge_buf + 8, 8);
             }
         }
@@ -3426,6 +3713,8 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
         ubc_dev->pending_reads.entries[slot].jfc_id = js->tx_jfcn;
         ubc_dev->pending_reads.entries[slot].local_va = local_va;
         ubc_dev->pending_reads.entries[slot].local_len = sge_len;
+        ubc_dev->pending_reads.entries[slot].local_token_id =
+            local_token_id ? local_token_id : js->sqe_token_id;
         ubc_dev->pending_reads.entries[slot].req_id = req_id;
         ubc_dev->pending_reads.count++;
 
@@ -3567,7 +3856,8 @@ static void ubc_generate_cqe(BusControllerDev *ubc_dev, UBCJettyState *js,
 
     /* Write CQE to CQ buffer at cq_pi */
     cqe_addr = jfc->cq_buf_addr + (dma_addr_t)jfc->cq_pi * 64;
-    ret = ubc_dma_write(ubc_dev, cqe_addr, cqe, 64);
+    ret = ubc_dma_write_data_tid(ubc_dev, cqe_addr, cqe, 64,
+                                 ubc_tid_or_auto(jfc->cqe_token_id));
     if (ret != MEMTX_OK) {
         qemu_log("ubc CQE: DMA write failed addr=%#" PRIx64 "\n", (uint64_t)cqe_addr);
         return;
@@ -3677,9 +3967,12 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
     dma_addr_t rqe_addr;
     uint64_t sge_va;
     uint32_t sge_len;
+    uint32_t sge_token_id;
     uint32_t rq_wqe_idx;
     uint32_t cqe_status = CQE_STATUS_SUCCESS;
     uint32_t actual_len;
+
+    ubc_close_dma_fallback_window(ubc_dev, "urma_rx_data");
 
     qemu_log("ubc URMA RX: dst_jetty=%u len=%u\n", dst_jetty, data_len);
 
@@ -3714,7 +4007,8 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
 
     /* DMA-read the next RECV WQE (16-byte SGE) from the RQ */
     rqe_addr = jfr->rq_buf_addr + (dma_addr_t)rq_wqe_idx * 16;
-    if (ubc_dma_read(ubc_dev, rqe_addr, sge_buf, 16) != MEMTX_OK) {
+    if (ubc_dma_read_data_tid(ubc_dev, rqe_addr, sge_buf, 16,
+                              ubc_tid_or_auto(jfr->rqe_token_id)) != MEMTX_OK) {
         qemu_log("ubc URMA RX: RQE DMA read failed at ci=%u addr=%#" PRIx64 "\n",
                  jfr->rq_ci, rqe_addr);
         ubc_generate_cqe(ubc_dev, js, js->rx_jfcn, rq_wqe_idx, 0,
@@ -3724,10 +4018,12 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
 
     /* Parse SGE: length(4) + token_id(4) + va(8) */
     memcpy(&sge_len, sge_buf, 4);
+    memcpy(&sge_token_id, sge_buf + 4, 4);
     memcpy(&sge_va, sge_buf + 8, 8);
 
-    qemu_log("ubc URMA RX: RQE ci=%u sge_va=%#" PRIx64 " sge_len=%u data_len=%u\n",
-             jfr->rq_ci, sge_va, sge_len, data_len);
+    qemu_log("ubc URMA RX: RQE ci=%u sge_va=%#" PRIx64
+             " sge_len=%u sge_tid=%u data_len=%u\n",
+             jfr->rq_ci, sge_va, sge_len, sge_token_id, data_len);
 
     /* Boundary check: null VA or zero length → RQ empty error */
     if (!sge_va || sge_len == 0) {
@@ -3747,7 +4043,10 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
     }
 
     /* DMA-write the received data into the guest's RECV buffer */
-    if (ubc_dma_write(ubc_dev, sge_va, data, actual_len) != MEMTX_OK) {
+    if (ubc_dma_write_data_tid(ubc_dev, sge_va, data, actual_len,
+                               ubc_tid_or_auto(sge_token_id ?
+                                               sge_token_id :
+                                               jfr->rqe_token_id)) != MEMTX_OK) {
         qemu_log("ubc URMA RX: data DMA write failed\n");
         ubc_generate_cqe(ubc_dev, js, js->rx_jfcn, rq_wqe_idx, 0,
                          CQE_STATUS_DMA_ERR, false);
@@ -3774,6 +4073,10 @@ void ubc_handle_urma_rx_write(BusControllerDev *ubc_dev, uint32_t dst_jetty,
                               uint64_t remote_addr, const uint8_t *data,
                               uint32_t data_len)
 {
+    UBCJettyState *js;
+
+    ubc_close_dma_fallback_window(ubc_dev, "urma_rx_write");
+
     qemu_log("ubc URMA RX WRITE: dst_jetty=%u remote_addr=%#" PRIx64 " len=%u\n",
              dst_jetty, remote_addr, data_len);
 
@@ -3786,9 +4089,11 @@ void ubc_handle_urma_rx_write(BusControllerDev *ubc_dev, uint32_t dst_jetty,
         qemu_log("ubc URMA RX WRITE: dst jetty %u not active\n", dst_jetty);
         return;
     }
+    js = &ubc_dev->jetties[dst_jetty];
 
     /* For WRITE: directly write to remote_addr, no RQ consumption */
-    if (ubc_dma_write(ubc_dev, remote_addr, data, data_len) != MEMTX_OK) {
+    if (ubc_dma_write_data_tid(ubc_dev, remote_addr, data, data_len,
+                               ubc_tid_or_auto(js->sqe_token_id)) != MEMTX_OK) {
         qemu_log("ubc URMA RX WRITE: DMA write to %#" PRIx64 " failed\n",
                  remote_addr);
         return;
@@ -4030,6 +4335,10 @@ static void ub_bus_controller_realize(DeviceState *dev, Error **errp)
     ub_save_ubc_list(s);
     s->notify_retry_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
                                          ub_notify_retry_timer_cb, s);
+
+    /* Initialize SIM decoder for cross-node memory access */
+    sim_dec_init(s);
+
     g_free(name);
 }
 
@@ -4044,6 +4353,9 @@ static void ub_bus_controller_unrealize(DeviceState *dev)
     ub_unregister_root_bus(s->bus);
     ub_reg_free(dev);
     ub_bus_instance_guid_unlock(s->ubc_dev);
+
+    /* Cleanup SIM decoder */
+    sim_dec_cleanup();
 }
 
 static bool ub_bus_controller_needed(void *opaque)
@@ -4820,6 +5132,7 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
     }
 
     ubc->ubc_dev = BUS_CONTROLLER_DEV(dev);
+    ubc->ubc_dev->dma_fallback_init_window = true;
     ub_entity_table_init(ubc->ubc_dev);
     ub_entity_cfg_spaces_init(ubc->ubc_dev);
     if (dev->guid.type != UB_GUID_TYPE_IBUS_CONTROLLER &&
@@ -4900,6 +5213,355 @@ static const TypeInfo ub_bus_controller_dev_type_info = {
     .class_size = sizeof(BusControllerDevClass),
     .class_init = ub_bus_controller_dev_class_init,
 };
+
+/*
+ * ============================================================================
+ * SIM Decoder Implementation
+ * ============================================================================
+ */
+
+static void sim_dec_init(BusControllerState *bcs)
+{
+    g_sim_decoder = g_malloc0(sizeof(*g_sim_decoder));
+    g_sim_decoder->bcs = bcs;
+    g_sim_decoder->next_map_id = 1;
+    QTAILQ_INIT(&g_sim_decoder->map_list);
+    qemu_mutex_init(&g_sim_decoder->lock);
+    g_sim_decoder->enabled = true;
+
+    qemu_log("SIM_DEC: decoder simulation initialized\n");
+}
+
+static void sim_dec_cleanup(void)
+{
+    SimDecMapEntry *entry, *tmp;
+
+    if (!g_sim_decoder)
+        return;
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    QTAILQ_FOREACH_SAFE(entry, &g_sim_decoder->map_list, next, tmp) {
+        QTAILQ_REMOVE(&g_sim_decoder->map_list, entry, next);
+        g_free(entry);
+    }
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+
+    qemu_mutex_destroy(&g_sim_decoder->lock);
+    g_free(g_sim_decoder);
+    g_sim_decoder = NULL;
+}
+
+static SimDecMapEntry *sim_dec_find_entry_by_pa(uint64_t pa)
+{
+    SimDecMapEntry *entry;
+
+    QTAILQ_FOREACH(entry, &g_sim_decoder->map_list, next) {
+        if (entry->active &&
+            pa >= entry->local_pa &&
+            pa < entry->local_pa + entry->size) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static SimDecMapEntry *sim_dec_find_entry_by_id(uint64_t map_id)
+{
+    SimDecMapEntry *entry;
+
+    QTAILQ_FOREACH(entry, &g_sim_decoder->map_list, next) {
+        if (entry->map_id == map_id)
+            return entry;
+    }
+    return NULL;
+}
+
+static bool sim_dec_check_overlap(uint64_t pa, uint64_t size)
+{
+    SimDecMapEntry *entry;
+    uint64_t end = pa + size;
+
+    QTAILQ_FOREACH(entry, &g_sim_decoder->map_list, next) {
+        if (entry->active) {
+            uint64_t entry_end = entry->local_pa + entry->size;
+            if (!(end <= entry->local_pa || pa >= entry_end)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static int sim_dec_handle_map(const SimDecMapReq *req, SimDecMapResp *resp)
+{
+    SimDecMapEntry *entry;
+    uint64_t map_id;
+
+    if (!g_sim_decoder || !g_sim_decoder->enabled) {
+        resp->status = SIM_DEC_STATUS_BACKEND_ERROR;
+        return -1;
+    }
+
+    /* Validate request */
+    if (req->size == 0 || req->size > (1ULL << 40)) {
+        qemu_log("SIM_DEC: invalid size %" PRIx64 "\n", req->size);
+        resp->status = SIM_DEC_STATUS_INVALID_PARAM;
+        return -1;
+    }
+
+    if (req->token_id == 0) {
+        qemu_log("SIM_DEC: token_id cannot be 0\n");
+        resp->status = SIM_DEC_STATUS_INVALID_PARAM;
+        return -1;
+    }
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+
+    /* Check for overlapping mappings */
+    if (sim_dec_check_overlap(req->local_pa, req->size)) {
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        qemu_log("SIM_DEC: PA overlap detected\n");
+        resp->status = SIM_DEC_STATUS_RESOURCE_BUSY;
+        return -1;
+    }
+
+    /* Create new map entry */
+    entry = g_malloc0(sizeof(*entry));
+    map_id = g_sim_decoder->next_map_id++;
+    if (map_id == 0)
+        map_id = g_sim_decoder->next_map_id++;
+
+    entry->map_id = map_id;
+    entry->local_pa = req->local_pa;
+    entry->size = req->size;
+    entry->remote_uba = req->remote_uba;
+    entry->token_id = req->token_id;
+    entry->token_value = req->token_value;
+    entry->scna = req->scna;
+    entry->dcna = req->dcna;
+    memcpy(entry->seid, req->seid, 16);
+    memcpy(entry->deid, req->deid, 16);
+    entry->upi = req->upi;
+    entry->src_eid = req->src_eid;
+    entry->active = true;
+
+    QTAILQ_INSERT_TAIL(&g_sim_decoder->map_list, entry, next);
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+
+    resp->map_id = map_id;
+    resp->status = SIM_DEC_STATUS_SUCCESS;
+
+    qemu_log("SIM_DEC: MAP success id=%" PRIx64 " pa=%" PRIx64 " sz=%" PRIx64
+             " remote_uba=%" PRIx64 " token=%u\n",
+             map_id, req->local_pa, req->size, req->remote_uba, req->token_id);
+    return 0;
+}
+
+static int sim_dec_handle_unmap(const SimDecUnmapReq *req)
+{
+    SimDecMapEntry *entry;
+
+    if (!g_sim_decoder)
+        return -1;
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    entry = sim_dec_find_entry_by_id(req->map_id);
+    if (!entry) {
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        qemu_log("SIM_DEC: UNMAP failed - map_id %" PRIx64 " not found\n",
+                 req->map_id);
+        return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+
+    entry->active = false;
+    QTAILQ_REMOVE(&g_sim_decoder->map_list, entry, next);
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+
+    qemu_log("SIM_DEC: UNMAP success id=%" PRIx64 "\n", req->map_id);
+    g_free(entry);
+    return SIM_DEC_STATUS_SUCCESS;
+}
+
+static int sim_dec_handle_sync(const SimDecSyncReq *req)
+{
+    SimDecMapEntry *entry;
+
+    if (!g_sim_decoder)
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    entry = sim_dec_find_entry_by_id(req->map_id);
+    if (!entry) {
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+
+    if (!entry->active) {
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+
+    if (req->offset + req->len > entry->size) {
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+
+    qemu_log("SIM_DEC: SYNC map_id=%" PRIx64 " offset=%" PRIx64 " len=%" PRIx64 "\n",
+             req->map_id, req->offset, req->len);
+    return SIM_DEC_STATUS_SUCCESS;
+}
+
+static int sim_dec_handle_query(const SimDecQueryReq *req, SimDecQueryResp *resp)
+{
+    SimDecMapEntry *entry;
+
+    if (!g_sim_decoder)
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    entry = sim_dec_find_entry_by_id(req->map_id);
+    if (!entry) {
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        resp->status = SIM_DEC_STATUS_INVALID_PARAM;
+        return -1;
+    }
+
+    resp->local_pa = entry->local_pa;
+    resp->size = entry->size;
+    resp->status = entry->active ? 0 : 1;
+    resp->ref_count = 1; /* Simplified */
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+
+    return SIM_DEC_STATUS_SUCCESS;
+}
+
+/*
+ * sim_dec_lookup_by_pa - Lookup decoder entry for address translation
+ * Called by UMMU to check if a PA is in decoder map for remote access
+ */
+int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
+                         uint32_t *token_id, uint32_t *src_eid)
+{
+    SimDecMapEntry *entry;
+
+    if (!g_sim_decoder || !g_sim_decoder->enabled)
+        return -1;
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    entry = sim_dec_find_entry_by_pa(pa);
+    if (entry && entry->active) {
+        if (remote_uba)
+            *remote_uba = entry->remote_uba + (pa - entry->local_pa);
+        if (token_id)
+            *token_id = entry->token_id;
+        if (src_eid)
+            *src_eid = entry->src_eid;
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        return 0;
+    }
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+    return -1;
+}
+
+/*
+ * ubc_handle_sim_dec_message - Handle incoming SIM_DEC control message
+ * This is called from the control channel/message handler
+ */
+int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
+                                uint8_t *resp, uint32_t *resp_len)
+{
+    const SimDecMsgHdr *hdr;
+    uint32_t min_len;
+    int ret = -1;
+
+    if (len < sizeof(*hdr)) {
+        qemu_log("SIM_DEC: message too short\n");
+        return -1;
+    }
+
+    hdr = (const SimDecMsgHdr *)data;
+
+    if (hdr->version != SIM_DEC_PROTO_VERSION) {
+        qemu_log("SIM_DEC: unsupported version %u\n", hdr->version);
+        return -1;
+    }
+
+    /* Build response header */
+    SimDecMsgHdr *resp_hdr = (SimDecMsgHdr *)resp;
+    resp_hdr->version = SIM_DEC_PROTO_VERSION;
+    resp_hdr->opcode = hdr->opcode;
+    resp_hdr->seq = hdr->seq;
+    resp_hdr->status = SIM_DEC_STATUS_SUCCESS;
+
+    switch (hdr->opcode) {
+    case SIM_DEC_OP_MAP:
+        min_len = sizeof(*hdr) + sizeof(SimDecMapReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        {
+            SimDecMapResp map_resp = {0};
+            ret = sim_dec_handle_map((const SimDecMapReq *)(data + sizeof(*hdr)),
+                                     &map_resp);
+            resp_hdr->payload_len = sizeof(map_resp);
+            memcpy(resp + sizeof(*resp_hdr), &map_resp, sizeof(map_resp));
+            resp_hdr->status = map_resp.status;
+        }
+        break;
+
+    case SIM_DEC_OP_UNMAP:
+        min_len = sizeof(*hdr) + sizeof(SimDecUnmapReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        resp_hdr->status = sim_dec_handle_unmap(
+            (const SimDecUnmapReq *)(data + sizeof(*hdr)));
+        resp_hdr->payload_len = 0;
+        ret = 0;
+        break;
+
+    case SIM_DEC_OP_SYNC:
+        min_len = sizeof(*hdr) + sizeof(SimDecSyncReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        resp_hdr->status = sim_dec_handle_sync(
+            (const SimDecSyncReq *)(data + sizeof(*hdr)));
+        resp_hdr->payload_len = 0;
+        ret = 0;
+        break;
+
+    case SIM_DEC_OP_QUERY:
+        min_len = sizeof(*hdr) + sizeof(SimDecQueryReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        {
+            SimDecQueryResp query_resp = {0};
+            ret = sim_dec_handle_query(
+                (const SimDecQueryReq *)(data + sizeof(*hdr)), &query_resp);
+            resp_hdr->payload_len = sizeof(query_resp);
+            memcpy(resp + sizeof(*resp_hdr), &query_resp, sizeof(query_resp));
+            resp_hdr->status = query_resp.status ? SIM_DEC_STATUS_INVALID_PARAM
+                                                  : SIM_DEC_STATUS_SUCCESS;
+        }
+        break;
+
+    default:
+        qemu_log("SIM_DEC: unknown opcode %u\n", hdr->opcode);
+        resp_hdr->status = SIM_DEC_STATUS_NOT_SUPPORTED;
+        break;
+    }
+
+    *resp_len = sizeof(*resp_hdr) + resp_hdr->payload_len;
+    return ret;
+}
 
 static void ub_bus_controller_register_types(void)
 {
