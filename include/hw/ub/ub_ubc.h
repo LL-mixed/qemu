@@ -76,7 +76,7 @@ typedef struct UBCmdQueueState {
     uint16_t tail;
 } UBCmdQueueState;
 
-#define UBC_MAX_JETTIES  64
+#define UBC_MAX_JETTIES  1024
 #define UBC_MAX_JFCS     128
 #define UBC_MAX_JFRS     128
 #define UBC_MAX_AEQS     16
@@ -207,6 +207,7 @@ typedef struct BusControllerDev {
         } entries[UBC_MAX_PENDING_READS];
     } pending_reads;
     uint32_t next_read_req_id;
+    uint32_t next_tp_id;
 } BusControllerDev;
 
 struct BusControllerDevClass {

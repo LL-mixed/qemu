@@ -1344,9 +1344,20 @@ static int ubc_handle_ue2ue_ctrlq(BusControllerDev *ubc_dev,
     } else if (req_hdr->service_type == UBASE_CTRLQ_SER_TYPE_TP_ACL &&
                req_hdr->opcode == UBASE_CTRLQ_OPC_GET_TP_LIST &&
                resp_data_len >= 8) {
-        qemu_log("ubc ue2ue ctrlq: GET_TP_LIST returning 1 TP entry\n");
+        uint32_t tpid = ubc_dev->next_tp_id;
+
+        if (tpid == 0 || tpid > 0x00FFFFFFU) {
+            tpid = 1;
+        }
+        ubc_dev->next_tp_id = tpid + 1;
+        if (ubc_dev->next_tp_id == 0 || ubc_dev->next_tp_id > 0x00FFFFFFU) {
+            ubc_dev->next_tp_id = 1;
+        }
+
+        qemu_log("ubc ue2ue ctrlq: GET_TP_LIST returning 1 TP entry (tpid=%u)\n",
+                 tpid);
         *(uint32_t *)resp_data = cpu_to_le32(1);
-        *(uint32_t *)(resp_data + 4) = cpu_to_le32((1 << 0) | (1 << 24));
+        *(uint32_t *)(resp_data + 4) = cpu_to_le32((tpid & 0x00FFFFFFU) | (1U << 24));
         *(uint32_t *)(resp_data + 8) = 0;
     } else if (req_hdr->service_type == UBASE_CTRLQ_SER_TYPE_DEV_REGISTER &&
                req_hdr->opcode == UBASE_CTRLQ_OPC_GET_SEID_INFO &&
@@ -1640,6 +1651,11 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
          *   | sl[15:12] | state[18:16] | jfs_mode[19] | sqe_token_id_l[31:20]
          * enum jetty_state: RESET=0, READY=1, ERROR=2, SUSPEND=3
          * DW18[31:16] = CI, DW20[15:0] = PI
+         * DW26[24]    = flush_ssn_vld, DW26[26] = flush_cqe_done
+         *
+         * On jetty teardown path, guest driver waits these flush/ack bits
+         * before proceeding to destroy/unimport. Keep them asserted in
+         * simulation to model an always-acked flush state.
          */
         if (tag < UBC_MAX_JETTIES && ubc_dev->jetties[tag].active) {
             UBCJettyState *js = &ubc_dev->jetties[tag];
@@ -1655,6 +1671,9 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
                 dw[18] = (dw[18] & 0xFFFFu) | ((uint32_t)js->sq_ci << 16);
                 /* Update PI = sq_pi in DW20 bits [15:0] */
                 dw[20] = (dw[20] & ~0xFFFFu) | (js->sq_pi & 0xFFFFu);
+                /* Report flush ack done to satisfy destroy precondition. */
+                dw[26] |= (1u << 24); /* flush_ssn_vld */
+                dw[26] |= (1u << 26); /* flush_cqe_done */
 
                 /* DMA-write back the modified context */
                 ubc_dma_write(ubc_dev, dma_addr, ctx_buf, sizeof(ctx_buf));
@@ -2782,11 +2801,22 @@ static void ubc_process_ctrlq(BusControllerDev *ubc_dev)
              *   [4:7]  tpid=1 | tpn_cnt=1
              *   [8:11] tpn_start=0 | migr=0 | rsv=0
              */
+            uint32_t tpid = ubc_dev->next_tp_id;
+
+            if (tpid == 0 || tpid > 0x00FFFFFFU) {
+                tpid = 1;
+            }
+            ubc_dev->next_tp_id = tpid + 1;
+            if (ubc_dev->next_tp_id == 0 || ubc_dev->next_tp_id > 0x00FFFFFFU) {
+                ubc_dev->next_tp_id = 1;
+            }
+
             resp_bb.ret = 0;
-            resp_bb.data[0] = cpu_to_le32(1);                    /* tp_list_cnt=1 */
-            resp_bb.data[1] = cpu_to_le32((1 << 0) | (1 << 24)); /* tpid=1, tpn_cnt=1 */
-            resp_bb.data[2] = 0;                                  /* tpn_start=0 */
-            qemu_log("ubc ctrlq tp_acl get_tp_list resp: 1 TP entry\n");
+            resp_bb.data[0] = cpu_to_le32(1); /* tp_list_cnt=1 */
+            resp_bb.data[1] = cpu_to_le32((tpid & 0x00FFFFFFU) | (1U << 24));
+            resp_bb.data[2] = 0; /* tpn_start=0 */
+            qemu_log("ubc ctrlq tp_acl get_tp_list resp: 1 TP entry (tpid=%u)\n",
+                     tpid);
         } else {
             resp_bb.ret = 0;
         }
@@ -5133,6 +5163,7 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
 
     ubc->ubc_dev = BUS_CONTROLLER_DEV(dev);
     ubc->ubc_dev->dma_fallback_init_window = true;
+    ubc->ubc_dev->next_tp_id = 1;
     ub_entity_table_init(ubc->ubc_dev);
     ub_entity_cfg_spaces_init(ubc->ubc_dev);
     if (dev->guid.type != UB_GUID_TYPE_IBUS_CONTROLLER &&
