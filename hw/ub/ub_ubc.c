@@ -239,6 +239,7 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define UBASE_OPC_QUERY_UE_RES 0x0002
 #define UBASE_OPC_QUERY_CTL_INFO 0x0003
 #define UBASE_OPC_QUERY_COMM_RSRC_PARAM 0x0030
+#define UBASE_OPC_QUERY_PORT_INFO 0x6200
 #define UBASE_OPC_QUERY_CHIP_INFO 0x6201
 #define UBASE_OPC_QUERY_OOR_CAPS 0x4200
 #define UBASE_OPC_QUERY_UB_PORT_BITMAP 0x5105
@@ -249,6 +250,10 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define UBASE_OPC_POST_MB 0x7000
 #define UBASE_OPC_QUERY_MB_ST 0x7001
 #define UBASE_OPC_UE2UE_UBASE 0xF00E
+#define UBASE_OPC_MUE_TO_UE 0xF001
+#define UBASE_OPC_UE_TO_MUE 0xF002
+
+#define UDMA_CMD_NOTIFY_MUE_SAVE_TP 0x2
 
 #define UBASE_CMD_FLAG_IN BIT(0)
 #define UBASE_CMD_FLAG_OUT BIT(1)
@@ -376,6 +381,19 @@ typedef struct QEMU_PACKED UBCCmdqDesc {
     uint32_t data[6];
 } UBCCmdqDesc;
 
+typedef struct QEMU_PACKED UBCEntityBuf {
+    uint32_t len;
+    uint32_t seq_num;
+    uint8_t data[0];
+} UBCEntityBuf;
+
+typedef struct QEMU_PACKED UBCEntityMsg {
+    uint8_t dst_ue_idx;
+    uint8_t opcode;
+    uint16_t rsv;
+    UBCEntityBuf buf;
+} UBCEntityMsg;
+
 typedef struct QEMU_PACKED UBCQueryVersionResp {
     uint32_t fw_version;
     uint8_t rsv[20];
@@ -471,6 +489,13 @@ typedef struct QEMU_PACKED UBCChipInfoResp {
     uint16_t nl_id;
     uint16_t io_port_logic_id;
 } UBCChipInfoResp;
+
+typedef struct QEMU_PACKED UBCPortInfoResp {
+    uint32_t speed;
+    uint8_t rsv[10];
+    uint8_t lanes;
+    uint8_t rsv2[9];
+} UBCPortInfoResp;
 
 typedef struct QEMU_PACKED UBCOorResp {
     uint8_t oor_en;
@@ -1263,7 +1288,7 @@ static int ubc_cmdq_push_crq_msg(BusControllerDev *ubc_dev, uint16_t opcode,
 
     descs = g_new0(UBCCmdqDesc, bd_num);
     descs[0].opcode = cpu_to_le16(opcode);
-    descs[0].flag = UBASE_CMD_FLAG_OUT | UBASE_CMD_FLAG_NO_INTR;
+    descs[0].flag = UBASE_CMD_FLAG_IN | UBASE_CMD_FLAG_OUT;
     descs[0].bd_num = bd_num;
 
     if (payload_len) {
@@ -1300,7 +1325,7 @@ static int ubc_cmdq_push_crq_msg(BusControllerDev *ubc_dev, uint16_t opcode,
         uint16_t first = (crq->tail - bd_num + crq->depth) % crq->depth;
         crq->tail = idx;
         ubc_ers2_write32(ubc_dev, UBASE_CRQ_TAIL_REG, crq->tail);
-        ubc_raise_ctrlq_event(ubc_dev);
+        ubc_raise_cmdq_event(ubc_dev);
         /* verify first desc was written to guest RAM */
         if (ubc_read_desc(crq, ubc_dev, first, &verify) == MEMTX_OK) {
             qemu_log("ubc push_crq verify[%u] opcode=0x%x flag=0x%x bd=%u"
@@ -1314,6 +1339,38 @@ static int ubc_cmdq_push_crq_msg(BusControllerDev *ubc_dev, uint16_t opcode,
     g_free(descs);
 
     return ret;
+}
+
+static int ubc_handle_ue_to_mue(BusControllerDev *ubc_dev,
+                                const uint8_t *req, size_t req_len)
+{
+    uint8_t resp[sizeof(UBCEntityMsg) + sizeof(int32_t)] = { 0 };
+    const UBCEntityMsg *req_msg = (const UBCEntityMsg *)req;
+    UBCEntityMsg *resp_msg = (UBCEntityMsg *)resp;
+    int32_t ret_code = 0;
+
+    if (req_len < sizeof(*req_msg)) {
+        qemu_log("ubc UE_TO_MUE invalid len=%zu\n", req_len);
+        return -EINVAL;
+    }
+
+    switch (req_msg->opcode) {
+    case UDMA_CMD_NOTIFY_MUE_SAVE_TP:
+        resp_msg->dst_ue_idx = req_msg->dst_ue_idx;
+        resp_msg->opcode = req_msg->opcode;
+        resp_msg->buf.len = cpu_to_le32(sizeof(ret_code));
+        resp_msg->buf.seq_num = req_msg->buf.seq_num;
+        memcpy(resp_msg->buf.data, &ret_code, sizeof(ret_code));
+
+        qemu_log("ubc UE_TO_MUE save_tp ack: dst_ue=%u seq=%u req_len=%zu\n",
+                 req_msg->dst_ue_idx, le32_to_cpu(req_msg->buf.seq_num), req_len);
+        return ubc_cmdq_push_crq_msg(ubc_dev, UBASE_OPC_MUE_TO_UE,
+                                     resp, sizeof(resp));
+    default:
+        qemu_log("ubc UE_TO_MUE unsupported opcode=0x%x len=%zu\n",
+                 req_msg->opcode, req_len);
+        return -EOPNOTSUPP;
+    }
 }
 
 static int ubc_handle_ue2ue_ctrlq(BusControllerDev *ubc_dev,
@@ -2199,6 +2256,23 @@ static size_t ubc_cmd_fill_resp(uint16_t opcode, const uint8_t *req, size_t req_
         memcpy(resp, &chip, resp_len);
         break;
     }
+    case UBASE_OPC_QUERY_PORT_INFO: {
+        UBCPortInfoResp port = { 0 };
+
+        /*
+         * Guest UDMA query_device_status() accepts only 200G/400G on the
+         * UBL-capable path. Return a stable simulated active link so
+         * query_dev_attr can complete instead of consuming an all-zero
+         * response and failing with "invalid port speed = 0".
+         */
+        port.speed = cpu_to_le32(400000);
+        port.lanes = 16;
+        resp_len = MIN(sizeof(port), resp_cap);
+        memcpy(resp, &port, resp_len);
+        qemu_log("ubc QUERY_PORT_INFO resp: speed=%u lanes=%u len=%zu\n",
+                 le32_to_cpu(port.speed), port.lanes, resp_len);
+        break;
+    }
     case UBASE_OPC_QUERY_OOR_CAPS: {
         UBCOorResp oor = { 0 };
         resp_len = MIN(sizeof(oor), resp_cap);
@@ -2474,6 +2548,8 @@ static void ubc_process_cmdq(BusControllerDev *ubc_dev)
         } else if (opcode == UBASE_OPC_UE2UE_UBASE) {
             ret = ubc_handle_ue2ue_ctrlq(ubc_dev, req_flat, req_len,
                                                    resp_flat, cap);
+        } else if (opcode == UBASE_OPC_UE_TO_MUE) {
+            ret = ubc_handle_ue_to_mue(ubc_dev, req_flat, req_len);
         } else if (opcode == UBASE_OPC_POST_MB) {
             ret = ubc_handle_post_mb(ubc_dev, req_flat, req_len, resp_flat, cap);
         } else {
