@@ -369,7 +369,9 @@ typedef enum HiMsgqPrivateOpcode {
     CC_CTX_CFG_CMD = 0,
     QUERY_UB_MEM_ROUTE_CMD = 1,
     EU_TABLE_CFG_CMD = 2,
-    CC_CTX_QUERY_CMD = 3
+    CC_CTX_QUERY_CMD = 3,
+    GET_UBMEM_EVENT_CMD = 4,
+    SIM_DEC_CTRL_CMD = 5
 } HiMsgqPrivateOpcode;
 
 typedef enum HiEuCfgStatus {

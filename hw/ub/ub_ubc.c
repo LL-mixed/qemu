@@ -333,13 +333,18 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define CQE_STATUS_RQ_EMPTY_ERR   4
 #define CQE_STATUS_DMA_ERR        5
 
-/* URMA inter-node data transfer msg_code (fits in 3-bit msg_code field) */
-#define UB_MSG_CODE_URMA_DATA  7
-
 /* Extended msg_codes for RDMA READ/WRITE (stored in msgetah) */
 #define UB_MSG_CODE_URMA_READ_REQ  6
 #define UB_MSG_CODE_URMA_READ_RESP 5
 #define UB_MSG_CODE_URMA_WRITE     4
+
+#define UBC_SIM_DEC_MAX_MSG_PAYLOAD 4095
+#define UBC_SIM_DEC_WRITE_CHUNK_MAX \
+    (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)sizeof(UBCSimDecWritePldHdr))
+#define UBC_SIM_DEC_READ_CHUNK_MAX \
+    (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)sizeof(UBCSimDecReadRespPldHdr))
+#define UBC_SIM_DEC_READ_WAIT_USEC  1000
+#define UBC_SIM_DEC_READ_WAIT_LOOPS 2000
 
 /* Doorbell/MMIO region constants (matches UAPI) */
 #define UDMA_JETTY_DSQE_OFFSET   0x1000
@@ -944,6 +949,17 @@ static inline void ubc_close_dma_fallback_window(BusControllerDev *ubc_dev,
              reason ? reason : "unspecified");
 }
 
+static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
+                                            uint64_t remote_uba,
+                                            uint32_t token_id,
+                                            const uint8_t *data,
+                                            uint32_t len);
+static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
+                                           uint64_t remote_uba,
+                                           uint32_t token_id,
+                                           uint8_t *data,
+                                           uint32_t len);
+
 /*
  * General-purpose DMA read from an IOVA address.
  * Tries IOMMU address space first, then CSQ learned bias,
@@ -963,6 +979,17 @@ static MemTxResult ubc_dma_read_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
     bool trace_iova = ((iova & 0xFFFFFFFFFFFFF000ULL) == 0xFFFF8000805E6000ULL);
     bool tid_override_active = false;
     UMMUTidOverrideScope tid_scope = { 0 };
+    uint64_t remote_uba = 0;
+    uint32_t map_token_id = 0;
+
+    if (path == UBC_DMA_ACCESS_DATA && ubc_dev &&
+        len > 0 &&
+        sim_dec_lookup_by_pa((uint64_t)iova, &remote_uba, &map_token_id,
+                             NULL) == 0) {
+        uint32_t eff_token_id = map_token_id ? map_token_id : tid;
+        return ubc_sim_dec_remote_read(ubc_dev, remote_uba, eff_token_id,
+                                       (uint8_t *)buf, (uint32_t)len);
+    }
 
     if (ubc_dev && ubc_dev->ummu && tid != UBC_DMA_TID_AUTO) {
         tid_scope = ummu_dma_tid_override_enter(ubc_dev->ummu, tid);
@@ -1032,6 +1059,18 @@ static MemTxResult ubc_dma_write_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
     MemTxResult ret;
     bool tid_override_active = false;
     UMMUTidOverrideScope tid_scope = { 0 };
+    uint64_t remote_uba = 0;
+    uint32_t map_token_id = 0;
+
+    if (path == UBC_DMA_ACCESS_DATA && ubc_dev &&
+        len > 0 &&
+        sim_dec_lookup_by_pa((uint64_t)iova, &remote_uba, &map_token_id,
+                             NULL) == 0) {
+        uint32_t eff_token_id = map_token_id ? map_token_id : tid;
+        return ubc_sim_dec_remote_write(ubc_dev, remote_uba, eff_token_id,
+                                        (const uint8_t *)buf,
+                                        (uint32_t)len);
+    }
 
     if (ubc_dev && ubc_dev->ummu && tid != UBC_DMA_TID_AUTO) {
         tid_scope = ummu_dma_tid_override_enter(ubc_dev->ummu, tid);
@@ -3082,6 +3121,340 @@ static UBFMManagedLink *ubc_find_fm_link(UBDevice *ub_dev, uint32_t *dcna)
     return fm_link;
 }
 
+static UBLinkState *ubc_find_active_link(BusControllerDev *ubc_dev, uint32_t *dcna)
+{
+    UBDevice *ub_dev = ubc_dev ? &ubc_dev->parent : NULL;
+    UBFMManagedLink *fm_link;
+
+    if (!ub_dev) {
+        return NULL;
+    }
+
+    fm_link = ubc_find_fm_link(ub_dev, dcna);
+    if (!fm_link || !fm_link->runtime) {
+        return NULL;
+    }
+    if (!fm_link->runtime->link_up || !fm_link->runtime->ioc) {
+        return NULL;
+    }
+
+    return fm_link->runtime;
+}
+
+static int ubc_send_msg_over_link(BusControllerDev *ubc_dev, UBLinkState *link,
+                                  uint32_t dcna, uint8_t sub_msg_code,
+                                  const void *payload, uint32_t payload_len)
+{
+    UBDevice *ub_dev = &ubc_dev->parent;
+    Error *local_err = NULL;
+    size_t total_len = sizeof(MsgPktHeader) + payload_len;
+    uint8_t *pkt = g_malloc0(total_len);
+    MsgPktHeader *hdr = (MsgPktHeader *)pkt;
+    int rc;
+
+    hdr->ulh.cfg = UB_CLAN_LINK_CFG;
+    hdr->ulh.plen = payload_len;
+    hdr->nth.scna = ub_dev->cna;
+    hdr->nth.dcna = dcna;
+    hdr->msgetah.msg_code = UBC_MSG_CODE_URMA_DATA;
+    hdr->msgetah.sub_msg_code = sub_msg_code;
+    hdr->msgetah.type = 1;
+    hdr->msgetah.plen = payload_len & 0xFFF;
+    if (payload_len) {
+        memcpy(pkt + sizeof(MsgPktHeader), payload, payload_len);
+    }
+
+    rc = ub_link_write_message(link, pkt, total_len, &local_err);
+    if (rc < 0) {
+        qemu_log("ubc sim_dec: ub_link write failed sub=%u: %s\n",
+                 sub_msg_code,
+                 local_err ? error_get_pretty(local_err) : "unknown");
+        if (local_err) {
+            error_free(local_err);
+        }
+    } else {
+        ub_link_kick_remote(link, NULL);
+    }
+    g_free(pkt);
+    return rc;
+}
+
+static MemTxResult ubc_dma_read_local_data_tid_strict(BusControllerDev *ubc_dev,
+                                                      dma_addr_t iova,
+                                                      void *buf, size_t len,
+                                                      uint32_t tid)
+{
+    AddressSpace *as = ubc_dma_as(ubc_dev);
+    bool tid_override_active = false;
+    UMMUTidOverrideScope tid_scope = { 0 };
+    MemTxResult ret;
+
+    if (ubc_dev && ubc_dev->ummu && tid != UBC_DMA_TID_AUTO) {
+        tid_scope = ummu_dma_tid_override_enter(ubc_dev->ummu, tid);
+        tid_override_active = true;
+    }
+    ret = address_space_read(as, iova, MEMTXATTRS_UNSPECIFIED, buf, len);
+    if (tid_override_active) {
+        ummu_dma_tid_override_leave(ubc_dev->ummu, tid_scope);
+    }
+    return ret;
+}
+
+static MemTxResult ubc_dma_write_local_data_tid_strict(BusControllerDev *ubc_dev,
+                                                       dma_addr_t iova,
+                                                       const void *buf,
+                                                       size_t len,
+                                                       uint32_t tid)
+{
+    AddressSpace *as = ubc_dma_as(ubc_dev);
+    bool tid_override_active = false;
+    UMMUTidOverrideScope tid_scope = { 0 };
+    MemTxResult ret;
+
+    if (ubc_dev && ubc_dev->ummu && tid != UBC_DMA_TID_AUTO) {
+        tid_scope = ummu_dma_tid_override_enter(ubc_dev->ummu, tid);
+        tid_override_active = true;
+    }
+    ret = address_space_write(as, iova, MEMTXATTRS_UNSPECIFIED, buf, len);
+    if (tid_override_active) {
+        ummu_dma_tid_override_leave(ubc_dev->ummu, tid_scope);
+    }
+    return ret;
+}
+
+void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
+                                 const UBCSimDecWritePldHdr *hdr,
+                                 const uint8_t *data, uint32_t data_len)
+{
+    uint32_t eff_tid;
+    MemTxResult ret;
+
+    if (!ubc_dev || !hdr || !data || data_len == 0) {
+        return;
+    }
+    if (hdr->data_len != data_len) {
+        qemu_log("ubc sim_dec rx write: len mismatch hdr=%u data=%u\n",
+                 hdr->data_len, data_len);
+        return;
+    }
+
+    eff_tid = ubc_tid_or_auto(hdr->token_id);
+    ret = ubc_dma_write_local_data_tid_strict(ubc_dev, hdr->remote_uba,
+                                              data, data_len, eff_tid);
+    if (ret != MEMTX_OK) {
+        qemu_log("ubc sim_dec rx write: DMA write failed uba=%#" PRIx64
+                 " len=%u tid=%u ret=%d\n",
+                 (uint64_t)hdr->remote_uba, data_len, eff_tid, ret);
+    }
+}
+
+void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
+                                    const UBCSimDecReadReqPld *req,
+                                    uint32_t dcna)
+{
+    UBLinkState *link;
+    uint32_t payload_len;
+    uint32_t eff_tid;
+    uint8_t *payload;
+    UBCSimDecReadRespPldHdr *resp;
+    MemTxResult ret;
+    int rc;
+
+    if (!ubc_dev || !req || req->read_len == 0 ||
+        req->read_len > UBC_SIM_DEC_READ_CHUNK_MAX) {
+        return;
+    }
+
+    link = ubc_find_active_link(ubc_dev, &dcna);
+    if (!link) {
+        qemu_log("ubc sim_dec rx read_req: no active link dcna=%#x\n", dcna);
+        return;
+    }
+
+    payload_len = sizeof(*resp) + req->read_len;
+    payload = g_malloc0(payload_len);
+    resp = (UBCSimDecReadRespPldHdr *)payload;
+    resp->req_id = req->req_id;
+    resp->status = 0;
+    resp->data_len = req->read_len;
+    eff_tid = ubc_tid_or_auto(req->token_id);
+
+    ret = ubc_dma_read_local_data_tid_strict(ubc_dev, req->remote_uba,
+                                             payload + sizeof(*resp),
+                                             req->read_len, eff_tid);
+    if (ret != MEMTX_OK) {
+        resp->status = 1;
+        resp->data_len = 0;
+    }
+
+    rc = ubc_send_msg_over_link(ubc_dev, link, dcna,
+                                UBC_MSG_SUB_SIM_DEC_READ_RESP,
+                                payload, sizeof(*resp) + resp->data_len);
+    if (rc < 0) {
+        qemu_log("ubc sim_dec rx read_req: send resp failed req=%u\n",
+                 req->req_id);
+    }
+    g_free(payload);
+}
+
+void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
+                                     const UBCSimDecReadRespPldHdr *hdr,
+                                     const uint8_t *data, uint32_t data_len)
+{
+    uint32_t copy_len;
+
+    if (!ubc_dev || !hdr) {
+        return;
+    }
+    if (!ubc_dev->sim_dec_sync_read.pending ||
+        ubc_dev->sim_dec_sync_read.req_id != hdr->req_id) {
+        qemu_log("ubc sim_dec rx read_resp: stale req=%u pending=%u cur=%u\n",
+                 hdr->req_id, ubc_dev->sim_dec_sync_read.pending,
+                 ubc_dev->sim_dec_sync_read.req_id);
+        return;
+    }
+
+    copy_len = MIN(hdr->data_len, ubc_dev->sim_dec_sync_read.expect_len);
+    copy_len = MIN(copy_len, data_len);
+    if (copy_len > 0 && ubc_dev->sim_dec_sync_read.buf) {
+        memcpy(ubc_dev->sim_dec_sync_read.buf, data, copy_len);
+    }
+    ubc_dev->sim_dec_sync_read.actual_len = copy_len;
+    ubc_dev->sim_dec_sync_read.status = hdr->status ? -EIO : 0;
+    ubc_dev->sim_dec_sync_read.pending = false;
+}
+
+static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
+                                            uint64_t remote_uba,
+                                            uint32_t token_id,
+                                            const uint8_t *data,
+                                            uint32_t len)
+{
+    UBLinkState *link;
+    uint32_t dcna = 0;
+    uint32_t done = 0;
+
+    if (!ubc_dev || !data || !len) {
+        return MEMTX_DECODE_ERROR;
+    }
+    link = ubc_find_active_link(ubc_dev, &dcna);
+    if (!link) {
+        qemu_log("ubc sim_dec write: no active link\n");
+        return MEMTX_DECODE_ERROR;
+    }
+
+    while (done < len) {
+        uint32_t chunk = MIN(len - done, UBC_SIM_DEC_WRITE_CHUNK_MAX);
+        uint32_t payload_len = sizeof(UBCSimDecWritePldHdr) + chunk;
+        uint8_t *payload = g_malloc(payload_len);
+        UBCSimDecWritePldHdr *hdr = (UBCSimDecWritePldHdr *)payload;
+        int rc;
+
+        hdr->remote_uba = remote_uba + done;
+        hdr->token_id = token_id;
+        hdr->data_len = chunk;
+        memcpy(payload + sizeof(*hdr), data + done, chunk);
+
+        rc = ubc_send_msg_over_link(ubc_dev, link, dcna,
+                                    UBC_MSG_SUB_SIM_DEC_WRITE,
+                                    payload, payload_len);
+        g_free(payload);
+        if (rc < 0) {
+            return MEMTX_DECODE_ERROR;
+        }
+        done += chunk;
+    }
+
+    return MEMTX_OK;
+}
+
+static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
+                                           uint64_t remote_uba,
+                                           uint32_t token_id,
+                                           uint8_t *data,
+                                           uint32_t len)
+{
+    UBLinkState *link;
+    BusControllerState *bcs;
+    uint32_t dcna = 0;
+    uint32_t done = 0;
+
+    if (!ubc_dev || !data || !len) {
+        return MEMTX_DECODE_ERROR;
+    }
+    link = ubc_find_active_link(ubc_dev, &dcna);
+    if (!link) {
+        qemu_log("ubc sim_dec read: no active link\n");
+        return MEMTX_DECODE_ERROR;
+    }
+    bcs = container_of_ubbus(ub_get_bus(&ubc_dev->parent));
+    if (!bcs) {
+        return MEMTX_DECODE_ERROR;
+    }
+
+    while (done < len) {
+        UBCSimDecReadReqPld req = { 0 };
+        uint32_t chunk = MIN(len - done, UBC_SIM_DEC_READ_CHUNK_MAX);
+        int rc;
+        int loop;
+
+        if (ubc_dev->sim_dec_sync_read.pending) {
+            qemu_log("ubc sim_dec read: another sync read pending req=%u\n",
+                     ubc_dev->sim_dec_sync_read.req_id);
+            return MEMTX_DECODE_ERROR;
+        }
+
+        ubc_dev->sim_dec_sync_read.pending = true;
+        ubc_dev->sim_dec_sync_read.req_id = ++ubc_dev->next_sim_dec_read_req_id;
+        if (ubc_dev->sim_dec_sync_read.req_id == 0) {
+            ubc_dev->sim_dec_sync_read.req_id = ++ubc_dev->next_sim_dec_read_req_id;
+        }
+        ubc_dev->sim_dec_sync_read.expect_len = chunk;
+        ubc_dev->sim_dec_sync_read.actual_len = 0;
+        ubc_dev->sim_dec_sync_read.status = -ETIMEDOUT;
+        ubc_dev->sim_dec_sync_read.buf = data + done;
+
+        req.req_id = ubc_dev->sim_dec_sync_read.req_id;
+        req.token_id = token_id;
+        req.remote_uba = remote_uba + done;
+        req.read_len = chunk;
+        rc = ubc_send_msg_over_link(ubc_dev, link, dcna,
+                                    UBC_MSG_SUB_SIM_DEC_READ_REQ,
+                                    &req, sizeof(req));
+        if (rc < 0) {
+            ubc_dev->sim_dec_sync_read.pending = false;
+            return MEMTX_DECODE_ERROR;
+        }
+
+        for (loop = 0; loop < UBC_SIM_DEC_READ_WAIT_LOOPS; loop++) {
+            if (!ubc_dev->sim_dec_sync_read.pending) {
+                break;
+            }
+            ub_link_process_incoming_message(bcs, link);
+            if (!ubc_dev->sim_dec_sync_read.pending) {
+                break;
+            }
+            g_usleep(UBC_SIM_DEC_READ_WAIT_USEC);
+        }
+
+        if (ubc_dev->sim_dec_sync_read.pending) {
+            qemu_log("ubc sim_dec read: timeout req=%u\n", req.req_id);
+            ubc_dev->sim_dec_sync_read.pending = false;
+            return MEMTX_DECODE_ERROR;
+        }
+        if (ubc_dev->sim_dec_sync_read.status != 0 ||
+            ubc_dev->sim_dec_sync_read.actual_len != chunk) {
+            qemu_log("ubc sim_dec read: bad resp req=%u status=%d len=%u expect=%u\n",
+                     req.req_id, ubc_dev->sim_dec_sync_read.status,
+                     ubc_dev->sim_dec_sync_read.actual_len, chunk);
+            return MEMTX_DECODE_ERROR;
+        }
+        done += chunk;
+    }
+
+    return MEMTX_OK;
+}
+
 /*
  * Send URMA data payload over ub_link to the remote node.
  * Wraps the data in a MsgPktHeader with msg_code=UB_MSG_CODE_URMA_DATA
@@ -3151,7 +3524,8 @@ static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState 
         hdr->deid = rmt_obj_id & 0xFFFFF;
 
         /* MsgExtendedHeader (DW7): use different msg_code for WRITE vs SEND */
-        hdr->msgetah.msg_code = is_write ? UB_MSG_CODE_URMA_WRITE : UB_MSG_CODE_URMA_DATA;
+        hdr->msgetah.msg_code = is_write ? UB_MSG_CODE_URMA_WRITE : UBC_MSG_CODE_URMA_DATA;
+        hdr->msgetah.sub_msg_code = is_write ? 0 : UBC_MSG_SUB_URMA_DATA;
         hdr->msgetah.type = 1;  /* data (not request) */
         hdr->msgetah.plen = (write_hdr_len + payload_len) & 0xFFF;
 
@@ -5505,7 +5879,7 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
 {
     const SimDecMsgHdr *hdr;
     uint32_t min_len;
-    int ret = -1;
+    int ret = 0;
 
     if (len < sizeof(*hdr)) {
         qemu_log("SIM_DEC: message too short\n");
@@ -5525,6 +5899,7 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
     resp_hdr->opcode = hdr->opcode;
     resp_hdr->seq = hdr->seq;
     resp_hdr->status = SIM_DEC_STATUS_SUCCESS;
+    resp_hdr->payload_len = 0;
 
     switch (hdr->opcode) {
     case SIM_DEC_OP_MAP:
@@ -5535,7 +5910,7 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         }
         {
             SimDecMapResp map_resp = {0};
-            ret = sim_dec_handle_map((const SimDecMapReq *)(data + sizeof(*hdr)),
+            (void)sim_dec_handle_map((const SimDecMapReq *)(data + sizeof(*hdr)),
                                      &map_resp);
             resp_hdr->payload_len = sizeof(map_resp);
             memcpy(resp + sizeof(*resp_hdr), &map_resp, sizeof(map_resp));
@@ -5575,7 +5950,7 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         }
         {
             SimDecQueryResp query_resp = {0};
-            ret = sim_dec_handle_query(
+            (void)sim_dec_handle_query(
                 (const SimDecQueryReq *)(data + sizeof(*hdr)), &query_resp);
             resp_hdr->payload_len = sizeof(query_resp);
             memcpy(resp + sizeof(*resp_hdr), &query_resp, sizeof(query_resp));

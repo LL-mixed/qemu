@@ -34,7 +34,6 @@
 #include "hw/ub/hisi/ub_fm.h"
 #include "qemu/timer.h"
 
-#define UB_MSG_CODE_URMA_DATA   7  /* URMA data transfer between nodes (SEND/RECV) */
 #define UB_MSG_CODE_URMA_WRITE  4  /* RDMA WRITE operation */
 
 /* RDMA WRITE payload header - must match definition in ub_ubc.c */
@@ -473,18 +472,57 @@ static void handle_eu_table_cfg_cmd(BusControllerState *s, HiMsgSqe *sqe, void *
     (void)fill_cq(s, &cqe);
 }
 
+static void handle_sim_dec_ctrl_cmd(BusControllerState *s, HiMsgSqe *sqe, void *payload)
+{
+    uint8_t rsp_buf[HI_MSG_SQE_PLD_SIZE];
+    uint32_t rsp_len = sizeof(rsp_buf);
+    HiMsgCqe cqe;
+    int ret;
+
+    ret = ubc_handle_sim_dec_message((const uint8_t *)payload, sqe->p_len,
+                                     rsp_buf, &rsp_len);
+
+    memset(&cqe, 0, sizeof(cqe));
+    cqe.opcode = SIM_DEC_CTRL_CMD;
+    cqe.task_type = HISI_PRIVATE;
+    cqe.msn = sqe->msn;
+
+    if (ret < 0 || rsp_len > HI_MSG_SQE_PLD_SIZE) {
+        qemu_log("SIM_DEC: private cmd failed opcode=%u ret=%d rsp_len=%u\n",
+                 sqe->opcode, ret, rsp_len);
+        cqe.status = CQE_FAIL;
+        cqe.p_len = 0;
+        cqe.rq_pi = ub_get_long(s->msgq_reg + RQ_PI);
+    } else {
+        cqe.status = CQE_SUCCESS;
+        cqe.p_len = rsp_len;
+        cqe.rq_pi = fill_rq(s, rsp_buf, rsp_len);
+        if (cqe.rq_pi == UINT32_MAX) {
+            qemu_log("SIM_DEC: fill_rq failed for response len=%u\n", rsp_len);
+            cqe.status = CQE_FAIL;
+            cqe.p_len = 0;
+            cqe.rq_pi = ub_get_long(s->msgq_reg + RQ_PI);
+        }
+    }
+
+    (void)fill_cq(s, &cqe);
+}
+
 static void (*hisi_private_handlers[])(BusControllerState *s, HiMsgSqe *sqe, void *payload) = {
     [CC_CTX_CFG_CMD] = NULL,
     [QUERY_UB_MEM_ROUTE_CMD] = NULL,
     [EU_TABLE_CFG_CMD] = handle_eu_table_cfg_cmd,
     [CC_CTX_QUERY_CMD] = NULL,
+    [GET_UBMEM_EVENT_CMD] = NULL,
+    [SIM_DEC_CTRL_CMD] = handle_sim_dec_ctrl_cmd,
 };
 
 static void handle_task_type_hisi_private(BusControllerState *s, HiMsgSqe *sqe)
 {
-    HiEuCfgReq *payload = NULL;
+    uint8_t *payload = NULL;
     uint8_t opcode = sqe->opcode;
     uint32_t p_addr = sqe->p_addr;
+    uint32_t p_len = sqe->p_len;
 
     if (opcode >= ARRAY_SIZE(hisi_private_handlers)) {
         qemu_log("invalid msg code %u, array size %lu\n",
@@ -497,10 +535,14 @@ static void handle_task_type_hisi_private(BusControllerState *s, HiMsgSqe *sqe)
         return;
     }
 
-    assert(HI_MSG_SQE_PLD_SIZE > sizeof(HiEuCfgReq));
-    payload = g_malloc0(sizeof(HiEuCfgReq));
+    if (p_len == 0 || p_len > HI_MSG_SQE_PLD_SIZE) {
+        qemu_log("invalid hisi private payload len %u\n", p_len);
+        return;
+    }
+
+    payload = g_malloc0(p_len);
     if (dma_memory_read(&address_space_memory, s->msgq.sq_base_addr_gpa + p_addr,
-                        payload, sizeof(HiEuCfgReq), MEMTXATTRS_MEMORY)) {
+                        payload, p_len, MEMTXATTRS_MEMORY)) {
         qemu_log("Failed to read sq_base_addr_gpa entry\n");
         g_free(payload);
         return;
@@ -739,16 +781,58 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
         qemu_log("ubc_msgq: received remote msg code=%u len=%zu\n",
                  header->msgetah.msg_code, len);
 
-        /* URMA data packets (msg_code=7) are forwarded to ub_ubc.c handler */
-        if (header->msgetah.msg_code == UB_MSG_CODE_URMA_DATA &&
+        if (header->msgetah.msg_code == UBC_MSG_CODE_URMA_DATA &&
             s->ubc_dev && len > sizeof(MsgPktHeader)) {
-            uint32_t dst_jetty = header->deid & 0xFFFFF;
-            uint8_t *data = (uint8_t *)buf + sizeof(MsgPktHeader);
-            uint32_t data_len = len - sizeof(MsgPktHeader);
+            const uint8_t *payload = (const uint8_t *)buf + sizeof(MsgPktHeader);
+            uint32_t payload_len = len - sizeof(MsgPktHeader);
 
-            ubc_handle_urma_rx_data(s->ubc_dev, dst_jetty, data, data_len);
-            g_free(buf);
-            continue;
+            switch (header->msgetah.sub_msg_code) {
+            case UBC_MSG_SUB_URMA_DATA: {
+                uint32_t dst_jetty = header->deid & 0xFFFFF;
+                ubc_handle_urma_rx_data(s->ubc_dev, dst_jetty, payload,
+                                        payload_len);
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_SIM_DEC_WRITE: {
+                if (payload_len >= sizeof(UBCSimDecWritePldHdr)) {
+                    const UBCSimDecWritePldHdr *wr =
+                        (const UBCSimDecWritePldHdr *)payload;
+                    const uint8_t *wr_data = payload + sizeof(*wr);
+                    uint32_t wr_len = payload_len - sizeof(*wr);
+
+                    ubc_handle_sim_dec_rx_write(s->ubc_dev, wr, wr_data, wr_len);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_SIM_DEC_READ_REQ: {
+                if (payload_len >= sizeof(UBCSimDecReadReqPld)) {
+                    const UBCSimDecReadReqPld *req =
+                        (const UBCSimDecReadReqPld *)payload;
+
+                    ubc_handle_sim_dec_rx_read_req(s->ubc_dev, req,
+                                                   header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_SIM_DEC_READ_RESP: {
+                if (payload_len >= sizeof(UBCSimDecReadRespPldHdr)) {
+                    const UBCSimDecReadRespPldHdr *resp =
+                        (const UBCSimDecReadRespPldHdr *)payload;
+                    const uint8_t *rd_data = payload + sizeof(*resp);
+                    uint32_t rd_len = payload_len - sizeof(*resp);
+
+                    ubc_handle_sim_dec_rx_read_resp(s->ubc_dev, resp, rd_data,
+                                                    rd_len);
+                }
+                g_free(buf);
+                continue;
+            }
+            default:
+                break;
+            }
         }
 
         /* RDMA WRITE (msg_code=4): remote node writes to our memory directly */

@@ -207,6 +207,15 @@ typedef struct BusControllerDev {
         } entries[UBC_MAX_PENDING_READS];
     } pending_reads;
     uint32_t next_read_req_id;
+    struct {
+        bool pending;
+        uint32_t req_id;
+        uint32_t expect_len;
+        uint32_t actual_len;
+        int status;
+        uint8_t *buf;
+    } sim_dec_sync_read;
+    uint32_t next_sim_dec_read_req_id;
     uint32_t next_tp_id;
 } BusControllerDev;
 
@@ -304,6 +313,46 @@ void ubc_handle_read_request(BusControllerDev *ubc_dev, const UBCReadReqPld *req
                               uint32_t dcna);
 void ubc_handle_read_response(BusControllerDev *ubc_dev, const UBCReadRespPld *resp,
                                 const uint8_t *data, uint32_t data_len);
+
+/* Cross-node SIM_DEC data-plane message (msg_code=7, distinguished by sub_msg_code). */
+#define UBC_MSG_CODE_URMA_DATA        7
+#define UBC_MSG_SUB_URMA_DATA         0
+#define UBC_MSG_SUB_SIM_DEC_WRITE     1
+#define UBC_MSG_SUB_SIM_DEC_READ_REQ  2
+#define UBC_MSG_SUB_SIM_DEC_READ_RESP 3
+
+typedef struct QEMU_PACKED UBCSimDecWritePldHdr {
+    uint64_t remote_uba;
+    uint32_t token_id;
+    uint32_t data_len;
+    /* data follows */
+} UBCSimDecWritePldHdr;
+
+typedef struct QEMU_PACKED UBCSimDecReadReqPld {
+    uint32_t req_id;
+    uint32_t token_id;
+    uint64_t remote_uba;
+    uint32_t read_len;
+    uint32_t rsvd;
+} UBCSimDecReadReqPld;
+
+typedef struct QEMU_PACKED UBCSimDecReadRespPldHdr {
+    uint32_t req_id;
+    uint32_t status;
+    uint32_t data_len;
+    uint32_t rsvd;
+    /* data follows */
+} UBCSimDecReadRespPldHdr;
+
+void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
+                                 const UBCSimDecWritePldHdr *hdr,
+                                 const uint8_t *data, uint32_t data_len);
+void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
+                                    const UBCSimDecReadReqPld *req,
+                                    uint32_t dcna);
+void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
+                                     const UBCSimDecReadRespPldHdr *hdr,
+                                     const uint8_t *data, uint32_t data_len);
 
 /* SIM Decoder (SIM_DEC) protocol for cross-node memory access */
 int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,

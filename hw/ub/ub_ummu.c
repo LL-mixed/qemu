@@ -102,6 +102,8 @@ static const char *const ummu_event_type_strings[EVT_MAX] = {
 QLIST_HEAD(, UMMUState) ub_umms;
 static bool g_dma_tid_override_valid;
 static uint32_t g_dma_tid_override;
+static uint32_t g_evt_a_translation_log_budget = 64;
+static bool g_evt_a_translation_log_suppressed;
 UMMUState *ummu_find_by_bus_num(uint8_t bus_num)
 {
     UMMUState *ummu;
@@ -2066,6 +2068,11 @@ static uint32_t ummu_get_tecte_tag_by_dest_eid(UMMUState *u, uint32_t dst_eid)
     return entry->tecte_tag;
 }
 
+static inline bool ummu_tect_ready(UMMUState *ummu)
+{
+    return TECT_BASE_ADDR(ummu->tect_base) != 0;
+}
+
 static int ummu_find_tecte(UMMUState *ummu, uint32_t tecte_tag, TECTE *tecte)
 {
     dma_addr_t tect_base_addr = TECT_BASE_ADDR(ummu->tect_base);
@@ -2074,9 +2081,7 @@ static int ummu_find_tecte(UMMUState *ummu, uint32_t tecte_tag, TECTE *tecte)
     int i;
 
     if (!tect_base_addr) {
-        fprintf(stderr, "ummu_find_tecte: tect_base is ZERO, "
-                "guest driver has not programmed TECT base yet\n");
-        return -EINVAL;
+        return -EAGAIN;
     }
 
     if (ummu_tect_fmt_2level(ummu)) {
@@ -2090,15 +2095,9 @@ static int ummu_find_tecte(UMMUState *ummu, uint32_t tecte_tag, TECTE *tecte)
         l2_tecte_offset = tecte_tag & ((1 << split) - 1);
         l1ptr = (dma_addr_t)(tect_base_addr + l1_tecte_offset * sizeof(l1_tecte_desc));
 
-        fprintf(stderr, "ummu_find_tecte: tag=%u split=%u l1_off=%d l2_off=%d "
-                "l1ptr=0x%llx\n", tecte_tag, split, l1_tecte_offset,
-                l2_tecte_offset, (unsigned long long)l1ptr);
-
         ret = dma_memory_read(&address_space_memory, l1ptr, &l1_tecte_desc,
                               sizeof(l1_tecte_desc), MEMTXATTRS_MEMORY);
         if (ret != MEMTX_OK) {
-            fprintf(stderr, "ummu_find_tecte: DMA read FAILED for L1 desc at "
-                    "0x%llx ret=%d\n", (unsigned long long)l1ptr, ret);
             qemu_log("dma read failed for tecte level1 desc.\n");
             return -EINVAL;
         }
@@ -2108,11 +2107,7 @@ static int ummu_find_tecte(UMMUState *ummu, uint32_t tecte_tag, TECTE *tecte)
         }
 
         if (TECT_DESC_V(&l1_tecte_desc) == 0) {
-            fprintf(stderr, "ummu_find_tecte: L1 desc INVALID at 0x%llx "
-                    "tag=%u — guest driver has not programmed this TECTE yet\n",
-                    (unsigned long long)l1ptr, tecte_tag);
-            qemu_log("tecte desc is invalid\n");
-            return -EINVAL;
+            return -EAGAIN;
         }
 
         l2ptr = TECT_L2TECTE_PTR(&l1_tecte_desc);
@@ -2309,26 +2304,19 @@ static int ummu_tect_parse_sparse_table(UMMUDevice *ummu_dev, UMMUTransCfg *cfg,
 
     tecte_tag = ummu_get_tecte_tag_by_dest_eid(ummu, dest_eid);
     if (tecte_tag == UINT32_MAX) {
-        fprintf(stderr, "ummu_tect_parse: no kvtbl entry for dest_eid=0x%x "
-                "kvtbl_entrys=%u\n", dest_eid, ummu->kvtbl_entrys);
         qemu_log("failed to get tecte tag by dest_eid(%u).\n", dest_eid);
         event->type = EVT_BAD_DSTEID;
         goto failed;
     }
 
-    fprintf(stderr, "ummu_tect_parse: dest_eid=0x%x tecte_tag=%u "
-            "tect_base=0x%llx tect_base_cfg=0x%x\n",
-            dest_eid, tecte_tag,
-            (unsigned long long)TECT_BASE_ADDR(ummu->tect_base),
-            ummu->tect_base_cfg);
-
     ret = ummu_find_tecte(ummu, tecte_tag, &tecte);
     if (ret) {
-        event->type = EVT_TECT_FETCH;
-        fprintf(stderr, "ummu_tect_parse: find_tecte FAILED tecte_tag=%u "
-                "tect_base=0x%llx ret=%d\n",
-                tecte_tag, (unsigned long long)ummu->tect_base, ret);
-        qemu_log("failed to find tecte: %d\n", ret);
+        if (ret == -EAGAIN) {
+            event->type = EVT_NONE;
+        } else {
+            event->type = EVT_TECT_FETCH;
+            qemu_log("failed to find tecte: %d\n", ret);
+        }
         goto failed;
     }
 
@@ -2377,33 +2365,22 @@ static int ummu_decode_config(UMMUDevice *ummu_dev, UMMUTransCfg *cfg, UMMUEvent
      */
     if (!dest_eid && ummu_dev->udev->eid) {
         dest_eid = ummu_dev->udev->eid;
-        fprintf(stderr, "UMMU DEBUG: fallback dest_eid to udev->eid=%#x\n",
-                dest_eid);
     }
 
-    fprintf(stderr, "UMMU DEBUG: decoding config for dev=%s (eid=%#x)\n",
-            ummu_dev->udev->qdev.id ? ummu_dev->udev->qdev.id : "?", dest_eid);
-
     if (ummu_tect_mode_sparse_table(ummu)) {
-        fprintf(stderr, "UMMU DEBUG: Sparse TECT mode detected. Base=%#" PRIx64 "\n",
-                ummu->tect_base);
         if (!dest_eid) {
             event->type = EVT_BAD_DSTEID;
             return -EINVAL;
         }
-
-        int ret = ummu_tect_parse_sparse_table(ummu_dev, cfg, dest_eid, event);
-        if (ret == 0) {
-            fprintf(stderr, "UMMU DEBUG: Parsed TECTE: st_mode=%u tid=%u tct_ptr=%#" PRIx64 " sz=%u tgs=%u\n",
-                    cfg->st_mode, cfg->tid, cfg->tct_ptr, cfg->tct_sz, cfg->tct_tgs);
-        } else {
-            fprintf(stderr, "UMMU DEBUG: TECTE parse FAILED for eid=%#x\n", dest_eid);
+        if (!ummu_tect_ready(ummu)) {
+            event->type = EVT_NONE;
+            return -EAGAIN;
         }
-        return ret;
+
+        return ummu_tect_parse_sparse_table(ummu_dev, cfg, dest_eid, event);
     }
 
     /* Fallback/Linear mode info */
-    fprintf(stderr, "UMMU DEBUG: Linear TECT mode (unsupported by current emu code)\n");
     event->type = EVT_TECT_FETCH;
     event->tecte_tag = ummu_get_tecte_tag_by_dest_eid(ummu, dest_eid);
 
@@ -2601,8 +2578,16 @@ static void ummu_record_event(UMMUState *u, UMMUEventInfo *info)
     EVT_SET_TECTE_TAG(&evt, info->tecte_tag);
     EVT_SET_TID(&evt, info->tid);
 
-    qemu_log("report event %s: tecte_tag %u tid %u\n",
-              ummu_event_type_strings[info->type], info->tecte_tag, info->tid);
+    if (info->type != EVT_A_TRANSLATION || g_evt_a_translation_log_budget > 0) {
+        if (info->type == EVT_A_TRANSLATION && g_evt_a_translation_log_budget > 0) {
+            g_evt_a_translation_log_budget--;
+        }
+        qemu_log("report event %s: tecte_tag %u tid %u\n",
+                  ummu_event_type_strings[info->type], info->tecte_tag, info->tid);
+    } else if (!g_evt_a_translation_log_suppressed) {
+        qemu_log("report event EVT_A_TRANSLATION: further logs suppressed\n");
+        g_evt_a_translation_log_suppressed = true;
+    }
 
     r = ummu_write_eventq(u, &evt);
     if (r != MEMTX_OK) {
@@ -2712,9 +2697,6 @@ static IOMMUTLBEntry ummu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
      */
     cfg = ummu_get_config_for_translate(ummu_dev, &event, &override_cfg);
     if (cfg) {
-        fprintf(stderr, "ummu_translate: dev=%s addr=%#llx cfg found st_mode=%u\n",
-                 ummu_dev->udev->qdev.id ? ummu_dev->udev->qdev.id : "?",
-                 (unsigned long long)addr, cfg->st_mode);
         switch (cfg->st_mode) {
         case TECTE_ST_MODE_BYPASS:
             goto epilogue;
@@ -2747,9 +2729,6 @@ static IOMMUTLBEntry ummu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
              * Alias it to the start of RAM (0x40000000) to allow early boot DMA to succeed.
              */
             entry.translated_addr = 0x40000000ULL + (addr & 0xFFFFFFFFULL);
-            fprintf(stderr, "ummu_translate: ALIAS applied for dev=%s addr=%#llx -> %#llx\n",
-                    ummu_dev->udev->qdev.id ? ummu_dev->udev->qdev.id : "?",
-                    (unsigned long long)addr, (unsigned long long)entry.translated_addr);
         }
         return entry;
     }
@@ -2757,6 +2736,14 @@ static IOMMUTLBEntry ummu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
     /* UMMU enabled but no cached config — retry lookup */
     cfg = ummu_get_config_for_translate(ummu_dev, &event, &override_cfg);
     if (!cfg) {
+        /*
+         * Keep bootstrap permissive for control path while tables are still
+         * converging. For data-path accesses that explicitly carry a tid
+         * override, stay strict and deny translation until config is ready.
+         */
+        if (g_dma_tid_override_valid) {
+            entry.perm = IOMMU_NONE;
+        }
         goto epilogue;
     }
 
