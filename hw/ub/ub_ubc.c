@@ -1629,6 +1629,9 @@ static bool ubc_push_ceq_event(BusControllerDev *ubc_dev, uint32_t ceqn,
 
 /* Forward declarations for URMA RX buffering helpers (defined later) */
 static void ubc_flush_urma_rx_buffer(BusControllerDev *ubc_dev, uint32_t jetty_id);
+static bool ubc_try_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
+                                        const uint8_t *data, uint32_t data_len,
+                                        bool allow_buffer);
 
 /*
  * Mailbox command handler.
@@ -4411,35 +4414,34 @@ static void ubc_buffer_urma_rx(BusControllerDev *ubc_dev, uint32_t dst_jetty,
 
 static void ubc_flush_urma_rx_buffer(BusControllerDev *ubc_dev, uint32_t jetty_id)
 {
-    uint32_t i, delivered = 0;
+    uint32_t i;
+    uint32_t new_count = 0;
+
     for (i = 0; i < ubc_dev->urma_rx_buf.count; i++) {
         if (ubc_dev->urma_rx_buf.entries[i].dst_jetty == jetty_id) {
             qemu_log("ubc URMA RX flush: delivering buffered packet %u/%u for jetty %u\n",
                      i, ubc_dev->urma_rx_buf.count, jetty_id);
-            ubc_handle_urma_rx_data(ubc_dev, jetty_id,
-                                      ubc_dev->urma_rx_buf.entries[i].data,
-                                      ubc_dev->urma_rx_buf.entries[i].data_len);
-            delivered++;
-        }
-    }
-    if (delivered > 0) {
-        /* Compact: remove delivered entries */
-        uint32_t new_count = 0;
-        for (i = 0; i < ubc_dev->urma_rx_buf.count; i++) {
-            if (ubc_dev->urma_rx_buf.entries[i].dst_jetty != jetty_id) {
-                if (new_count != i) {
-                    ubc_dev->urma_rx_buf.entries[new_count] =
-                    ubc_dev->urma_rx_buf.entries[i];
-                }
-                new_count++;
+            if (!ubc_try_handle_urma_rx_data(ubc_dev, jetty_id,
+                                             ubc_dev->urma_rx_buf.entries[i].data,
+                                             ubc_dev->urma_rx_buf.entries[i].data_len,
+                                             false)) {
+                qemu_log("ubc URMA RX flush: jetty %u not ready yet, keep packet %u buffered\n",
+                         jetty_id, i);
             }
         }
-        ubc_dev->urma_rx_buf.count = new_count;
+
+        if (new_count != i) {
+            ubc_dev->urma_rx_buf.entries[new_count] = ubc_dev->urma_rx_buf.entries[i];
+        }
+        new_count++;
     }
+
+    ubc_dev->urma_rx_buf.count = new_count;
 }
 
-void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
-                              const uint8_t *data, uint32_t data_len)
+static bool ubc_try_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
+                                        const uint8_t *data, uint32_t data_len,
+                                        bool allow_buffer)
 {
     UBCJettyState *js;
     UBCJfrState  *jfr;
@@ -4458,27 +4460,31 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
 
     if (!ubc_dev || dst_jetty >= UBC_MAX_JETTIES) {
         qemu_log("ubc URMA RX: dst_jetty %u out of range\n", dst_jetty);
-        ubc_buffer_urma_rx(ubc_dev, dst_jetty, data, data_len);
-        return;
+        if (allow_buffer) {
+            ubc_buffer_urma_rx(ubc_dev, dst_jetty, data, data_len);
+        }
+        return false;
     }
 
     if (!ubc_dev->jetties[dst_jetty].active) {
         qemu_log("ubc URMA RX: dst jetty %u not active, buffering\n", dst_jetty);
-        ubc_buffer_urma_rx(ubc_dev, dst_jetty, data, data_len);
-        return;
+        if (allow_buffer) {
+            ubc_buffer_urma_rx(ubc_dev, dst_jetty, data, data_len);
+        }
+        return false;
     }
 
     js = &ubc_dev->jetties[dst_jetty];
 
     if (js->jfrn >= UBC_MAX_JFRS || !ubc_dev->jfrs[js->jfrn].active) {
         qemu_log("ubc URMA RX: JFR %u not active for jetty %u\n", js->jfrn, dst_jetty);
-        return;
+        return false;
     }
 
     jfr = &ubc_dev->jfrs[js->jfrn];
     if (!jfr->rq_buf_addr || !jfr->rq_depth) {
         qemu_log("ubc URMA RX: no RQ buffer for JFR %u\n", js->jfrn);
-        return;
+        return false;
     }
 
     /* Boundary check: RQ full (rq_ci == rq_pi means empty, but if RQ has no
@@ -4491,9 +4497,7 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
                               ubc_tid_or_auto(jfr->rqe_token_id)) != MEMTX_OK) {
         qemu_log("ubc URMA RX: RQE DMA read failed at ci=%u addr=%#" PRIx64 "\n",
                  jfr->rq_ci, rqe_addr);
-        ubc_generate_cqe(ubc_dev, js, js->rx_jfcn, rq_wqe_idx, 0,
-                         CQE_STATUS_DMA_ERR, false);
-        return;
+        return false;
     }
 
     /* Parse SGE: length(4) + token_id(4) + va(8) */
@@ -4508,9 +4512,7 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
     /* Boundary check: null VA or zero length → RQ empty error */
     if (!sge_va || sge_len == 0) {
         qemu_log("ubc URMA RX: RQE null va or zero len at ci=%u\n", jfr->rq_ci);
-        ubc_generate_cqe(ubc_dev, js, js->rx_jfcn, rq_wqe_idx, 0,
-                         CQE_STATUS_RQ_EMPTY_ERR, false);
-        return;
+        return false;
     }
 
     /* Length mismatch: truncate and set error if SGE buffer too small */
@@ -4530,7 +4532,7 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
         qemu_log("ubc URMA RX: data DMA write failed\n");
         ubc_generate_cqe(ubc_dev, js, js->rx_jfcn, rq_wqe_idx, 0,
                          CQE_STATUS_DMA_ERR, false);
-        return;
+        return false;
     }
 
     /* Advance RQ consumer index */
@@ -4542,6 +4544,13 @@ void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
 
     qemu_log("ubc URMA RX: CQE done jetty=%u rq_ci=%u byte_cnt=%u status=%u\n",
              dst_jetty, jfr->rq_ci, actual_len, cqe_status);
+    return true;
+}
+
+void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
+                              const uint8_t *data, uint32_t data_len)
+{
+    (void)ubc_try_handle_urma_rx_data(ubc_dev, dst_jetty, data, data_len, true);
 }
 
 /*
