@@ -136,6 +136,7 @@ typedef struct SimDecMapEntry {
     uint32_t upi;
     uint32_t src_eid;
     bool     active;
+    MemoryRegion cpu_window;
     QTAILQ_ENTRY(SimDecMapEntry) next;
 } SimDecMapEntry;
 
@@ -153,6 +154,109 @@ static SimDecoderState *g_sim_decoder;
 /* Forward declarations for SIM decoder */
 static void sim_dec_init(BusControllerState *bcs);
 static void sim_dec_cleanup(void);
+static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
+                                            uint64_t remote_uba,
+                                            uint32_t token_id,
+                                            const uint8_t *buf,
+                                            uint32_t len);
+static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
+                                           uint64_t remote_uba,
+                                           uint32_t token_id,
+                                           uint8_t *buf,
+                                           uint32_t len);
+
+static uint64_t sim_dec_cpu_window_read(void *opaque, hwaddr addr,
+                                        unsigned size)
+{
+    SimDecMapEntry *entry = opaque;
+    uint8_t buf[8] = { 0 };
+    uint64_t remote_uba;
+    MemTxResult ret;
+
+    if (!entry || !entry->active || size > sizeof(buf) || addr + size > entry->size) {
+        qemu_log("SIM_DEC: cpu read invalid addr=%#" PRIx64 " size=%u map=%" PRIx64 "\n",
+                 (uint64_t)addr, size, entry ? entry->map_id : 0);
+        return 0;
+    }
+
+    remote_uba = entry->remote_uba + addr;
+    ret = ubc_sim_dec_remote_read(g_sim_decoder->bcs->ubc_dev, remote_uba,
+                                  entry->token_id, buf, size);
+    if (ret != MEMTX_OK) {
+        qemu_log("SIM_DEC: cpu read failed map=%" PRIx64 " remote_uba=%#" PRIx64
+                 " size=%u ret=%d\n",
+                 entry->map_id, remote_uba, size, ret);
+        return 0;
+    }
+
+    switch (size) {
+    case 1:
+        return buf[0];
+    case 2:
+        return lduw_le_p(buf);
+    case 4:
+        return ldl_le_p(buf);
+    case 8:
+        return ldq_le_p(buf);
+    default:
+        return 0;
+    }
+}
+
+static void sim_dec_cpu_window_write(void *opaque, hwaddr addr,
+                                     uint64_t value, unsigned size)
+{
+    SimDecMapEntry *entry = opaque;
+    uint8_t buf[8] = { 0 };
+    uint64_t remote_uba;
+    MemTxResult ret;
+
+    if (!entry || !entry->active || size > sizeof(buf) || addr + size > entry->size) {
+        qemu_log("SIM_DEC: cpu write invalid addr=%#" PRIx64 " size=%u map=%" PRIx64 "\n",
+                 (uint64_t)addr, size, entry ? entry->map_id : 0);
+        return;
+    }
+
+    switch (size) {
+    case 1:
+        buf[0] = (uint8_t)value;
+        break;
+    case 2:
+        stw_le_p(buf, (uint16_t)value);
+        break;
+    case 4:
+        stl_le_p(buf, (uint32_t)value);
+        break;
+    case 8:
+        stq_le_p(buf, value);
+        break;
+    default:
+        return;
+    }
+
+    remote_uba = entry->remote_uba + addr;
+    ret = ubc_sim_dec_remote_write(g_sim_decoder->bcs->ubc_dev, remote_uba,
+                                   entry->token_id, buf, size);
+    if (ret != MEMTX_OK) {
+        qemu_log("SIM_DEC: cpu write failed map=%" PRIx64 " remote_uba=%#" PRIx64
+                 " size=%u ret=%d\n",
+                 entry->map_id, remote_uba, size, ret);
+    }
+}
+
+static const MemoryRegionOps sim_dec_cpu_window_ops = {
+    .read = sim_dec_cpu_window_read,
+    .write = sim_dec_cpu_window_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
 
 #define UBC_ERS_PAGE_SIZE (4 * KiB)
 #define UBC_ERS2_MMIO_SIZE (UBC_ERS2_SPACE_SIZE * UBC_ERS_PAGE_SIZE)
@@ -5731,6 +5835,8 @@ static void sim_dec_cleanup(void)
 
     qemu_mutex_lock(&g_sim_decoder->lock);
     QTAILQ_FOREACH_SAFE(entry, &g_sim_decoder->map_list, next, tmp) {
+        memory_region_del_subregion(get_system_memory(), &entry->cpu_window);
+        object_unparent(OBJECT(&entry->cpu_window));
         QTAILQ_REMOVE(&g_sim_decoder->map_list, entry, next);
         g_free(entry);
     }
@@ -5835,6 +5941,12 @@ static int sim_dec_handle_map(const SimDecMapReq *req, SimDecMapResp *resp)
     entry->src_eid = req->src_eid;
     entry->active = true;
 
+    memory_region_init_io(&entry->cpu_window, OBJECT(DEVICE(g_sim_decoder->bcs->ubc_dev)),
+                          &sim_dec_cpu_window_ops, entry, "ub-sim-decoder-cpu",
+                          entry->size);
+    memory_region_add_subregion_overlap(get_system_memory(), entry->local_pa,
+                                        &entry->cpu_window, 10);
+
     QTAILQ_INSERT_TAIL(&g_sim_decoder->map_list, entry, next);
     qemu_mutex_unlock(&g_sim_decoder->lock);
 
@@ -5864,6 +5976,8 @@ static int sim_dec_handle_unmap(const SimDecUnmapReq *req)
     }
 
     entry->active = false;
+    memory_region_del_subregion(get_system_memory(), &entry->cpu_window);
+    object_unparent(OBJECT(&entry->cpu_window));
     QTAILQ_REMOVE(&g_sim_decoder->map_list, entry, next);
     qemu_mutex_unlock(&g_sim_decoder->lock);
 
