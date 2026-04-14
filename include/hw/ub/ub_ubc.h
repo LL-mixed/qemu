@@ -183,7 +183,10 @@ typedef struct BusControllerDev {
         uint32_t count;
         struct {
             uint32_t dst_jetty;
+            uint32_t src_jetty;
+            uint32_t src_scna;
             uint32_t data_len;
+            uint8_t  src_eid[16];
             uint8_t  data[4096];
         } entries[64];
     } urma_rx_buf;
@@ -274,6 +277,8 @@ void ub_try_inject_remote_cfg_notifies(BusControllerState *s);
 void ub_notify_retry_timer_cb(void *opaque);
 void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link);
 void ubc_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_jetty,
+                              uint32_t src_jetty, uint32_t src_scna,
+                              const uint8_t src_eid[16],
                               const uint8_t *data, uint32_t data_len);
 void ubc_handle_urma_rx_write(BusControllerDev *ubc_dev, uint32_t dst_jetty,
                               uint64_t remote_addr, const uint8_t *data,

@@ -785,12 +785,18 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
             s->ubc_dev && len > sizeof(MsgPktHeader)) {
             const uint8_t *payload = (const uint8_t *)buf + sizeof(MsgPktHeader);
             uint32_t payload_len = len - sizeof(MsgPktHeader);
+            uint8_t src_eid[16] = { 0 };
+
+            src_eid[0] = header->seid_l & 0xFF;
+            src_eid[1] = (header->seid_l >> 8) & 0xFF;
+            src_eid[2] = header->seid_h & 0xFF;
 
             switch (header->msgetah.sub_msg_code) {
             case UBC_MSG_SUB_URMA_DATA: {
                 uint32_t dst_jetty = header->deid & 0xFFFFF;
-                ubc_handle_urma_rx_data(s->ubc_dev, dst_jetty, payload,
-                                        payload_len);
+                ubc_handle_urma_rx_data(s->ubc_dev, dst_jetty, header->sjetty,
+                                        header->nth.scna, src_eid,
+                                        payload, payload_len);
                 g_free(buf);
                 continue;
             }
