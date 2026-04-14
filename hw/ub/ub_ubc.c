@@ -157,11 +157,13 @@ static void sim_dec_cleanup(void);
 static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
                                             uint64_t remote_uba,
                                             uint32_t token_id,
+                                            uint32_t dcna,
                                             const uint8_t *buf,
                                             uint32_t len);
 static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
                                            uint64_t remote_uba,
                                            uint32_t token_id,
+                                           uint32_t dcna,
                                            uint8_t *buf,
                                            uint32_t len);
 static uint8_t ubc_node_ip_suffix_from_id(const char *node_id);
@@ -183,7 +185,7 @@ static uint64_t sim_dec_cpu_window_read(void *opaque, hwaddr addr,
 
     remote_uba = entry->remote_uba + addr;
     ret = ubc_sim_dec_remote_read(g_sim_decoder->bcs->ubc_dev, remote_uba,
-                                  entry->token_id, buf, size);
+                                  entry->token_id, entry->dcna, buf, size);
     if (ret != MEMTX_OK) {
         qemu_log("SIM_DEC: cpu read failed map=%" PRIx64 " remote_uba=%#" PRIx64
                  " size=%u ret=%d\n",
@@ -238,7 +240,7 @@ static void sim_dec_cpu_window_write(void *opaque, hwaddr addr,
 
     remote_uba = entry->remote_uba + addr;
     ret = ubc_sim_dec_remote_write(g_sim_decoder->bcs->ubc_dev, remote_uba,
-                                   entry->token_id, buf, size);
+                                   entry->token_id, entry->dcna, buf, size);
     if (ret != MEMTX_OK) {
         qemu_log("SIM_DEC: cpu write failed map=%" PRIx64 " remote_uba=%#" PRIx64
                  " size=%u ret=%d\n",
@@ -1086,11 +1088,13 @@ static inline void ubc_close_dma_fallback_window(BusControllerDev *ubc_dev,
 static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
                                             uint64_t remote_uba,
                                             uint32_t token_id,
+                                            uint32_t dcna,
                                             const uint8_t *data,
                                             uint32_t len);
 static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
                                            uint64_t remote_uba,
                                            uint32_t token_id,
+                                           uint32_t dcna,
                                            uint8_t *data,
                                            uint32_t len);
 
@@ -1115,14 +1119,15 @@ static MemTxResult ubc_dma_read_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
     UMMUTidOverrideScope tid_scope = { 0 };
     uint64_t remote_uba = 0;
     uint32_t map_token_id = 0;
+    uint32_t map_dcna = 0;
 
     if (path == UBC_DMA_ACCESS_DATA && ubc_dev &&
         len > 0 &&
         sim_dec_lookup_by_pa((uint64_t)iova, &remote_uba, &map_token_id,
-                             NULL) == 0) {
+                             NULL, &map_dcna) == 0) {
         uint32_t eff_token_id = map_token_id ? map_token_id : tid;
         return ubc_sim_dec_remote_read(ubc_dev, remote_uba, eff_token_id,
-                                       (uint8_t *)buf, (uint32_t)len);
+                                       map_dcna, (uint8_t *)buf, (uint32_t)len);
     }
 
     if (ubc_dev && ubc_dev->ummu && tid != UBC_DMA_TID_AUTO) {
@@ -1195,14 +1200,15 @@ static MemTxResult ubc_dma_write_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
     UMMUTidOverrideScope tid_scope = { 0 };
     uint64_t remote_uba = 0;
     uint32_t map_token_id = 0;
+    uint32_t map_dcna = 0;
 
     if (path == UBC_DMA_ACCESS_DATA && ubc_dev &&
         len > 0 &&
         sim_dec_lookup_by_pa((uint64_t)iova, &remote_uba, &map_token_id,
-                             NULL) == 0) {
+                             NULL, &map_dcna) == 0) {
         uint32_t eff_token_id = map_token_id ? map_token_id : tid;
         return ubc_sim_dec_remote_write(ubc_dev, remote_uba, eff_token_id,
-                                        (const uint8_t *)buf,
+                                        map_dcna, (const uint8_t *)buf,
                                         (uint32_t)len);
     }
 
@@ -3717,14 +3723,14 @@ void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
 static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
                                             uint64_t remote_uba,
                                             uint32_t token_id,
+                                            uint32_t dcna,
                                             const uint8_t *data,
                                             uint32_t len)
 {
     UBLinkState *link;
-    uint32_t dcna = 0;
     uint32_t done = 0;
 
-    if (!ubc_dev || !data || !len) {
+    if (!ubc_dev || !data || !len || dcna == 0) {
         return MEMTX_DECODE_ERROR;
     }
     link = ubc_find_active_link(ubc_dev, &dcna);
@@ -3761,15 +3767,15 @@ static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
 static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
                                            uint64_t remote_uba,
                                            uint32_t token_id,
+                                           uint32_t dcna,
                                            uint8_t *data,
                                            uint32_t len)
 {
     UBLinkState *link;
     BusControllerState *bcs;
-    uint32_t dcna = 0;
     uint32_t done = 0;
 
-    if (!ubc_dev || !data || !len) {
+    if (!ubc_dev || !data || !len || dcna == 0) {
         return MEMTX_DECODE_ERROR;
     }
     link = ubc_find_active_link(ubc_dev, &dcna);
@@ -6375,7 +6381,8 @@ static int sim_dec_handle_query(const SimDecQueryReq *req, SimDecQueryResp *resp
  * Called by UMMU to check if a PA is in decoder map for remote access
  */
 int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
-                         uint32_t *token_id, uint32_t *src_eid)
+                         uint32_t *token_id, uint32_t *src_eid,
+                         uint32_t *dcna)
 {
     SimDecMapEntry *entry;
 
@@ -6391,6 +6398,8 @@ int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
             *token_id = entry->token_id;
         if (src_eid)
             *src_eid = entry->src_eid;
+        if (dcna)
+            *dcna = entry->dcna;
         qemu_mutex_unlock(&g_sim_decoder->lock);
         return 0;
     }

@@ -363,6 +363,7 @@ void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
 int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
                                 uint8_t *resp, uint32_t *resp_len);
 int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
-                         uint32_t *token_id, uint32_t *src_eid);
+                         uint32_t *token_id, uint32_t *src_eid,
+                         uint32_t *dcna);
 
 #endif
