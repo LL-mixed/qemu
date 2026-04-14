@@ -1578,7 +1578,9 @@ static int ubc_handle_ue2ue_ctrlq(BusControllerDev *ubc_dev,
         uint8_t eid_hw[16];
 
         if (eid_suffix == 0) {
-            eid_suffix = 1;
+            qemu_log("ubc ue2ue seid resp: unresolved UB_FM_NODE_ID=%s\n",
+                     fm_node_id ? fm_node_id : "(null)");
+            return -EINVAL;
         }
         ubc_fill_link_local_eid_hw(eid_hw, eid_suffix);
         *(uint32_t *)resp_data = cpu_to_le32(1);
@@ -2986,7 +2988,9 @@ static void ubc_process_ctrlq(BusControllerDev *ubc_dev)
             uint16_t crq_next2;
 
             if (eid_suffix == 0) {
-                eid_suffix = 1;
+                qemu_log("ubc ctrlq GET_SEID_INFO: unresolved UB_FM_NODE_ID=%s\n",
+                         fm_node_id ? fm_node_id : "(null)");
+                return;
             }
             ubc_fill_link_local_eid_hw(eid_hw, eid_suffix);
 
@@ -3287,6 +3291,18 @@ static uint8_t ubc_node_ip_suffix_from_id(const char *node_id)
     }
     if (g_str_equal(node_id, "nodeD")) {
         return 4;
+    }
+    if (g_str_equal(node_id, "nodeE")) {
+        return 5;
+    }
+    if (g_str_equal(node_id, "nodeF")) {
+        return 6;
+    }
+    if (g_str_equal(node_id, "nodeG")) {
+        return 7;
+    }
+    if (g_str_equal(node_id, "nodeH")) {
+        return 8;
     }
     return 0;
 }
