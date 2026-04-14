@@ -1916,7 +1916,18 @@ static void create_ub(VirtMachineState *vms)
     ubc_dev = qdev_new(TYPE_BUS_CONTROLLER_DEV);
     ubc_dev_state = BUS_CONTROLLER_DEV(ubc_dev);
     ubc_dev_state->parent.eid = 1;
-    ubc_dev_state->parent.port.port_num = 3;
+    {
+        const char *port_num_str = g_getenv("UB_SIM_PORT_NUM");
+        uint32_t port_num = port_num_str ? atoi(port_num_str) : 3;
+        if (port_num < 1) {
+            port_num = 3;
+        }
+        if (port_num > UB_DEV_MAX_NUM_OF_PORT) {
+            port_num = UB_DEV_MAX_NUM_OF_PORT;
+        }
+        ubc_dev_state->parent.port.port_num = port_num;
+        qemu_log("virt ubc: port_num=%u\n", port_num);
+    }
     ubc_dev_state->parent.guid.vendor = VENDER_ID_HUAWEI;
     ubc_dev_state->parent.guid.device_id = 0x0541;
     ubc_dev_state->parent.guid.version = 0;
