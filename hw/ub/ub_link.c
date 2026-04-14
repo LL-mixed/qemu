@@ -56,12 +56,26 @@ static UBDevice *ub_link_resolve_device(const char *device_id)
     return dev;
 }
 
+static bool ub_link_device_matches_node(const char *device_id, const char *node_id)
+{
+    size_t node_len;
+
+    if (!device_id || !node_id) {
+        return false;
+    }
+
+    node_len = strlen(node_id);
+    return strncmp(device_id, node_id, node_len) == 0 &&
+           device_id[node_len] == '.';
+}
+
 static void ub_link_select_endpoints(UBLinkState *s,
                                      UBLinkEndpointDesc **local,
                                      UBLinkEndpointDesc **remote)
 {
     UBDevice *a_dev = ub_link_resolve_device(s->a.device_id);
     UBDevice *b_dev = ub_link_resolve_device(s->b.device_id);
+    const char *node_id = g_getenv("UB_FM_NODE_ID");
 
     s->a.device = a_dev;
     s->b.device = b_dev;
@@ -79,15 +93,35 @@ static void ub_link_select_endpoints(UBLinkState *s,
 
     /*
      * Fallback for early boot before objects are fully discoverable.
-     * Current dual-node orchestration uses nodeA as server (endpoint a).
+     * Prefer matching the endpoint device_id prefix with the local node id.
      */
-    if (g_strcmp0(g_getenv("UB_FM_NODE_ID"), "nodeA") == 0) {
+    if (ub_link_device_matches_node(s->a.device_id, node_id) &&
+        !ub_link_device_matches_node(s->b.device_id, node_id)) {
         *local = &s->a;
         *remote = &s->b;
-    } else {
+        return;
+    }
+    if (ub_link_device_matches_node(s->b.device_id, node_id) &&
+        !ub_link_device_matches_node(s->a.device_id, node_id)) {
         *local = &s->b;
         *remote = &s->a;
+        return;
     }
+
+    /*
+     * Final deterministic fallback: keep endpoint ordering stable across all
+     * nodes so both sides derive the same local/remote orientation.
+     */
+    if (g_strcmp0(s->a.device_id, s->b.device_id) < 0 ||
+        (g_strcmp0(s->a.device_id, s->b.device_id) == 0 &&
+         s->a.port_idx <= s->b.port_idx)) {
+        *local = &s->a;
+        *remote = &s->b;
+        return;
+    }
+
+    *local = &s->b;
+    *remote = &s->a;
 }
 
 static char *ub_link_shared_dir(void)
@@ -531,7 +565,6 @@ int ub_link_update_status_file(UBLinkState *s)
     g_autofree char *data = NULL;
     UBLinkEndpointDesc *local = NULL;
     UBLinkEndpointDesc *remote = NULL;
-    UBDevice *local_dev = NULL;
     const char *device_id = NULL;
     uint32_t port_idx = 0;
 
@@ -767,6 +800,10 @@ void ub_link_configure(UBLinkState *s, const char *a_device_id, uint32_t a_port_
 
 int ub_link_apply(UBLinkState *s, Error **errp)
 {
+    UBLinkEndpointDesc *local = NULL;
+    UBLinkEndpointDesc *remote = NULL;
+    bool is_server;
+
     if (s->applied) {
         /* Already applied, check if still ready */
         if (s->state == UB_LINK_STATE_READY) {
@@ -781,9 +818,8 @@ int ub_link_apply(UBLinkState *s, Error **errp)
     /* Ensure our info is out there */
     ub_link_published_state_save(s);
 
-    const char *node_id = g_getenv("UB_FM_NODE_ID");
-    /* Orchestration scripts typically assume Node A is the listener/server */
-    bool is_server = node_id && (strcmp(node_id, "nodeA") == 0);
+    ub_link_select_endpoints(s, &local, &remote);
+    is_server = (local == &s->a);
     ub_link_setup_socket(s, is_server);
 
     /* Check Ready Contract conditions before marking applied */

@@ -62,6 +62,41 @@ static const char *ub_fm_get_local_node_id(void)
     return (local_node_id && local_node_id[0]) ? local_node_id : NULL;
 }
 
+static uint8_t ub_fm_node_ip_suffix_from_device_id(const char *device_id)
+{
+    const char *node;
+
+    if (!device_id) {
+        return 0;
+    }
+
+    node = strstr(device_id, "node");
+    if (!node || strlen(node) < 5) {
+        return 0;
+    }
+
+    switch (node[4]) {
+    case 'A':
+        return 1;
+    case 'B':
+        return 2;
+    case 'C':
+        return 3;
+    case 'D':
+        return 4;
+    case 'E':
+        return 5;
+    case 'F':
+        return 6;
+    case 'G':
+        return 7;
+    case 'H':
+        return 8;
+    default:
+        return 0;
+    }
+}
+
 static bool ub_fm_device_id_is_local_node_scoped(const char *device_id)
 {
     const char *local_node_id = ub_fm_get_local_node_id();
@@ -314,6 +349,8 @@ static bool ub_fm_configure_remote_links(void)
                 NeighborInfo *ni = &local_dev->port.neighbors[local->port_idx];
                 ni->remote_primary_cna = (uint32_t)remote_cna;
                 ni->remote_primary_cna_valid = true;
+                ni->remote_node_ip_suffix =
+                    ub_fm_node_ip_suffix_from_device_id(remote->device_id);
                 qemu_log("ub_fm: synced remote cna 0x%x for link %s:%u\n",
                          (uint32_t)remote_cna, local->device_id, local->port_idx);
             }

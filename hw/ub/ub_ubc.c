@@ -3252,6 +3252,75 @@ static void ubc_fill_remote_dcna_from_link(UBDevice *ub_dev,
     }
 }
 
+static bool ubc_extract_ipv4_suffix_from_rmt_eid(const uint8_t *rmt_eid,
+                                                 uint8_t *suffix)
+{
+    int i;
+
+    if (!rmt_eid || !suffix) {
+        return false;
+    }
+    if (rmt_eid[0] == 0xfe && rmt_eid[1] == 0x80) {
+        for (i = 2; i < 12; i++) {
+            if (rmt_eid[i] != 0) {
+                return false;
+            }
+        }
+        if (rmt_eid[12] != 10 || rmt_eid[13] != 0 || rmt_eid[14] != 0) {
+            return false;
+        }
+        *suffix = rmt_eid[15];
+        return *suffix != 0;
+    }
+    if (rmt_eid[15] == 0xfe && rmt_eid[14] == 0x80) {
+        for (i = 4; i < 14; i++) {
+            if (rmt_eid[i] != 0) {
+                return false;
+            }
+        }
+        if (rmt_eid[3] != 10 || rmt_eid[2] != 0 || rmt_eid[1] != 0) {
+            return false;
+        }
+        *suffix = rmt_eid[0];
+        return *suffix != 0;
+    }
+    return false;
+}
+
+static void ubc_try_fill_dcna_from_rmt_eid(UBDevice *ub_dev, const uint8_t *rmt_eid,
+                                           uint32_t *dcna)
+{
+    uint8_t target_suffix = 0;
+    uint32_t i;
+
+    if (!ub_dev || !dcna || *dcna) {
+        return;
+    }
+    if (!ubc_extract_ipv4_suffix_from_rmt_eid(rmt_eid, &target_suffix)) {
+        qemu_log("ubc route by rmt_eid: unsupported eid=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
+                 rmt_eid ? rmt_eid[0] : 0, rmt_eid ? rmt_eid[1] : 0, rmt_eid ? rmt_eid[2] : 0, rmt_eid ? rmt_eid[3] : 0,
+                 rmt_eid ? rmt_eid[4] : 0, rmt_eid ? rmt_eid[5] : 0, rmt_eid ? rmt_eid[6] : 0, rmt_eid ? rmt_eid[7] : 0,
+                 rmt_eid ? rmt_eid[8] : 0, rmt_eid ? rmt_eid[9] : 0, rmt_eid ? rmt_eid[10] : 0, rmt_eid ? rmt_eid[11] : 0,
+                 rmt_eid ? rmt_eid[12] : 0, rmt_eid ? rmt_eid[13] : 0, rmt_eid ? rmt_eid[14] : 0, rmt_eid ? rmt_eid[15] : 0);
+        return;
+    }
+
+    for (i = 0; i < ub_dev->port.port_num; i++) {
+        NeighborInfo *ni = &ub_dev->port.neighbors[i];
+
+        if (!ni->is_remote_neighbor || !ni->remote_primary_cna_valid) {
+            continue;
+        }
+        if (ni->remote_node_ip_suffix == target_suffix) {
+            *dcna = ni->remote_primary_cna;
+            qemu_log("ubc route by rmt_eid: target_suffix=%u remote_id=%s dcna=%#x\n",
+                     target_suffix, ni->neighbor_id[0] ? ni->neighbor_id : "<unknown>",
+                     *dcna);
+            return;
+        }
+    }
+}
+
 static UBFMManagedLink *ubc_find_fm_link(UBDevice *ub_dev, uint32_t *dcna)
 {
     UBFMManagedLink *fm_link = NULL;
@@ -3662,9 +3731,27 @@ static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState 
     Error *local_err = NULL;
     uint32_t dcna = 0;
 
-    qemu_log("ubc SEND: jetty=%u rmt_obj_id=%u payload_len=%u\n",
-             js->jetty_id, rmt_obj_id, payload_len);
+    qemu_log("ubc SEND: jetty=%u rmt_obj_id=%u payload_len=%u rmt_eid=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
+             js->jetty_id, rmt_obj_id, payload_len,
+             rmt_eid[0], rmt_eid[1], rmt_eid[2], rmt_eid[3],
+             rmt_eid[4], rmt_eid[5], rmt_eid[6], rmt_eid[7],
+             rmt_eid[8], rmt_eid[9], rmt_eid[10], rmt_eid[11],
+             rmt_eid[12], rmt_eid[13], rmt_eid[14], rmt_eid[15]);
+    if (payload && payload_len > 0) {
+        uint32_t dump = payload_len < 32 ? payload_len : 32;
+        GString *hex = g_string_new(NULL);
+        uint32_t di;
+        for (di = 0; di < dump; di++) {
+            g_string_append_printf(hex, "%02x", payload[di]);
+            if (di + 1 < dump) {
+                g_string_append_c(hex, ':');
+            }
+        }
+        qemu_log("ubc SEND payload[0:%u]=%s\n", dump, hex->str);
+        g_string_free(hex, true);
+    }
 
+    ubc_try_fill_dcna_from_rmt_eid(ub_dev, rmt_eid, &dcna);
     fm_link = ubc_find_fm_link(ub_dev, &dcna);
 
     if (!fm_link) {
@@ -3792,6 +3879,7 @@ static void ubc_send_read_request(BusControllerDev *ubc_dev, UBCJettyState *js,
     Error *local_err = NULL;
     uint32_t dcna = 0;
 
+    ubc_try_fill_dcna_from_rmt_eid(ub_dev, rmt_eid, &dcna);
     fm_link = ubc_find_fm_link(ub_dev, &dcna);
 
     if (!fm_link) {

@@ -133,6 +133,7 @@ typedef struct NeighborInfo {
         UBDevice *neighbor_dev;
     };
     bool is_remote_neighbor;
+    uint8_t remote_node_ip_suffix;
     uint32_t local_port_idx;
     uint32_t neighbor_port_idx;
     bool remote_neighbor_guid_valid;
