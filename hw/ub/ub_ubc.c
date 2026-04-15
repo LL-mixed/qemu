@@ -457,7 +457,7 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define UBC_SIM_DEC_READ_CHUNK_MAX \
     (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)sizeof(UBCSimDecReadRespPldHdr))
 #define UBC_SIM_DEC_READ_WAIT_USEC  1000
-#define UBC_SIM_DEC_READ_WAIT_LOOPS 2000
+#define UBC_SIM_DEC_READ_WAIT_LOOPS 10000
 
 /* Doorbell/MMIO region constants (matches UAPI) */
 #define UDMA_JETTY_DSQE_OFFSET   0x1000
