@@ -5628,26 +5628,36 @@ static bool ub_ubc_is_empty(UBBus *bus)
     return true;
 }
 
-#ifdef __APPLE__
-#define UB_BUSINSTANCE_GUID_LOCK_DIR "/tmp/ub-qemu"
-#else
-#define UB_BUSINSTANCE_GUID_LOCK_DIR "/run/libvirt/qemu"
-#endif
+static char *ub_bus_instance_guid_lock_dir(void)
+{
+    const char *runtime_dir = g_get_user_runtime_dir();
+
+    if (runtime_dir && runtime_dir[0] != '\0') {
+        return g_build_filename(runtime_dir, "ub-qemu", NULL);
+    }
+
+    return g_strdup_printf("%s/ub-qemu-%u", g_get_tmp_dir(),
+                           (unsigned int)getuid());
+}
 
 static int ub_bus_instance_guid_lock(UbGuid *guid)
 {
     char path[256] = {0};
     char guid_str[UB_DEV_GUID_STRING_LENGTH + 1] = {0};
+    g_autofree char *lock_dir = NULL;
     int lock_fd;
 
-    if (g_mkdir_with_parents(UB_BUSINSTANCE_GUID_LOCK_DIR, 0755) < 0) {
+    lock_dir = ub_bus_instance_guid_lock_dir();
+
+    if (g_mkdir_with_parents(lock_dir, 0700) < 0) {
         qemu_log("failed to create bus instance lock dir %s: %s\n",
-                 UB_BUSINSTANCE_GUID_LOCK_DIR, strerror(errno));
+                 lock_dir, strerror(errno));
         return -1;
     }
 
     ub_device_get_str_from_guid(guid, guid_str, UB_DEV_GUID_STRING_LENGTH + 1);
-    snprintf(path, sizeof(path), "%s/ub-bus-instance-%s.lock",  UB_BUSINSTANCE_GUID_LOCK_DIR, guid_str);
+    snprintf(path, sizeof(path), "%s/ub-bus-instance-%s.lock", lock_dir,
+             guid_str);
     lock_fd = open(path, O_RDONLY | O_CREAT, 0600);
     if (lock_fd < 0) {
         qemu_log("failed to open lock file %s: %s\n", path, strerror(errno));

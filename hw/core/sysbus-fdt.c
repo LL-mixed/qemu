@@ -40,6 +40,9 @@
 #include "hw/misc/ubmem_vmmu.h"
 #endif
 #include "hw/arm/fdt.h"
+#include "hw/vfio/vfio-platform.h"
+#include "hw/vfio/vfio-amd-xgbe.h"
+#include "hw/vfio/vfio-calxeda-xgmac.h"
 
 /*
  * internal struct that contains the information to create dynamic

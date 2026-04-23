@@ -2,48 +2,11 @@
 
 #ifdef CONFIG_DARWIN
 
-#include "exec/gdbstub.h"
-#include "gdbstub/syscalls.h"
 #include "qapi/error.h"
 #include "qemu/coroutine_int.h"
 #include "sysemu/iommufd.h"
 
 typedef struct ARMCPU ARMCPU;
-
-void gdb_register_coprocessor(CPUState *cpu,
-                              gdb_get_reg_cb get_reg, gdb_set_reg_cb set_reg,
-                              int num_regs, const char *xml, int g_pos)
-{
-}
-
-void gdb_unregister_coprocessor_all(CPUState *cpu)
-{
-}
-
-int gdbserver_start(const char *port_or_device)
-{
-    return -1;
-}
-
-void gdb_set_stop_cpu(CPUState *cpu)
-{
-}
-
-void gdb_do_syscall(gdb_syscall_complete_cb cb, const char *fmt, ...)
-{
-    if (cb) {
-        cb(NULL, (uint64_t)-1, GDB_EUNKNOWN);
-    }
-}
-
-int use_gdb_syscalls(void)
-{
-    return 0;
-}
-
-void gdb_exit(int code)
-{
-}
 
 bool iommufd_backend_alloc_hwpt(IOMMUFDBackend *be, uint32_t dev_id,
                                 uint32_t pt_id, uint32_t flags,

@@ -26,3 +26,8 @@ bool write_list_to_kvmstate(ARMCPU *cpu, int level)
 void kvm_arm_rme_init_gpa_space(hwaddr highest_gpa, PCIBus *pci_bus)
 {
 }
+
+void kvm_arm_reset_vcpu(ARMCPU *cpu)
+{
+    g_assert_not_reached();
+}

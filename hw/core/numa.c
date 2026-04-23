@@ -38,6 +38,7 @@
 #include "hw/mem/pc-dimm.h"
 #include "migration/vmstate.h"
 #include "hw/boards.h"
+#include "sysemu/kvm.h"
 #include "hw/mem/memory-device.h"
 #include "qemu/option.h"
 #include "qemu/config-file.h"

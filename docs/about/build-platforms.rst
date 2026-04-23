@@ -84,8 +84,9 @@ Ubuntu LTS. Other distros will be assumed to ship similar software versions.
 For FreeBSD and OpenBSD, decisions will be made based on the contents of the
 respective ports repository, while NetBSD will use the pkgsrc repository.
 
-For macOS, `Homebrew`_ will be used, although `MacPorts`_ is expected to carry
-similar versions.
+For macOS, version checks are based on commonly available package-manager
+builds, and alternate macOS packaging ecosystems are expected to carry similar
+versions.
 
 Some build dependencies may follow less conservative rules:
 
@@ -139,7 +140,5 @@ unprivileged accounts can create symlinks if Developer Mode is enabled.
 When Developer Mode is not available/enabled, the SeCreateSymbolicLinkPrivilege
 privilege is required, or the process must be run as an administrator.
 
-.. _Homebrew: https://brew.sh/
-.. _MacPorts: https://www.macports.org/
 .. _MSYS2: https://www.msys2.org/
 .. _Repology: https://repology.org/

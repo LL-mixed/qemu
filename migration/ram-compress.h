@@ -30,8 +30,12 @@
 #define QEMU_MIGRATION_COMPRESS_H
 
 #ifdef CONFIG_ZSTD
-#include "/opt/homebrew/opt/zstd/include/zstd.h"
-#include "/opt/homebrew/opt/zstd/include/zstd_errors.h"
+/*
+ * Keep zstd includes prefix-agnostic so macOS builds can rely on whichever
+ * SDK or package-manager include path the toolchain exposes.
+ */
+#include <zstd.h>
+#include <zstd_errors.h>
 #endif
 #include "qemu-file.h"
 #include "qapi/qapi-types-migration.h"
