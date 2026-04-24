@@ -3563,6 +3563,36 @@ static UBLinkState *ubc_find_active_link(BusControllerDev *ubc_dev, uint32_t *dc
     return fm_link->runtime;
 }
 
+static void ubc_sim_dec_process_wait_links(BusControllerState *bcs,
+                                           BusControllerDev *ubc_dev,
+                                           UBLinkState *preferred)
+{
+    UBDevice *ub_dev = ubc_dev ? &ubc_dev->parent : NULL;
+    uint32_t i;
+
+    if (!bcs || !ub_dev) {
+        return;
+    }
+    if (preferred) {
+        ub_link_process_incoming_message(bcs, preferred);
+    }
+    for (i = 0; i < ub_dev->port.port_num; ++i) {
+        NeighborInfo *ni = &ub_dev->port.neighbors[i];
+        UBLinkState *link;
+        uint32_t dcna;
+
+        if (!ni->is_remote_neighbor || !ni->remote_primary_cna_valid) {
+            continue;
+        }
+        dcna = ni->remote_primary_cna;
+        link = ubc_find_active_link(ubc_dev, &dcna);
+        if (!link || link == preferred) {
+            continue;
+        }
+        ub_link_process_incoming_message(bcs, link);
+    }
+}
+
 static int ubc_send_msg_over_link(BusControllerDev *ubc_dev, UBLinkState *link,
                                   uint32_t dcna, uint8_t sub_msg_code,
                                   const void *payload, uint32_t payload_len)
@@ -3589,12 +3619,10 @@ static int ubc_send_msg_over_link(BusControllerDev *ubc_dev, UBLinkState *link,
     if (sub_msg_code == UBC_MSG_SUB_SIM_DEC_READ_REQ &&
         payload_len >= sizeof(UBCSimDecReadReqPld)) {
         const UBCSimDecReadReqPld *req = payload;
-        if (req->read_len <= 8) {
-            qemu_log("ubc sim_dec send read_req req=%u uba=%#" PRIx64
-                     " len=%u dcna=%#x\n",
-                     req->req_id, (uint64_t)req->remote_uba,
-                     req->read_len, dcna);
-        }
+        qemu_log("ubc sim_dec send read_req req=%u uba=%#" PRIx64
+                 " len=%u dcna=%#x\n",
+                 req->req_id, (uint64_t)req->remote_uba,
+                 req->read_len, dcna);
     }
 
     rc = ub_link_write_message(link, pkt, total_len, &local_err);
@@ -3609,12 +3637,10 @@ static int ubc_send_msg_over_link(BusControllerDev *ubc_dev, UBLinkState *link,
         if (sub_msg_code == UBC_MSG_SUB_SIM_DEC_READ_REQ &&
             payload_len >= sizeof(UBCSimDecReadReqPld)) {
             const UBCSimDecReadReqPld *req = payload;
-            if (req->read_len <= 8) {
-                qemu_log("ubc sim_dec send read_req done req=%u uba=%#" PRIx64
-                         " len=%u dcna=%#x\n",
-                         req->req_id, (uint64_t)req->remote_uba,
-                         req->read_len, dcna);
-            }
+            qemu_log("ubc sim_dec send read_req done req=%u uba=%#" PRIx64
+                     " len=%u dcna=%#x\n",
+                     req->req_id, (uint64_t)req->remote_uba,
+                     req->read_len, dcna);
         }
         ub_link_kick_remote(link, NULL);
     }
@@ -3735,14 +3761,10 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
     resp->status = 0;
     resp->data_len = req->read_len;
     eff_tid = ubc_tid_or_auto(req->token_id);
-    if (req->read_len <= 8 &&
-        ((req->remote_uba & 0xfffULL) >= 0x100) &&
-        ((req->remote_uba & 0xfffULL) <= 0x110)) {
-        qemu_log("ubc sim_dec rx read_req probe req=%u uba=%#" PRIx64
-                 " len=%u tid=%u dcna=%#x\n",
-                 req->req_id, (uint64_t)req->remote_uba,
-                 req->read_len, eff_tid, dcna);
-    }
+    qemu_log("ubc sim_dec rx read_req req=%u uba=%#" PRIx64
+             " len=%u tid=%u dcna=%#x\n",
+             req->req_id, (uint64_t)req->remote_uba,
+             req->read_len, eff_tid, dcna);
 
     ret = ubc_dma_read_local_data_tid_strict(ubc_dev, req->remote_uba,
                                              payload + sizeof(*resp),
@@ -3750,6 +3772,10 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
     if (ret != MEMTX_OK) {
         resp->status = 1;
         resp->data_len = 0;
+        qemu_log("ubc sim_dec rx read_req dma_failed req=%u uba=%#" PRIx64
+                 " len=%u tid=%u ret=%d\n",
+                 req->req_id, (uint64_t)req->remote_uba,
+                 req->read_len, eff_tid, ret);
     }
 
     rc = ubc_send_msg_over_link(ubc_dev, link, dcna,
@@ -3758,6 +3784,10 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
     if (rc < 0) {
         qemu_log("ubc sim_dec rx read_req: send resp failed req=%u\n",
                  req->req_id);
+    } else {
+        qemu_log("ubc sim_dec rx read_req send_resp done req=%u status=%u"
+                 " data_len=%u dcna=%#x\n",
+                 req->req_id, resp->status, resp->data_len, dcna);
     }
     g_free(payload);
 }
@@ -3781,6 +3811,10 @@ void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
 
     copy_len = MIN(hdr->data_len, ubc_dev->sim_dec_sync_read.expect_len);
     copy_len = MIN(copy_len, data_len);
+    qemu_log("ubc sim_dec rx read_resp req=%u status=%u data_len=%u"
+             " wire_len=%u copy_len=%u expect=%u\n",
+             hdr->req_id, hdr->status, hdr->data_len, data_len,
+             copy_len, ubc_dev->sim_dec_sync_read.expect_len);
     if (copy_len > 0 && ubc_dev->sim_dec_sync_read.buf) {
         memcpy(ubc_dev->sim_dec_sync_read.buf, data, copy_len);
     }
@@ -3914,7 +3948,7 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
             if (!ubc_dev->sim_dec_sync_read.pending) {
                 break;
             }
-            ub_link_process_incoming_message(bcs, link);
+            ubc_sim_dec_process_wait_links(bcs, ubc_dev, link);
             if (!ubc_dev->sim_dec_sync_read.pending) {
                 break;
             }
