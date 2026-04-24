@@ -778,8 +778,13 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
         HiMsgCqe cqe = { 0 };
         uint32_t pi;
 
-        qemu_log("ubc_msgq: received remote msg code=%u len=%zu\n",
-                 header->msgetah.msg_code, len);
+        if (header->msgetah.msg_code == UBC_MSG_CODE_URMA_DATA && len <= 64) {
+            qemu_log("ubc_msgq: received remote msg code=%u sub=%u len=%zu scna=%#x\n",
+                     header->msgetah.msg_code,
+                     header->msgetah.sub_msg_code,
+                     len,
+                     header->nth.scna);
+        }
 
         if (header->msgetah.msg_code == UBC_MSG_CODE_URMA_DATA &&
             s->ubc_dev && len > sizeof(MsgPktHeader)) {
@@ -816,6 +821,14 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
                 if (payload_len >= sizeof(UBCSimDecReadReqPld)) {
                     const UBCSimDecReadReqPld *req =
                         (const UBCSimDecReadReqPld *)payload;
+                    if (req->read_len <= 8 &&
+                        ((req->remote_uba & 0xfffULL) >= 0x108) &&
+                        ((req->remote_uba & 0xfffULL) <= 0x110)) {
+                        qemu_log("ubc_msgq sim_dec read_req dispatch req=%u uba=%#" PRIx64
+                                 " len=%u scna=%#x\n",
+                                 req->req_id, (uint64_t)req->remote_uba,
+                                 req->read_len, header->nth.scna);
+                    }
 
                     ubc_handle_sim_dec_rx_read_req(s->ubc_dev, req,
                                                    header->nth.scna);
@@ -829,6 +842,11 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
                         (const UBCSimDecReadRespPldHdr *)payload;
                     const uint8_t *rd_data = payload + sizeof(*resp);
                     uint32_t rd_len = payload_len - sizeof(*resp);
+                    if (rd_len <= 8 && resp->req_id >= 57) {
+                        qemu_log("ubc_msgq sim_dec read_resp dispatch req=%u status=%u data_len=%u scna=%#x\n",
+                                 resp->req_id, resp->status, rd_len,
+                                 header->nth.scna);
+                    }
 
                     ubc_handle_sim_dec_rx_read_resp(s->ubc_dev, resp, rd_data,
                                                     rd_len);
