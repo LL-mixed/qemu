@@ -345,6 +345,11 @@ static void ub_link_setup_socket(UBLinkState *s, bool is_server)
     addr.u.q_unix.path = path;
 
     if (is_server) {
+        if (s->lioc || s->ioc || s->socket_connected) {
+            qemu_log("ub_link: server socket already active for %s:%u, skip setup\n",
+                     local->device_id, local->port_idx);
+            return;
+        }
         unlink(path);
         QIONetListener *listener = qio_net_listener_new();
         if (qio_net_listener_open_sync(listener, &addr, 1, &local_err) < 0) {
@@ -359,6 +364,11 @@ static void ub_link_setup_socket(UBLinkState *s, bool is_server)
         qemu_log("ub_link: server listening on %s for %s:%u\n",
                  path, local->device_id, local->port_idx);
     } else {
+        if (s->ioc || s->socket_connected) {
+            qemu_log("ub_link: client socket already active for %s:%u, skip setup\n",
+                     local->device_id, local->port_idx);
+            return;
+        }
         /* Always publish our endpoint so the other node can eventually find us */
         ub_link_published_state_save(s);
 
@@ -391,10 +401,50 @@ static void ub_link_setup_socket(UBLinkState *s, bool is_server)
 
 int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **errp)
 {
-    if (!s || !s->ioc) return 0;
+    UBLinkEndpointDesc *local = NULL;
+    UBLinkEndpointDesc *remote = NULL;
+    bool is_server;
     uint32_t plen = cpu_to_le32((uint32_t)len);
-    if (qio_channel_write_all(s->ioc, (const char *)&plen, sizeof(plen), errp) < 0) return -1;
-    return qio_channel_write_all(s->ioc, (const char *)buf, len, errp);
+
+    if (!s || !s->ioc) {
+        error_setg(errp, "ub_link: socket is not connected");
+        return -1;
+    }
+    if (qio_channel_write_all(s->ioc, (const char *)&plen, sizeof(plen), errp) < 0) {
+        qio_channel_close(s->ioc, NULL);
+        object_unref(OBJECT(s->ioc));
+        s->ioc = NULL;
+        s->link_up = false;
+        s->socket_connected = false;
+        s->remote_guid_valid = false;
+        s->snapshot_reconciled = false;
+        s->applied = false;
+        s->remote_applied = false;
+        s->state = UB_LINK_STATE_PENDING;
+        ub_link_update_status_file(s);
+        ub_link_select_endpoints(s, &local, &remote);
+        is_server = (local == &s->a);
+        ub_link_setup_socket(s, is_server);
+        return -1;
+    }
+    if (qio_channel_write_all(s->ioc, (const char *)buf, len, errp) < 0) {
+        qio_channel_close(s->ioc, NULL);
+        object_unref(OBJECT(s->ioc));
+        s->ioc = NULL;
+        s->link_up = false;
+        s->socket_connected = false;
+        s->remote_guid_valid = false;
+        s->snapshot_reconciled = false;
+        s->applied = false;
+        s->remote_applied = false;
+        s->state = UB_LINK_STATE_PENDING;
+        ub_link_update_status_file(s);
+        ub_link_select_endpoints(s, &local, &remote);
+        is_server = (local == &s->a);
+        ub_link_setup_socket(s, is_server);
+        return -1;
+    }
+    return 0;
 }
 
 static bool ub_link_ensure_rx_capacity(UBLinkState *s, size_t need, Error **errp)
@@ -475,7 +525,6 @@ int ub_link_read_message(UBLinkState *s, void **buf, size_t *len, Error **errp)
     *buf = g_malloc((size_t)plen);
     memcpy(*buf, s->rx_buf + sizeof(uint32_t), (size_t)plen);
     *len = (size_t)plen;
-
     s->rx_buf_used -= frame_len;
     if (s->rx_buf_used > 0) {
         memmove(s->rx_buf, s->rx_buf + frame_len, s->rx_buf_used);

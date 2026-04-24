@@ -36,7 +36,7 @@ static QEMUTimer *ub_fm_remote_link_retry_timer;
 static QEMUTimer *ub_fm_rx_poll_timer;
 
 #define UB_FM_REMOTE_LINK_RETRY_MS 2000  /* fast retry for remote endpoint .ini */
-#define UB_FM_RX_POLL_MS 500             /* poll connected sockets for incoming data */
+#define UB_FM_RX_POLL_MS 10              /* poll connected sockets for incoming data */
 
 /* Entity plan dynamic refresh support */
 static QEMUTimer *ub_fm_entity_plan_refresh_timer;
