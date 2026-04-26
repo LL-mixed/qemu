@@ -21,6 +21,7 @@
 #include "exec/address-spaces.h"
 #include "hw/irq.h"
 #include "qemu/module.h"
+#include "qemu/main-loop.h"
 #include "qemu/units.h"
 #include "hw/arm/virt.h"
 #include "hw/qdev-properties.h"
@@ -42,6 +43,69 @@
 #include "hw/ub/ub_common.h"
 #include "hw/ub/ubus_instance.h"
 #include "hw/ub/ub_pool_msg.h"
+
+typedef struct LinquUbBridge LinquUbBridge;
+LinquUbBridge *linqu_ub_bridge_new_from_yaml(const char *path);
+void linqu_ub_bridge_free(LinquUbBridge *bridge);
+int linqu_ub_bridge_register_endpoint(LinquUbBridge *bridge,
+                                      uint16_t endpoint_id,
+                                      uint32_t entity_id);
+int linqu_ub_bridge_get_default_segment(LinquUbBridge *bridge,
+                                        uint16_t endpoint_id,
+                                        uint64_t *segment_out);
+int linqu_ub_bridge_submit_slot(LinquUbBridge *bridge,
+                                uint16_t endpoint_id,
+                                const uint8_t *slot,
+                                size_t slot_len);
+int linqu_ub_bridge_write_segment_payload(LinquUbBridge *bridge,
+                                          uint64_t segment,
+                                          size_t offset,
+                                          const uint8_t *data,
+                                          size_t data_len);
+int linqu_ub_bridge_read_segment_payload(LinquUbBridge *bridge,
+                                         uint64_t segment,
+                                         size_t offset,
+                                         uint8_t *out,
+                                         size_t out_len);
+int linqu_ub_bridge_ring_doorbell(LinquUbBridge *bridge,
+                                  uint16_t endpoint_id,
+                                  uint32_t max_batch,
+                                  uint32_t *submitted_out,
+                                  uint32_t *pending_out);
+int linqu_ub_bridge_poll_completion(LinquUbBridge *bridge,
+                                    uint16_t endpoint_id,
+                                    uint8_t *slot_out,
+                                    size_t slot_len);
+
+#define LINQU_UAPI_ENDPOINT_ID 1
+#define LINQU_UAPI_ENTITY_ID 0
+#define LINQU_UAPI_VERSION 0x0000000400020000ULL
+#define LINQU_UAPI_ENDPOINT_BASE 0x1000
+#define LINQU_UAPI_REG_VERSION 0x000
+#define LINQU_UAPI_REG_CMDQ_BASE_LO 0x010
+#define LINQU_UAPI_REG_CMDQ_BASE_HI 0x018
+#define LINQU_UAPI_REG_CMDQ_SIZE 0x020
+#define LINQU_UAPI_REG_CMDQ_HEAD 0x028
+#define LINQU_UAPI_REG_CMDQ_TAIL 0x030
+#define LINQU_UAPI_REG_CQ_BASE_LO 0x038
+#define LINQU_UAPI_REG_CQ_BASE_HI 0x040
+#define LINQU_UAPI_REG_CQ_SIZE 0x048
+#define LINQU_UAPI_REG_CQ_HEAD 0x050
+#define LINQU_UAPI_REG_CQ_TAIL 0x058
+#define LINQU_UAPI_REG_STATUS 0x060
+#define LINQU_UAPI_REG_DOORBELL 0x068
+#define LINQU_UAPI_REG_LAST_ERROR 0x070
+#define LINQU_UAPI_REG_IRQ_STATUS 0x078
+#define LINQU_UAPI_REG_IRQ_ACK 0x080
+#define LINQU_UAPI_REG_DEFAULT_SEGMENT 0x088
+#define LINQU_UAPI_REG_SEG_DATA_OFFSET 0x090
+#define LINQU_UAPI_REG_SEG_DATA_VALUE 0x098
+#define LINQU_UAPI_DESC_BYTES 64
+#define LINQU_UAPI_DEFAULT_CMDQ_DEPTH 32
+#define LINQU_UAPI_DEFAULT_CQ_DEPTH 64
+#define LINQU_UAPI_IRQ_COMPLETION 1
+#define LINQU_UAPI_IRQ_ERROR 2
+#define LINQU_UAPI_IRQ_CQ_OVERFLOW 4
 
 /*
  * ============================================================================
@@ -3212,11 +3276,496 @@ static void ubc_ers2_mmio_write(BusControllerDev *ubc_dev, hwaddr addr,
     }
 }
 
+static bool linqu_uapi_decode_endpoint(hwaddr addr, hwaddr *reg)
+{
+    if (addr < LINQU_UAPI_ENDPOINT_BASE ||
+        addr >= (LINQU_UAPI_ENDPOINT_BASE + 0x1000)) {
+        return false;
+    }
+    *reg = (addr - LINQU_UAPI_ENDPOINT_BASE) & 0xfffULL;
+    return true;
+}
+
+static uint64_t linqu_uapi_status(BusControllerDev *ubc_dev)
+{
+    uint32_t cmdq_pending;
+    uint32_t cq_pending;
+
+    if (ubc_dev->linqu_uapi_cmdq_tail >= ubc_dev->linqu_uapi_cmdq_head) {
+        cmdq_pending = ubc_dev->linqu_uapi_cmdq_tail - ubc_dev->linqu_uapi_cmdq_head;
+    } else {
+        cmdq_pending = ubc_dev->linqu_uapi_cmdq_depth -
+                       ubc_dev->linqu_uapi_cmdq_head +
+                       ubc_dev->linqu_uapi_cmdq_tail;
+    }
+    if (ubc_dev->linqu_uapi_cq_tail >= ubc_dev->linqu_uapi_cq_head) {
+        cq_pending = ubc_dev->linqu_uapi_cq_tail - ubc_dev->linqu_uapi_cq_head;
+    } else {
+        cq_pending = ubc_dev->linqu_uapi_cq_depth -
+                     ubc_dev->linqu_uapi_cq_head +
+                     ubc_dev->linqu_uapi_cq_tail;
+    }
+
+    return ((uint64_t)cmdq_pending << 0) |
+           ((uint64_t)cq_pending << 16) |
+           ((uint64_t)ubc_dev->linqu_uapi_cmdq_head << 32) |
+           ((uint64_t)ubc_dev->linqu_uapi_cmdq_tail << 40) |
+           ((uint64_t)ubc_dev->linqu_uapi_cq_head << 48) |
+           ((uint64_t)ubc_dev->linqu_uapi_cq_tail << 56);
+}
+
+static bool linqu_uapi_init_bridge(BusControllerDev *ubc_dev)
+{
+    const char *scenario_path;
+    uint64_t segment = 0;
+
+    if (!ubc_dev) {
+        return false;
+    }
+    if (ubc_dev->linqu_uapi_bridge_ready) {
+        return ubc_dev->linqu_uapi_bridge != NULL;
+    }
+
+    ubc_dev->linqu_uapi_bridge_ready = true;
+    ubc_dev->linqu_uapi_cmdq_depth = LINQU_UAPI_DEFAULT_CMDQ_DEPTH;
+    ubc_dev->linqu_uapi_cq_depth = LINQU_UAPI_DEFAULT_CQ_DEPTH;
+
+    scenario_path = g_getenv("SIM_UAPI_SCENARIO_CONFIG");
+    if (!scenario_path || scenario_path[0] == '\0') {
+        ubc_dev->linqu_uapi_last_error = 1;
+        return false;
+    }
+
+    ubc_dev->linqu_uapi_bridge = linqu_ub_bridge_new_from_yaml(scenario_path);
+    if (!ubc_dev->linqu_uapi_bridge) {
+        ubc_dev->linqu_uapi_last_error = 2;
+        return false;
+    }
+    if (linqu_ub_bridge_register_endpoint(ubc_dev->linqu_uapi_bridge,
+                                          LINQU_UAPI_ENDPOINT_ID,
+                                          LINQU_UAPI_ENTITY_ID) != 0) {
+        ubc_dev->linqu_uapi_last_error = 3;
+        return false;
+    }
+    if (linqu_ub_bridge_get_default_segment(ubc_dev->linqu_uapi_bridge,
+                                            LINQU_UAPI_ENDPOINT_ID,
+                                            &segment) != 0 ||
+        segment == 0) {
+        ubc_dev->linqu_uapi_last_error = 4;
+        return false;
+    }
+
+    ubc_dev->linqu_uapi_default_segment = segment;
+    qemu_log("linqu-uapi bridge ready scenario=%s default_segment=%" PRIu64 "\n",
+             scenario_path, segment);
+    return true;
+}
+
+static MemTxResult linqu_uapi_read_slot(uint64_t base, uint32_t slot,
+                                        uint8_t *buf)
+{
+    return dma_memory_read(&address_space_memory,
+                           base + ((hwaddr)slot * LINQU_UAPI_DESC_BYTES),
+                           buf,
+                           LINQU_UAPI_DESC_BYTES,
+                           MEMTXATTRS_UNSPECIFIED);
+}
+
+static MemTxResult linqu_uapi_write_slot(uint64_t base, uint32_t slot,
+                                         const uint8_t *buf)
+{
+    return dma_memory_write(&address_space_memory,
+                            base + ((hwaddr)slot * LINQU_UAPI_DESC_BYTES),
+                            buf,
+                            LINQU_UAPI_DESC_BYTES,
+                            MEMTXATTRS_UNSPECIFIED);
+}
+
+static void linqu_uapi_flush_cq(BusControllerDev *ubc_dev)
+{
+    uint8_t slot[LINQU_UAPI_DESC_BYTES];
+    int rc;
+
+    qemu_log("linqu-uapi flush_cq begin head=%u tail=%u depth=%u\n",
+             ubc_dev->linqu_uapi_cq_head,
+             ubc_dev->linqu_uapi_cq_tail,
+             ubc_dev->linqu_uapi_cq_depth);
+    while (((ubc_dev->linqu_uapi_cq_tail + 1) % ubc_dev->linqu_uapi_cq_depth) !=
+           ubc_dev->linqu_uapi_cq_head) {
+        rc = linqu_ub_bridge_poll_completion(ubc_dev->linqu_uapi_bridge,
+                                             LINQU_UAPI_ENDPOINT_ID,
+                                             slot,
+                                             sizeof(slot));
+        if (rc == 1) {
+            qemu_log("linqu-uapi flush_cq empty head=%u tail=%u\n",
+                     ubc_dev->linqu_uapi_cq_head,
+                     ubc_dev->linqu_uapi_cq_tail);
+            break;
+        }
+        if (rc < 0) {
+            ubc_dev->linqu_uapi_last_error = 5;
+            ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
+            qemu_log("linqu-uapi flush_cq poll failed last_error=%" PRIu64 "\n",
+                     ubc_dev->linqu_uapi_last_error);
+            return;
+        }
+        if (linqu_uapi_write_slot(ubc_dev->linqu_uapi_cq_iova,
+                                  ubc_dev->linqu_uapi_cq_tail,
+                                  slot) != MEMTX_OK) {
+            ubc_dev->linqu_uapi_last_error = 6;
+            ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
+            qemu_log("linqu-uapi flush_cq write failed cq_iova=%#" PRIx64 " tail=%u\n",
+                     ubc_dev->linqu_uapi_cq_iova,
+                     ubc_dev->linqu_uapi_cq_tail);
+            return;
+        }
+        qemu_log("linqu-uapi flush_cq wrote completion tail=%u op_id=%" PRIu64 " source=%u status=%u code_len=%u code=%.*s\n",
+                 ubc_dev->linqu_uapi_cq_tail,
+                 ldq_le_p(slot),
+                 slot[9],
+                 slot[10],
+                 slot[11],
+                 slot[11],
+                 (const char *)(slot + 12));
+        ubc_dev->linqu_uapi_cq_tail =
+            (ubc_dev->linqu_uapi_cq_tail + 1) % ubc_dev->linqu_uapi_cq_depth;
+        ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_COMPLETION;
+    }
+}
+
+static void linqu_uapi_kick(BusControllerDev *ubc_dev, uint32_t batch)
+{
+    uint8_t slot[LINQU_UAPI_DESC_BYTES];
+    uint32_t submitted = 0;
+    uint32_t pending = 0;
+    uint32_t head;
+    int rc;
+
+    if (!linqu_uapi_init_bridge(ubc_dev)) {
+        return;
+    }
+    if (ubc_dev->linqu_uapi_cmdq_depth == 0 || ubc_dev->linqu_uapi_cq_depth == 0) {
+        ubc_dev->linqu_uapi_last_error = 7;
+        qemu_log("linqu-uapi kick invalid queue depth cmdq=%u cq=%u\n",
+                 ubc_dev->linqu_uapi_cmdq_depth,
+                 ubc_dev->linqu_uapi_cq_depth);
+        return;
+    }
+
+    qemu_log("linqu-uapi kick begin batch=%u cmdq_base=%#" PRIx64 " cmdq_head=%u cmdq_tail=%u cmdq_depth=%u cq_base=%#" PRIx64 " cq_head=%u cq_tail=%u cq_depth=%u\n",
+             batch,
+             ubc_dev->linqu_uapi_cmdq_iova,
+             ubc_dev->linqu_uapi_cmdq_head,
+             ubc_dev->linqu_uapi_cmdq_tail,
+             ubc_dev->linqu_uapi_cmdq_depth,
+             ubc_dev->linqu_uapi_cq_iova,
+             ubc_dev->linqu_uapi_cq_head,
+             ubc_dev->linqu_uapi_cq_tail,
+             ubc_dev->linqu_uapi_cq_depth);
+    head = ubc_dev->linqu_uapi_cmdq_head;
+    while (head != ubc_dev->linqu_uapi_cmdq_tail && submitted < batch) {
+        if (linqu_uapi_read_slot(ubc_dev->linqu_uapi_cmdq_iova, head, slot) != MEMTX_OK) {
+            ubc_dev->linqu_uapi_last_error = 8;
+            ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
+            qemu_log("linqu-uapi kick read slot failed base=%#" PRIx64 " head=%u\n",
+                     ubc_dev->linqu_uapi_cmdq_iova,
+                     head);
+            return;
+        }
+        qemu_log("linqu-uapi kick submit slot=%u opcode=%u op_id=%" PRIu64 "\n",
+                 head,
+                 slot[0],
+                 ldq_le_p(slot + 8));
+        rc = linqu_ub_bridge_submit_slot(ubc_dev->linqu_uapi_bridge,
+                                         LINQU_UAPI_ENDPOINT_ID,
+                                         slot,
+                                         sizeof(slot));
+        if (rc != 0) {
+            ubc_dev->linqu_uapi_last_error = 9;
+            ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
+            qemu_log("linqu-uapi kick submit failed slot=%u rc=%d\n", head, rc);
+            return;
+        }
+        head = (head + 1) % ubc_dev->linqu_uapi_cmdq_depth;
+        submitted++;
+    }
+
+    qemu_log("linqu-uapi kick ring submitted_pre=%u pending_head=%u tail=%u\n",
+             submitted,
+             head,
+             ubc_dev->linqu_uapi_cmdq_tail);
+    rc = linqu_ub_bridge_ring_doorbell(ubc_dev->linqu_uapi_bridge,
+                                       LINQU_UAPI_ENDPOINT_ID,
+                                       submitted,
+                                       &submitted,
+                                       &pending);
+    if (rc != 0) {
+        ubc_dev->linqu_uapi_last_error = 10;
+        ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
+        qemu_log("linqu-uapi kick ring failed rc=%d\n", rc);
+        return;
+    }
+    qemu_log("linqu-uapi kick ring done submitted=%u pending=%u\n",
+             submitted,
+             pending);
+    ubc_dev->linqu_uapi_cmdq_head = head;
+    linqu_uapi_flush_cq(ubc_dev);
+    qemu_log("linqu-uapi kick done cmdq_head=%u cq_tail=%u irq=%#" PRIx64 " last_error=%" PRIu64 "\n",
+             ubc_dev->linqu_uapi_cmdq_head,
+             ubc_dev->linqu_uapi_cq_tail,
+             ubc_dev->linqu_uapi_irq_status,
+             ubc_dev->linqu_uapi_last_error);
+}
+
+static void linqu_uapi_kick_bh(void *opaque)
+{
+    BusControllerDev *ubc_dev = opaque;
+
+    if (!ubc_dev) {
+        return;
+    }
+
+    ubc_dev->linqu_uapi_kick_running = true;
+    while (ubc_dev->linqu_uapi_kick_pending) {
+        uint32_t batch = ubc_dev->linqu_uapi_kick_batch;
+
+        ubc_dev->linqu_uapi_kick_pending = false;
+        ubc_dev->linqu_uapi_kick_batch = 0;
+        linqu_uapi_kick(ubc_dev, batch);
+    }
+    ubc_dev->linqu_uapi_kick_running = false;
+}
+
+static void linqu_uapi_schedule_kick(BusControllerDev *ubc_dev, uint32_t batch)
+{
+    bool was_idle;
+
+    if (!ubc_dev) {
+        return;
+    }
+
+    was_idle = !ubc_dev->linqu_uapi_kick_pending &&
+               !ubc_dev->linqu_uapi_kick_running;
+    if (batch > ubc_dev->linqu_uapi_kick_batch) {
+        ubc_dev->linqu_uapi_kick_batch = batch;
+    }
+    ubc_dev->linqu_uapi_kick_pending = true;
+    if (was_idle) {
+        aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                linqu_uapi_kick_bh,
+                                ubc_dev);
+    }
+}
+
+static uint64_t linqu_uapi_access_extract(uint64_t full_value, hwaddr reg,
+                                          unsigned len)
+{
+    if (len == sizeof(uint64_t)) {
+        return full_value;
+    }
+    if (len == DWORD_SIZE) {
+        return (reg & 0x4) ? (full_value >> 32) & 0xffffffffULL
+                           : full_value & 0xffffffffULL;
+    }
+    return full_value;
+}
+
+static uint64_t linqu_uapi_access_merge(uint64_t current_value, hwaddr reg,
+                                        uint64_t value, unsigned len)
+{
+    if (len == sizeof(uint64_t)) {
+        return value;
+    }
+    if (len == DWORD_SIZE) {
+        if (reg & 0x4) {
+            return (current_value & 0x00000000ffffffffULL) |
+                   ((value & 0xffffffffULL) << 32);
+        }
+        return (current_value & 0xffffffff00000000ULL) |
+               (value & 0xffffffffULL);
+    }
+    return current_value;
+}
+
+static uint64_t linqu_uapi_reg_read(BusControllerDev *ubc_dev, hwaddr reg,
+                                    unsigned len)
+{
+    uint64_t value = 0;
+
+    if (reg == LINQU_UAPI_REG_VERSION) {
+        return linqu_uapi_access_extract(LINQU_UAPI_VERSION, reg, len);
+    }
+    if (!linqu_uapi_init_bridge(ubc_dev)) {
+        return 0;
+    }
+
+    switch (reg & ~0x7ULL) {
+    case LINQU_UAPI_REG_CMDQ_BASE_LO:
+        value = (uint32_t)ubc_dev->linqu_uapi_cmdq_iova;
+        break;
+    case LINQU_UAPI_REG_CMDQ_BASE_HI:
+        value = ubc_dev->linqu_uapi_cmdq_iova >> 32;
+        break;
+    case LINQU_UAPI_REG_CMDQ_SIZE:
+        value = ubc_dev->linqu_uapi_cmdq_depth;
+        break;
+    case LINQU_UAPI_REG_CMDQ_HEAD:
+        value = ubc_dev->linqu_uapi_cmdq_head;
+        break;
+    case LINQU_UAPI_REG_CMDQ_TAIL:
+        value = ubc_dev->linqu_uapi_cmdq_tail;
+        break;
+    case LINQU_UAPI_REG_CQ_BASE_LO:
+        value = (uint32_t)ubc_dev->linqu_uapi_cq_iova;
+        break;
+    case LINQU_UAPI_REG_CQ_BASE_HI:
+        value = ubc_dev->linqu_uapi_cq_iova >> 32;
+        break;
+    case LINQU_UAPI_REG_CQ_SIZE:
+        value = ubc_dev->linqu_uapi_cq_depth;
+        break;
+    case LINQU_UAPI_REG_CQ_HEAD:
+        value = ubc_dev->linqu_uapi_cq_head;
+        break;
+    case LINQU_UAPI_REG_CQ_TAIL:
+        value = ubc_dev->linqu_uapi_cq_tail;
+        break;
+    case LINQU_UAPI_REG_STATUS:
+        value = linqu_uapi_status(ubc_dev);
+        break;
+    case LINQU_UAPI_REG_LAST_ERROR:
+        value = ubc_dev->linqu_uapi_last_error;
+        break;
+    case LINQU_UAPI_REG_IRQ_STATUS:
+        value = ubc_dev->linqu_uapi_irq_status;
+        break;
+    case LINQU_UAPI_REG_DEFAULT_SEGMENT:
+        value = ubc_dev->linqu_uapi_default_segment;
+        break;
+    case LINQU_UAPI_REG_SEG_DATA_OFFSET:
+        value = ubc_dev->linqu_uapi_segment_data_offset;
+        break;
+    case LINQU_UAPI_REG_SEG_DATA_VALUE:
+        if (linqu_ub_bridge_read_segment_payload(ubc_dev->linqu_uapi_bridge,
+                                                 ubc_dev->linqu_uapi_default_segment,
+                                                 ubc_dev->linqu_uapi_segment_data_offset,
+                                                 (uint8_t *)&value,
+                                                 sizeof(value)) != 0) {
+            ubc_dev->linqu_uapi_last_error = 11;
+            return 0;
+        }
+        break;
+    default:
+        return 0;
+    }
+    return linqu_uapi_access_extract(value, reg, len);
+}
+
+static bool linqu_uapi_reg_write(BusControllerDev *ubc_dev, hwaddr reg,
+                                 uint64_t value, unsigned len)
+{
+    hwaddr base_reg = reg & ~0x7ULL;
+    uint64_t current;
+
+    if (!linqu_uapi_init_bridge(ubc_dev)) {
+        return false;
+    }
+    switch (base_reg) {
+    case LINQU_UAPI_REG_CMDQ_BASE_LO:
+        current = ubc_dev->linqu_uapi_cmdq_iova;
+        ubc_dev->linqu_uapi_cmdq_iova =
+            linqu_uapi_access_merge(current, reg, value, len);
+        return true;
+    case LINQU_UAPI_REG_CQ_BASE_LO:
+        current = ubc_dev->linqu_uapi_cq_iova;
+        ubc_dev->linqu_uapi_cq_iova =
+            linqu_uapi_access_merge(current, reg, value, len);
+        return true;
+    case LINQU_UAPI_REG_CQ_HEAD:
+        if (len == DWORD_SIZE && (reg & 0x4)) {
+            return true;
+        }
+        if (value >= ubc_dev->linqu_uapi_cq_depth) {
+            ubc_dev->linqu_uapi_last_error = 12;
+            return true;
+        }
+        ubc_dev->linqu_uapi_cq_head = value;
+        if (ubc_dev->linqu_uapi_cq_head == ubc_dev->linqu_uapi_cq_tail) {
+            ubc_dev->linqu_uapi_irq_status &= ~LINQU_UAPI_IRQ_COMPLETION;
+        }
+        return true;
+    case LINQU_UAPI_REG_CMDQ_TAIL:
+        if (len == DWORD_SIZE && (reg & 0x4)) {
+            return true;
+        }
+        if (value >= ubc_dev->linqu_uapi_cmdq_depth) {
+            ubc_dev->linqu_uapi_last_error = 13;
+            return true;
+        }
+        ubc_dev->linqu_uapi_cmdq_tail = value;
+        return true;
+    case LINQU_UAPI_REG_DOORBELL:
+        if (len == DWORD_SIZE && (reg & 0x4)) {
+            return true;
+        }
+        linqu_uapi_schedule_kick(ubc_dev,
+                                 value ? value : ubc_dev->linqu_uapi_cmdq_depth);
+        return true;
+    case LINQU_UAPI_REG_IRQ_ACK:
+        if (len == DWORD_SIZE && (reg & 0x4)) {
+            return true;
+        }
+        ubc_dev->linqu_uapi_irq_status &= ~value;
+        return true;
+    case LINQU_UAPI_REG_SEG_DATA_OFFSET:
+        current = ubc_dev->linqu_uapi_segment_data_offset;
+        ubc_dev->linqu_uapi_segment_data_offset =
+            linqu_uapi_access_merge(current, reg, value, len);
+        return true;
+    case LINQU_UAPI_REG_SEG_DATA_VALUE:
+        current = 0;
+        if (linqu_ub_bridge_read_segment_payload(ubc_dev->linqu_uapi_bridge,
+                                                 ubc_dev->linqu_uapi_default_segment,
+                                                 ubc_dev->linqu_uapi_segment_data_offset,
+                                                 (uint8_t *)&current,
+                                                 sizeof(current)) != 0) {
+            ubc_dev->linqu_uapi_last_error = 11;
+            return true;
+        }
+        value = linqu_uapi_access_merge(current, reg, value, len);
+        if (linqu_ub_bridge_write_segment_payload(ubc_dev->linqu_uapi_bridge,
+                                                  ubc_dev->linqu_uapi_default_segment,
+                                                  ubc_dev->linqu_uapi_segment_data_offset,
+                                                  (const uint8_t *)&value,
+                                                  sizeof(value)) != 0) {
+            ubc_dev->linqu_uapi_last_error = 14;
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint64_t ub_ers_region_read(void *opaque, hwaddr addr, unsigned len)
 {
     typeof(((BusControllerDev *)0)->ers[0]) *ers = opaque;
     BusControllerDev *ubc_dev = ers->owner;
     uint32_t entity_idx = 0;
+    hwaddr linqu_reg;
+
+    if (ers->idx == 1 && len >= DWORD_SIZE &&
+        addr < sizeof(uint64_t)) {
+        return linqu_uapi_access_extract(LINQU_UAPI_VERSION, addr, len);
+    }
+
+    if (ers->idx == 2 && len >= DWORD_SIZE) {
+        if (addr < sizeof(uint64_t)) {
+            return linqu_uapi_reg_read(ubc_dev, addr, len);
+        }
+        if (linqu_uapi_decode_endpoint(addr, &linqu_reg)) {
+            return linqu_uapi_reg_read(ubc_dev, linqu_reg, len);
+        }
+    }
 
     /* Multi-entity routing for ERS0 (Config), ERS1 (Doorbell), and ERS2 (Resource) */
     if ((ers->idx == 0 || ers->idx == 1 || ers->idx == 2) && addr >= 0x400000) {
@@ -5185,6 +5734,14 @@ static void ub_ers_region_write(void *opaque, hwaddr addr, uint64_t val, unsigne
     typeof(((BusControllerDev *)0)->ers[0]) *ers = opaque;
     BusControllerDev *ubc_dev = ers->owner;
     uint32_t entity_idx = 0;
+    hwaddr linqu_reg;
+
+    if (ers->idx == 2 && len >= DWORD_SIZE) {
+        if (linqu_uapi_decode_endpoint(addr, &linqu_reg) &&
+            linqu_uapi_reg_write(ubc_dev, linqu_reg, val, len)) {
+            return;
+        }
+    }
 
     /* Multi-entity routing: each entity has a 4MB aperture in the alias window */
     if ((ers->idx == 0 || ers->idx == 1 || ers->idx == 2) && addr >= 0x400000) {

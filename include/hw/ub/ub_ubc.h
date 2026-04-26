@@ -218,6 +218,24 @@ typedef struct BusControllerDev {
         int status;
         uint8_t *buf;
     } sim_dec_sync_read;
+
+    void *linqu_uapi_bridge;
+    bool linqu_uapi_bridge_ready;
+    uint64_t linqu_uapi_cmdq_iova;
+    uint64_t linqu_uapi_cq_iova;
+    uint32_t linqu_uapi_cmdq_depth;
+    uint32_t linqu_uapi_cq_depth;
+    uint32_t linqu_uapi_cmdq_head;
+    uint32_t linqu_uapi_cmdq_tail;
+    uint32_t linqu_uapi_cq_head;
+    uint32_t linqu_uapi_cq_tail;
+    uint64_t linqu_uapi_default_segment;
+    uint64_t linqu_uapi_segment_data_offset;
+    uint64_t linqu_uapi_last_error;
+    uint64_t linqu_uapi_irq_status;
+    bool linqu_uapi_kick_pending;
+    bool linqu_uapi_kick_running;
+    uint32_t linqu_uapi_kick_batch;
     uint32_t next_sim_dec_read_req_id;
     uint32_t next_tp_id;
 } BusControllerDev;
