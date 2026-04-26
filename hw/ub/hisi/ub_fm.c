@@ -748,8 +748,7 @@ static bool ub_fm_has_pending_links(void)
     for (i = 0; i < ub_fm_active_links->len; i++) {
         UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
 
-        if (link->runtime &&
-            (ub_link_is_pending(link->runtime) || link->runtime->ioc != NULL)) {
+        if (link->runtime && ub_link_is_pending(link->runtime)) {
             return true;
         }
     }
@@ -1432,8 +1431,7 @@ int ub_fm_apply_declared_topology(Error **errp)
              * can be observed after the initial topology apply.
              */
             if (link->runtime &&
-                (link->runtime->ioc != NULL ||
-                 link->runtime->remote_applied ||
+                (ub_link_is_pending(link->runtime) ||
                  link->runtime->a.device == NULL ||
                  link->runtime->b.device == NULL)) {
                 has_pending = true;
