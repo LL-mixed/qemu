@@ -19,6 +19,9 @@
 #include "qom/object.h"
 #include "sysemu/sysemu.h"
 
+#define UB_LINK_WRITE_WAIT_USEC 1000
+#define UB_LINK_WRITE_TIMEOUT_USEC (2 * G_USEC_PER_SEC)
+
 typedef struct UBLinkPublishedState {
     char *device_id;
     uint32_t port_idx;
@@ -122,6 +125,30 @@ static void ub_link_select_endpoints(UBLinkState *s,
 
     *local = &s->b;
     *remote = &s->a;
+}
+
+static void ub_link_aio_read(void *opaque)
+{
+    UBLinkState *s = opaque;
+
+    if (!s || !s->rx_cb) {
+        return;
+    }
+    s->rx_cb(s->rx_cb_opaque, s);
+}
+
+static void ub_link_arm_aio_rx(UBLinkState *s)
+{
+    if (!s || !s->ioc || !s->rx_cb) {
+        return;
+    }
+
+    qio_channel_set_aio_fd_handler(s->ioc,
+                                   qemu_get_aio_context(),
+                                   ub_link_aio_read,
+                                   NULL,
+                                   NULL,
+                                   s);
 }
 
 static char *ub_link_shared_dir(void)
@@ -327,6 +354,7 @@ static void ub_link_accept(QIONetListener *listener, QIOChannelSocket *cioc, gpo
 
     /* Configure remote link now that connection is established */
     ub_link_load_remote_endpoint_and_connect(s, local, remote);
+    ub_link_arm_aio_rx(s);
 }
 
 static void ub_link_setup_socket(UBLinkState *s, bool is_server)
@@ -388,6 +416,7 @@ static void ub_link_setup_socket(UBLinkState *s, bool is_server)
                 ub_link_mark_connected(s);
                 /* Configure remote link now that connection is established */
                 ub_link_load_remote_endpoint_and_connect(s, local, remote);
+                ub_link_arm_aio_rx(s);
                 return;
             }
             error_free(local_err);
@@ -398,6 +427,9 @@ static void ub_link_setup_socket(UBLinkState *s, bool is_server)
         object_unref(OBJECT(sioc));
     }
 }
+
+static int ub_link_write_all_bounded(UBLinkState *s, const char *buf, size_t len,
+                                     Error **errp);
 
 int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **errp)
 {
@@ -410,7 +442,7 @@ int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **e
         error_setg(errp, "ub_link: socket is not connected");
         return -1;
     }
-    if (qio_channel_write_all(s->ioc, (const char *)&plen, sizeof(plen), errp) < 0) {
+    if (ub_link_write_all_bounded(s, (const char *)&plen, sizeof(plen), errp) < 0) {
         qio_channel_close(s->ioc, NULL);
         object_unref(OBJECT(s->ioc));
         s->ioc = NULL;
@@ -427,7 +459,7 @@ int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **e
         ub_link_setup_socket(s, is_server);
         return -1;
     }
-    if (qio_channel_write_all(s->ioc, (const char *)buf, len, errp) < 0) {
+    if (ub_link_write_all_bounded(s, (const char *)buf, len, errp) < 0) {
         qio_channel_close(s->ioc, NULL);
         object_unref(OBJECT(s->ioc));
         s->ioc = NULL;
@@ -444,6 +476,44 @@ int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **e
         ub_link_setup_socket(s, is_server);
         return -1;
     }
+    return 0;
+}
+
+static int ub_link_write_all_bounded(UBLinkState *s, const char *buf, size_t len,
+                                     Error **errp)
+{
+    gint64 deadline = g_get_monotonic_time() + UB_LINK_WRITE_TIMEOUT_USEC;
+    size_t done = 0;
+
+    while (done < len) {
+        Error *local_err = NULL;
+        ssize_t ret = qio_channel_write(s->ioc, buf + done, len - done,
+                                        &local_err);
+
+        if (ret == QIO_CHANNEL_ERR_BLOCK) {
+            error_free(local_err);
+            if (g_get_monotonic_time() >= deadline) {
+                error_setg(errp, "ub_link: bounded write timed out after %zu/%zu bytes",
+                           done, len);
+                return -1;
+            }
+            aio_poll(qemu_get_aio_context(), false);
+            g_usleep(UB_LINK_WRITE_WAIT_USEC);
+            continue;
+        }
+        if (ret < 0) {
+            error_propagate(errp, local_err);
+            return -1;
+        }
+        error_free(local_err);
+        if (ret == 0) {
+            error_setg(errp, "ub_link: bounded write made no progress after %zu/%zu bytes",
+                       done, len);
+            return -1;
+        }
+        done += (size_t)ret;
+    }
+
     return 0;
 }
 
@@ -473,9 +543,28 @@ static bool ub_link_ensure_rx_capacity(UBLinkState *s, size_t need, Error **errp
     return true;
 }
 
+static bool ub_link_trace_nodea_nodeh_rx(UBLinkState *s)
+{
+    const char *node_id = g_getenv("UB_FM_NODE_ID");
+
+    if (!s || g_strcmp0(node_id, "nodeA") != 0) {
+        return false;
+    }
+
+    return (g_strcmp0(s->a.device_id, "ubcdev0") == 0 &&
+            s->a.port_idx == 6 &&
+            g_strcmp0(s->b.device_id, "nodeH.ubcdev0") == 0) ||
+           (g_strcmp0(s->b.device_id, "ubcdev0") == 0 &&
+            s->b.port_idx == 6 &&
+            g_strcmp0(s->a.device_id, "nodeH.ubcdev0") == 0);
+}
+
 int ub_link_read_message(UBLinkState *s, void **buf, size_t *len, Error **errp)
 {
     uint8_t tmp[4096];
+    bool trace = ub_link_trace_nodea_nodeh_rx(s);
+    size_t before_used;
+    size_t bytes_read = 0;
     ssize_t ret;
 
     if (!s || !s->ioc) {
@@ -487,11 +576,24 @@ int ub_link_read_message(UBLinkState *s, void **buf, size_t *len, Error **errp)
     }
 
     /* Non-blocking stream read: accumulate as much as available this turn. */
+    before_used = s->rx_buf_used;
     for (;;) {
-        ret = qio_channel_read(s->ioc, (char *)tmp, sizeof(tmp), NULL);
-        if (ret <= 0) {
+        Error *read_err = NULL;
+
+        ret = qio_channel_read(s->ioc, (char *)tmp, sizeof(tmp), &read_err);
+        if (ret < 0) {
+            if (trace && read_err) {
+                qemu_log("ub_link rx nodeA<-nodeH read_err: before=%zu used=%zu err=%s\n",
+                         before_used, s->rx_buf_used, error_get_pretty(read_err));
+            }
+            error_free(read_err);
             break;
         }
+        if (ret == 0) {
+            error_free(read_err);
+            break;
+        }
+        error_free(read_err);
 
         if (!ub_link_ensure_rx_capacity(s, s->rx_buf_used + (size_t)ret, errp)) {
             s->rx_buf_used = 0;
@@ -500,6 +602,12 @@ int ub_link_read_message(UBLinkState *s, void **buf, size_t *len, Error **errp)
 
         memcpy(s->rx_buf + s->rx_buf_used, tmp, (size_t)ret);
         s->rx_buf_used += (size_t)ret;
+        bytes_read += (size_t)ret;
+    }
+
+    if (trace && bytes_read > 0) {
+        qemu_log("ub_link rx nodeA<-nodeH bytes: before=%zu read=%zu used=%zu cap=%zu\n",
+                 before_used, bytes_read, s->rx_buf_used, s->rx_buf_cap);
     }
 
     if (s->rx_buf_used < sizeof(uint32_t)) {
@@ -513,12 +621,20 @@ int ub_link_read_message(UBLinkState *s, void **buf, size_t *len, Error **errp)
     plen = le32_to_cpu(plen_le);
     if (plen == 0 || plen > UB_LINK_RX_BUF_MAX) {
         error_setg(errp, "ub_link: invalid frame length %u", plen);
+        if (trace) {
+            qemu_log("ub_link rx nodeA<-nodeH invalid_frame: plen=%u used=%zu cap=%zu\n",
+                     plen, s->rx_buf_used, s->rx_buf_cap);
+        }
         s->rx_buf_used = 0;
         return -1;
     }
 
     frame_len = sizeof(uint32_t) + (size_t)plen;
     if (s->rx_buf_used < frame_len) {
+        if (trace && bytes_read > 0) {
+            qemu_log("ub_link rx nodeA<-nodeH partial_frame: plen=%u frame=%zu used=%zu\n",
+                     plen, frame_len, s->rx_buf_used);
+        }
         return 0;
     }
 
@@ -528,6 +644,11 @@ int ub_link_read_message(UBLinkState *s, void **buf, size_t *len, Error **errp)
     s->rx_buf_used -= frame_len;
     if (s->rx_buf_used > 0) {
         memmove(s->rx_buf, s->rx_buf + frame_len, s->rx_buf_used);
+    }
+
+    if (trace) {
+        qemu_log("ub_link rx nodeA<-nodeH complete_frame: plen=%u remain=%zu\n",
+                 plen, s->rx_buf_used);
     }
 
     return 1;

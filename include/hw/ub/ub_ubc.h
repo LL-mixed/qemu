@@ -213,6 +213,7 @@ typedef struct BusControllerDev {
     struct {
         bool pending;
         uint32_t req_id;
+        uint32_t peer_cna;
         uint32_t expect_len;
         uint32_t actual_len;
         int status;
@@ -375,7 +376,8 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
                                     uint32_t dcna);
 void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
                                      const UBCSimDecReadRespPldHdr *hdr,
-                                     const uint8_t *data, uint32_t data_len);
+                                     const uint8_t *data, uint32_t data_len,
+                                     uint32_t peer_cna);
 
 /* SIM Decoder (SIM_DEC) protocol for cross-node memory access */
 int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,

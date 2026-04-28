@@ -749,7 +749,7 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
         return;
     }
 
-    for (;;) {
+    while (true) {
         void *buf = NULL;
         size_t len = 0;
         Error *local_err = NULL;
@@ -849,7 +849,7 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
                     }
 
                     ubc_handle_sim_dec_rx_read_resp(s->ubc_dev, resp, rd_data,
-                                                    rd_len);
+                                                    rd_len, header->nth.scna);
                 }
                 g_free(buf);
                 continue;
@@ -914,7 +914,13 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
         cqe.type = header->msgetah.type;
         cqe.msg_code = header->msgetah.msg_code;
         cqe.sub_msg_code = header->msgetah.sub_msg_code;
-        cqe.p_len = len - sizeof(MsgPktHeader);
+        /*
+         * The guest hisi msg poller passes cqe->p_len as the complete
+         * packet size to message_rx_handler(), which then validates
+         * header.msgetah.plen == len - MSG_PKT_HEADER_SIZE.  Keep this as
+         * the full message length, matching local injected messages.
+         */
+        cqe.p_len = len;
         cqe.msn = 0x8000 | (uint16_t)(qemu_clock_get_ms(QEMU_CLOCK_REALTIME) & 0x7FFF);
         cqe.rq_pi = pi;
         cqe.status = CQE_SUCCESS;

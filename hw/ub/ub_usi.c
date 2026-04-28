@@ -21,6 +21,18 @@
 #include "qemu/log.h"
 #include "exec/address-spaces.h"
 
+static bool ub_usi_trace_notify(void)
+{
+    static bool initialized;
+    static bool enabled;
+
+    if (!initialized) {
+        enabled = g_getenv("UB_USI_TRACE_NOTIFY") != NULL;
+        initialized = true;
+    }
+    return enabled;
+}
+
 static void usi_init_vector_notifiers(UBDevice *udev,
                                       USIVectorUseNotifier use_notifier,
                                       USIVectorReleaseNotifier release_notifier,
@@ -478,8 +490,10 @@ void usi_send_message(USIMessage *msg, uint32_t interrupt_id, UBDevice *udev)
         address_space_stl_le(&address_space_memory, msg->address, msg->data,
                              attrs, NULL);
     }
-    qemu_log("usi notify success: interrupt_id %u eventid %u gicv3_its 0x%lx\n",
-             interrupt_id, msg->data, msg->address);
+    if (ub_usi_trace_notify()) {
+        qemu_log("usi notify success: interrupt_id %u eventid %u gicv3_its %#" PRIx64 "\n",
+                 interrupt_id, msg->data, (uint64_t)msg->address);
+    }
 }
 
 void usi_notify(UBDevice *udev, uint16_t vector)

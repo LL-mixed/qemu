@@ -22,6 +22,7 @@
 #include "hw/ub/ub_link.h"
 #include "hw/ub/ub_ubc.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/timer.h"
 
 static GPtrArray *ub_fm_declared_links;
@@ -34,6 +35,7 @@ static GPtrArray *ub_fm_snapshot_source_links;
 static QEMUTimer *ub_fm_pending_refresh_timer;
 static QEMUTimer *ub_fm_remote_link_retry_timer;
 static QEMUTimer *ub_fm_rx_poll_timer;
+static bool ub_fm_rx_poll_active;
 
 #define UB_FM_REMOTE_LINK_RETRY_MS 2000  /* fast retry for remote endpoint .ini */
 #define UB_FM_RX_POLL_MS 10              /* poll connected sockets for incoming data */
@@ -60,6 +62,37 @@ static const char *ub_fm_get_local_node_id(void)
     const char *local_node_id = g_getenv("UB_FM_NODE_ID");
 
     return (local_node_id && local_node_id[0]) ? local_node_id : NULL;
+}
+
+static bool ub_fm_trace_link_lookup_enabled(void)
+{
+    const char *val = g_getenv("UB_FM_TRACE_LINK_LOOKUP");
+
+    return val && val[0] && strcmp(val, "0") != 0;
+}
+
+static void ub_fm_link_aio_read(void *opaque)
+{
+    UBLinkState *runtime = opaque;
+
+    if (!runtime || !runtime->rx_cb) {
+        return;
+    }
+    runtime->rx_cb(runtime->rx_cb_opaque, runtime);
+}
+
+static void ub_fm_link_arm_aio_rx(UBLinkState *runtime)
+{
+    if (!runtime || !runtime->ioc || !runtime->rx_cb) {
+        return;
+    }
+
+    qio_channel_set_aio_fd_handler(runtime->ioc,
+                                   qemu_get_aio_context(),
+                                   ub_fm_link_aio_read,
+                                   NULL,
+                                   NULL,
+                                   runtime);
 }
 
 static uint8_t ub_fm_node_ip_suffix_from_device_id(const char *device_id)
@@ -932,12 +965,17 @@ static void ub_fm_schedule_remote_link_retry(void)
  * This timer runs at 500ms intervals to read any URMA data that
  * arrived from the peer QEMU without waiting for the slow 60s
  * topology refresh timer. */
-static void ub_fm_rx_poll_cb(void *opaque)
+void ub_fm_poll_rx_links_now(void)
 {
     guint i;
 
+    if (ub_fm_rx_poll_active) {
+        return;
+    }
+    ub_fm_rx_poll_active = true;
+
     if (!ub_fm_active_links) {
-        ub_fm_rx_poll_start();
+        ub_fm_rx_poll_active = false;
         return;
     }
 
@@ -962,15 +1000,22 @@ static void ub_fm_rx_poll_cb(void *opaque)
                 link->runtime->rx_cb =
                     (void (*)(void *, UBLinkState *))ub_link_process_incoming_message;
                 link->runtime->rx_cb_opaque = ubc;
+                ub_fm_link_arm_aio_rx(link->runtime);
             }
         }
 
         if (link->runtime->rx_cb) {
+            ub_fm_link_arm_aio_rx(link->runtime);
             link->runtime->rx_cb(link->runtime->rx_cb_opaque, link->runtime);
         }
     }
 
-    /* Reschedule the poll timer */
+    ub_fm_rx_poll_active = false;
+}
+
+static void ub_fm_rx_poll_cb(void *opaque)
+{
+    ub_fm_poll_rx_links_now();
     ub_fm_rx_poll_start();
 }
 
@@ -1383,6 +1428,7 @@ int ub_fm_apply_declared_topology(Error **errp)
                     link->runtime->rx_cb =
                         (void (*)(void *, UBLinkState *))ub_link_process_incoming_message;
                     link->runtime->rx_cb_opaque = ubc;
+                    ub_fm_link_arm_aio_rx(link->runtime);
                 }
             }
         }
@@ -1414,6 +1460,7 @@ int ub_fm_apply_declared_topology(Error **errp)
                         link->runtime->rx_cb = (void (*)(void *, UBLinkState *))ub_link_process_incoming_message;
                         link->runtime->rx_cb_opaque = ubc;
                     }
+                    ub_fm_link_arm_aio_rx(link->runtime);
 
                     qemu_log("ub_fm: remote kick received on %s:%u, processing msgq\n",
                              dev->qdev.id, port_idx);
@@ -1521,13 +1568,18 @@ UBFMManagedLink *ub_fm_find_link_by_cna(uint32_t dcna)
     guint i;
     uint32_t cna = dcna & 0x00ffffffU;
     UBFMManagedLink *fallback = NULL;
+    bool trace = ub_fm_trace_link_lookup_enabled();
 
     if (!ub_fm_active_links) {
-        qemu_log("ub_fm_find_link_by_cna: dcna=%#x no active links\n", cna);
+        if (trace) {
+            qemu_log("ub_fm_find_link_by_cna: dcna=%#x no active links\n", cna);
+        }
         return NULL;
     }
-    qemu_log("ub_fm_find_link_by_cna: dcna=%#x active_links=%u\n",
-             cna, ub_fm_active_links->len);
+    if (trace) {
+        qemu_log("ub_fm_find_link_by_cna: dcna=%#x active_links=%u\n",
+                 cna, ub_fm_active_links->len);
+    }
 
     for (i = 0; i < ub_fm_active_links->len; i++) {
         UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
@@ -1553,36 +1605,122 @@ UBFMManagedLink *ub_fm_find_link_by_cna(uint32_t dcna)
             if (!local) {
                 continue;
             }
-            qemu_log("ub_fm_find_link_by_cna: link[%u] ep[%d]=%s:%u local_cna=%#x\n",
-                     i, e, local->qdev.id ? local->qdev.id : "<null>",
-                     port_idx, local->cna);
+            if (trace) {
+                qemu_log("ub_fm_find_link_by_cna: link[%u] ep[%d]=%s:%u local_cna=%#x\n",
+                         i, e, local->qdev.id ? local->qdev.id : "<null>",
+                         port_idx, local->cna);
+            }
             if ((local->cna & 0x00ffffffU) == cna) {
-                qemu_log("ub_fm_find_link_by_cna: hit local cna on link[%u] ep[%d]\n",
-                         i, e);
+                if (trace) {
+                    qemu_log("ub_fm_find_link_by_cna: hit local cna on link[%u] ep[%d]\n",
+                             i, e);
+                }
                 return link;
             }
             if (port_idx >= local->port.port_num) {
                 continue;
             }
             ni = &local->port.neighbors[port_idx];
-            qemu_log("ub_fm_find_link_by_cna: link[%u] ep[%d] ni_remote=%d valid=%d remote_cna=%#x\n",
-                     i, e, ni->is_remote_neighbor, ni->remote_primary_cna_valid,
-                     ni->remote_primary_cna);
+            if (trace) {
+                qemu_log("ub_fm_find_link_by_cna: link[%u] ep[%d] ni_remote=%d valid=%d remote_cna=%#x\n",
+                         i, e, ni->is_remote_neighbor, ni->remote_primary_cna_valid,
+                         ni->remote_primary_cna);
+            }
             if (ni->is_remote_neighbor && ni->remote_primary_cna_valid &&
                 ((ni->remote_primary_cna & 0x00ffffffU) == cna)) {
-                qemu_log("ub_fm_find_link_by_cna: hit neighbor remote cna on link[%u] ep[%d]\n",
-                         i, e);
+                if (trace) {
+                    qemu_log("ub_fm_find_link_by_cna: hit neighbor remote cna on link[%u] ep[%d]\n",
+                             i, e);
+                }
                 return link;
             }
         }
     }
 
     if (fallback && ub_fm_active_links->len == 1) {
-        qemu_log("ub_fm_find_link_by_cna: fallback single active link for dcna=%#x\n",
-                 cna);
+        if (trace) {
+            qemu_log("ub_fm_find_link_by_cna: fallback single active link for dcna=%#x\n",
+                     cna);
+        }
         return fallback;
     }
-    qemu_log("ub_fm_find_link_by_cna: miss dcna=%#x\n", cna);
+    if (trace) {
+        qemu_log("ub_fm_find_link_by_cna: miss dcna=%#x\n", cna);
+    }
+    return NULL;
+}
+
+UBFMManagedLink *ub_fm_find_link_for_device_cna(UBDevice *local_dev,
+                                                uint32_t dcna)
+{
+    guint i;
+    uint32_t cna = dcna & 0x00ffffffU;
+    bool trace = ub_fm_trace_link_lookup_enabled();
+    const char *local_id;
+
+    if (!local_dev || !ub_fm_active_links) {
+        return NULL;
+    }
+
+    local_id = local_dev->qdev.id;
+    for (i = 0; i < ub_fm_active_links->len; i++) {
+        UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
+        UBLinkState *runtime;
+        UBLinkEndpointDesc *ep[2];
+        int e;
+
+        runtime = link->runtime;
+        if (!runtime || !runtime->link_up || !runtime->ioc) {
+            continue;
+        }
+
+        ep[0] = &runtime->a;
+        ep[1] = &runtime->b;
+        for (e = 0; e < 2; e++) {
+            UBLinkEndpointDesc *local_ep = ep[e];
+            UBLinkEndpointDesc *peer_ep = ep[1 - e];
+            NeighborInfo *ni;
+            bool endpoint_device_match = local_ep->device == local_dev;
+            bool endpoint_device_id_match =
+                local_ep->device && local_ep->device->qdev.id && local_id &&
+                strcmp(local_ep->device->qdev.id, local_id) == 0;
+            bool endpoint_desc_id_match =
+                local_ep->device_id && local_id &&
+                strcmp(local_ep->device_id, local_id) == 0;
+
+            if (!endpoint_device_match && !endpoint_device_id_match &&
+                !endpoint_desc_id_match) {
+                continue;
+            }
+            if (peer_ep->device &&
+                ((peer_ep->device->cna & 0x00ffffffU) == cna)) {
+                if (trace) {
+                    qemu_log("ub_fm_find_link_for_device_cna: hit peer device local=%s dcna=%#x link[%u]\n",
+                             local_dev->qdev.id ? local_dev->qdev.id : "<null>",
+                             cna, i);
+                }
+                return link;
+            }
+            if (local_ep->port_idx >= local_dev->port.port_num) {
+                continue;
+            }
+            ni = &local_dev->port.neighbors[local_ep->port_idx];
+            if (ni->is_remote_neighbor && ni->remote_primary_cna_valid &&
+                ((ni->remote_primary_cna & 0x00ffffffU) == cna)) {
+                if (trace) {
+                    qemu_log("ub_fm_find_link_for_device_cna: hit neighbor local=%s dcna=%#x link[%u]\n",
+                             local_dev->qdev.id ? local_dev->qdev.id : "<null>",
+                             cna, i);
+                }
+                return link;
+            }
+        }
+    }
+
+    if (trace) {
+        qemu_log("ub_fm_find_link_for_device_cna: miss local=%s dcna=%#x\n",
+                 local_dev->qdev.id ? local_dev->qdev.id : "<null>", cna);
+    }
     return NULL;
 }
 

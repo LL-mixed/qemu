@@ -6,8 +6,6 @@
 #include "qemu/coroutine_int.h"
 #include "sysemu/iommufd.h"
 
-typedef struct ARMCPU ARMCPU;
-
 bool iommufd_backend_alloc_hwpt(IOMMUFDBackend *be, uint32_t dev_id,
                                 uint32_t pt_id, uint32_t flags,
                                 uint32_t data_type, uint32_t data_len,
@@ -102,10 +100,6 @@ int iommufd_device_get_info(HostIOMMUDeviceIOMMUFD *idev,
         *type = IOMMU_HW_INFO_TYPE_NONE;
     }
     return -1;
-}
-
-void kvm_arm_reset_vcpu(ARMCPU *cpu)
-{
 }
 
 void qemu_coroutine_info_add(const Coroutine *co_)

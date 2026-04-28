@@ -88,7 +88,10 @@ int ub_fm_get_node_capability(const char *device_id,
                                const char **secondary_fe_type);
 
 int ub_fm_kick_by_cna(uint32_t dcna, Error **errp);
+void ub_fm_poll_rx_links_now(void);
 UBFMManagedLink *ub_fm_find_link_by_cna(uint32_t dcna);
+UBFMManagedLink *ub_fm_find_link_for_device_cna(UBDevice *local_dev,
+                                                uint32_t dcna);
 
 /* Entity Plan Management */
 typedef struct UBFMEntityPlanEntry {

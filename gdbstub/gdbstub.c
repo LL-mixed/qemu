@@ -28,6 +28,7 @@
 #include "qemu/cutils.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "qemu/accel.h"
 #include "trace.h"
 #include "exec/gdbstub.h"
 #include "gdbstub/syscalls.h"
@@ -2341,4 +2342,3 @@ void gdb_create_default_process(GDBState *s)
     process->attached = false;
     process->target_xml = NULL;
 }
-

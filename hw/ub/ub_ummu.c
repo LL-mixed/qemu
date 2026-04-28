@@ -28,6 +28,18 @@
 #include "hw/ub/ub_config.h"
 #include "hw/ub/hisi/ubc.h"
 #include "migration/vmstate.h"
+
+static bool ummu_trace_ptw_enabled(void)
+{
+    static bool initialized;
+    static bool enabled;
+
+    if (!initialized) {
+        enabled = g_getenv("UMMU_TRACE_PTW") != NULL;
+        initialized = true;
+    }
+    return enabled;
+}
 #include "ub_ummu_internal.h"
 #include "sysemu/dma.h"
 #include "hw/arm/mmu-translate-common.h"
@@ -2140,8 +2152,10 @@ static int ummu_decode_tecte(UMMUState *ummu, UMMUTransCfg *cfg,
     cfg->tct_fmt = TECTE_TCT_FMT(tecte);
     cfg->st_mode = TECTE_ST_MODE(tecte);
 
-    qemu_log("tct_ptr: 0x%lx, tct_num: %lu, fmt: %lu, st_mode: %u\n",
-             cfg->tct_ptr, cfg->tct_num, cfg->tct_fmt, cfg->st_mode);
+    if (ummu_trace_ptw_enabled()) {
+        qemu_log("tct_ptr: 0x%lx, tct_num: %lu, fmt: %lu, st_mode: %u\n",
+                 cfg->tct_ptr, cfg->tct_num, cfg->tct_fmt, cfg->st_mode);
+    }
     return 0;
 }
 
@@ -2163,8 +2177,10 @@ static int ummu_get_tcte(UMMUState *ummu, dma_addr_t addr,
     }
 
     _tcte = (uint64_t *)tcte;
-    qemu_log("fetch tcte(%u): <0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx>\n",
-             tid, _tcte[0], _tcte[1], _tcte[2], _tcte[3], _tcte[4], _tcte[5], _tcte[6], _tcte[7]);
+    if (ummu_trace_ptw_enabled()) {
+        qemu_log("fetch tcte(%u): <0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx>\n",
+                 tid, _tcte[0], _tcte[1], _tcte[2], _tcte[3], _tcte[4], _tcte[5], _tcte[6], _tcte[7]);
+    }
     return 0;
 }
 
@@ -2181,8 +2197,10 @@ static int ummu_find_tcte(UMMUState *ummu, UMMUTransCfg *cfg, uint32_t tid,
     switch (cfg->tct_fmt) {
     case TCT_FMT_LINEAR: {
         dma_addr_t tcte_addr = cfg->tct_ptr + (dma_addr_t)tid * sizeof(*tcte);
-        qemu_log("tct linear: tid=%u tct_ptr=0x%lx tcte_addr=0x%lx\n",
-                 tid, cfg->tct_ptr, tcte_addr);
+        if (ummu_trace_ptw_enabled()) {
+            qemu_log("tct linear: tid=%u tct_ptr=0x%lx tcte_addr=0x%lx\n",
+                     tid, cfg->tct_ptr, tcte_addr);
+        }
         ret = ummu_get_tcte(ummu, tcte_addr, tcte, tid);
         if (ret) {
             event->type = EVT_TCT_FETCH;
@@ -2206,9 +2224,11 @@ static int ummu_find_tcte(UMMUState *ummu, UMMUTransCfg *cfg, uint32_t tid,
         for (i = 0; i < ARRAY_SIZE(tct_desc.word); i++) {
             le32_to_cpus(&tct_desc.word[i]);
         }
-        qemu_log("tct lvl2_4k: l1idx=%d l1_addr=0x%lx v=%u l2ptr=0x%lx\n",
-                 l1idx, l1_addr, TCT_L1TCTE_V(&tct_desc),
-                 TCT_L2TCTE_PTR(&tct_desc));
+        if (ummu_trace_ptw_enabled()) {
+            qemu_log("tct lvl2_4k: l1idx=%d l1_addr=0x%lx v=%u l2ptr=0x%lx\n",
+                     l1idx, l1_addr, TCT_L1TCTE_V(&tct_desc),
+                     TCT_L2TCTE_PTR(&tct_desc));
+        }
         if (!TCT_L1TCTE_V(&tct_desc)) {
             event->type = EVT_BAD_TOKENID;
             qemu_log("tct lvl2_4k: l1 entry invalid\n");
@@ -2216,7 +2236,9 @@ static int ummu_find_tcte(UMMUState *ummu, UMMUTransCfg *cfg, uint32_t tid,
         }
         dma_addr_t tcte_addr = TCT_L2TCTE_PTR(&tct_desc) +
                                (dma_addr_t)l2idx * sizeof(*tcte);
-        qemu_log("tct lvl2_4k: l2idx=%d tcte_addr=0x%lx\n", l2idx, tcte_addr);
+        if (ummu_trace_ptw_enabled()) {
+            qemu_log("tct lvl2_4k: l2idx=%d tcte_addr=0x%lx\n", l2idx, tcte_addr);
+        }
         ret = ummu_get_tcte(ummu, tcte_addr, tcte, tid);
         if (ret) {
             event->type = EVT_TCT_FETCH;
@@ -2240,9 +2262,11 @@ static int ummu_find_tcte(UMMUState *ummu, UMMUTransCfg *cfg, uint32_t tid,
         for (i = 0; i < ARRAY_SIZE(tct_desc.word); i++) {
             le32_to_cpus(&tct_desc.word[i]);
         }
-        qemu_log("tct lvl2_64k: l1idx=%d l1_addr=0x%lx v=%u l2ptr=0x%lx\n",
-                 l1idx, l1_addr, TCT_L1TCTE_V(&tct_desc),
-                 TCT_L2TCTE_PTR(&tct_desc));
+        if (ummu_trace_ptw_enabled()) {
+            qemu_log("tct lvl2_64k: l1idx=%d l1_addr=0x%lx v=%u l2ptr=0x%lx\n",
+                     l1idx, l1_addr, TCT_L1TCTE_V(&tct_desc),
+                     TCT_L2TCTE_PTR(&tct_desc));
+        }
         if (!TCT_L1TCTE_V(&tct_desc)) {
             event->type = EVT_BAD_TOKENID;
             qemu_log("tct lvl2_64k: l1 entry invalid\n");
@@ -2250,7 +2274,9 @@ static int ummu_find_tcte(UMMUState *ummu, UMMUTransCfg *cfg, uint32_t tid,
         }
         dma_addr_t tcte_addr = TCT_L2TCTE_PTR(&tct_desc) +
                                (dma_addr_t)l2idx * sizeof(*tcte);
-        qemu_log("tct lvl2_64k: l2idx=%d tcte_addr=0x%lx\n", l2idx, tcte_addr);
+        if (ummu_trace_ptw_enabled()) {
+            qemu_log("tct lvl2_64k: l2idx=%d tcte_addr=0x%lx\n", l2idx, tcte_addr);
+        }
         ret = ummu_get_tcte(ummu, tcte_addr, tcte, tid);
         if (ret) {
             event->type = EVT_TCT_FETCH;
@@ -2281,8 +2307,10 @@ static int ummu_decode_tcte(UMMUState *ummu, UMMUTransCfg *cfg,
     cfg->tct_ttba = TCTE_TTBA(tcte);
     cfg->tct_sz = TCTE_SZ(tcte);
     cfg->tct_tgs = tgs2granule(TCTE_TGS(tcte));
-    qemu_log("tcte_tbba: 0x%lx, sz: %u, tgs: %u, tct_v: %u\n",
-             cfg->tct_ttba, cfg->tct_sz, cfg->tct_tgs, tct_v);
+    if (ummu_trace_ptw_enabled()) {
+        qemu_log("tcte_tbba: 0x%lx, sz: %u, tgs: %u, tct_v: %u\n",
+                 cfg->tct_ttba, cfg->tct_sz, cfg->tct_tgs, tct_v);
+    }
     return 0;
 }
 
@@ -2327,8 +2355,10 @@ static int ummu_tect_parse_sparse_table(UMMUDevice *ummu_dev, UMMUTransCfg *cfg,
         goto failed;
     }
 
-    qemu_log("get udev(%s %s) tid(%u)\n",
-             ummu_dev->udev->name, ummu_dev->udev->qdev.id, tid);
+    if (ummu_trace_ptw_enabled()) {
+        qemu_log("get udev(%s %s) tid(%u)\n",
+                 ummu_dev->udev->name, ummu_dev->udev->qdev.id, tid);
+    }
     ret = ummu_find_tcte(ummu, cfg, tid, &tcte, event);
     if (ret) {
         qemu_log("failed to find tecte.\n");
@@ -2448,8 +2478,10 @@ static void ummu_ptw_64_s1(UMMUTransCfg *cfg, dma_addr_t iova, IOMMUTLBEntry *en
     stride = VMSA_STRIDE(granule_sz);
     inputsize = 64 - cfg->tct_sz;
     
-    fprintf(stderr, "UMMU DEBUG PTW: iova=%#" PRIx64 " granule=%u stride=%u inputsize=%u ttba=%#" PRIx64 "\n",
-            (uint64_t)iova, granule_sz, stride, inputsize, cfg->tct_ttba);
+    if (ummu_trace_ptw_enabled()) {
+        fprintf(stderr, "UMMU DEBUG PTW: iova=%#" PRIx64 " granule=%u stride=%u inputsize=%u ttba=%#" PRIx64 "\n",
+                (uint64_t)iova, granule_sz, stride, inputsize, cfg->tct_ttba);
+    }
 
     if (granule_sz == 0 || stride == 0) {
         qemu_log("ummu ptw 64 s1 failed: granule_sz = %u, stride = %u\n", granule_sz, stride);
@@ -2460,8 +2492,10 @@ static void ummu_ptw_64_s1(UMMUTransCfg *cfg, dma_addr_t iova, IOMMUTLBEntry *en
     baseaddr = extract64(cfg->tct_ttba, 0, 48);
     baseaddr &= ~indexmask;
 
-    qemu_log("stride: %u, inputsize: %u, level: %u, baseaddr: 0x%lx\n",
-             stride, inputsize, level, baseaddr);
+    if (ummu_trace_ptw_enabled()) {
+        qemu_log("stride: %u, inputsize: %u, level: %u, baseaddr: 0x%lx\n",
+                 stride, inputsize, level, baseaddr);
+    }
     while (level < VMSA_LEVELS) {
         uint64_t subpage_size = 1ULL << level_shift(level, granule_sz);
         uint64_t mask = subpage_size - 1;

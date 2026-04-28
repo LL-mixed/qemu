@@ -44,6 +44,20 @@
 #include "hw/ub/ubus_instance.h"
 #include "hw/ub/ub_pool_msg.h"
 
+static bool ubc_trace_link_lookup_enabled(void)
+{
+    const char *val = g_getenv("UBC_TRACE_LINK_LOOKUP");
+
+    return val && val[0] && strcmp(val, "0") != 0;
+}
+
+static bool ubc_trace_data_path_enabled(void)
+{
+    const char *val = g_getenv("UBC_TRACE_DATA_PATH");
+
+    return val && val[0] && strcmp(val, "0") != 0;
+}
+
 typedef struct LinquUbBridge LinquUbBridge;
 LinquUbBridge *linqu_ub_bridge_new_from_yaml(const char *path);
 void linqu_ub_bridge_free(LinquUbBridge *bridge);
@@ -531,7 +545,7 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define UBC_SIM_DEC_READ_CHUNK_MAX \
     (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)sizeof(UBCSimDecReadRespPldHdr))
 #define UBC_SIM_DEC_READ_WAIT_USEC  1000
-#define UBC_SIM_DEC_READ_WAIT_LOOPS 10000
+#define UBC_SIM_DEC_READ_WAIT_LOOPS 30000
 
 /* Doorbell/MMIO region constants (matches UAPI) */
 #define UDMA_JETTY_DSQE_OFFSET   0x1000
@@ -1805,8 +1819,10 @@ static bool ubc_push_ceq_event(BusControllerDev *ubc_dev, uint32_t ceqn,
         ceq->eq_owner_phase ^= 1;
     }
 
-    qemu_log("ubc CEQE: ceqn=%u jfcn=%u owner=%u eq_pi=%u irq_num=%u\n",
-             ceqn, jfcn, owner, ceq->eq_pi, ceq->irq_num);
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc CEQE: ceqn=%u jfcn=%u owner=%u eq_pi=%u irq_num=%u\n",
+                 ceqn, jfcn, owner, ceq->eq_pi, ceq->irq_num);
+    }
 
     /*
      * CEQ notify vector mapping:
@@ -2576,16 +2592,20 @@ static bool ubc_notify_vector(BusControllerDev *ubc_dev, uint16_t usi_vector,
             usi_send_message(&msg, rid, NULL);
             /* Compatibility kick: some environments only route the low ITS doorbell. */
             usi_send_message(&kick, rid, NULL);
-            qemu_log("ubc %s notify vector=%u rid=0x%x data=0x%x addr=%#" PRIx64 "\n",
-                     name, msi_vector, rid, data, (uint64_t)msg.address);
+            if (ubc_trace_data_path_enabled()) {
+                qemu_log("ubc %s notify vector=%u rid=0x%x data=0x%x addr=%#" PRIx64 "\n",
+                         name, msi_vector, rid, data, (uint64_t)msg.address);
+            }
             return true;
         }
 
         msg.address = 0x8090040ULL;
         msg.data = msi_vector;
         usi_send_message(&msg, UBC_INTERRUPT_ID_START + msi_vector, NULL);
-        qemu_log("ubc %s msi notify fallback vector=%u rid=0x%x\n",
-                 name, msi_vector, UBC_INTERRUPT_ID_START + msi_vector);
+        if (ubc_trace_data_path_enabled()) {
+            qemu_log("ubc %s msi notify fallback vector=%u rid=0x%x\n",
+                     name, msi_vector, UBC_INTERRUPT_ID_START + msi_vector);
+        }
     }
     return true;
 }
@@ -2656,12 +2676,16 @@ static void ubc_process_cmdq(BusControllerDev *ubc_dev)
     UBCmdQueueState *csq = &ubc_dev->cmd_csq;
     uint16_t guard = 0;
 
+    ub_fm_poll_rx_links_now();
+
     if (!csq->base || !csq->depth) {
         return;
     }
 
-    fprintf(stderr, "ubc_process_cmdq: ENTER base=%#lx depth=%u head=%u tail=%u\n",
-            (unsigned long)csq->base, csq->depth, csq->head, csq->tail);
+    if (ubc_trace_data_path_enabled()) {
+        fprintf(stderr, "ubc_process_cmdq: ENTER base=%#lx depth=%u head=%u tail=%u\n",
+                (unsigned long)csq->base, csq->depth, csq->head, csq->tail);
+    }
 
     while (csq->head != csq->tail && guard++ < csq->depth) {
         UBCCmdqDesc *descs;
@@ -2690,8 +2714,11 @@ static void ubc_process_cmdq(BusControllerDev *ubc_dev)
             break;
         }
         opcode = le16_to_cpu(head_desc.opcode);
-        qemu_log("ubc cmdq process opcode=0x%x bd=%u head=%u tail=%u depth=%u\n",
-                 opcode, head_desc.bd_num, csq->head, csq->tail, csq->depth);
+        if (ubc_trace_data_path_enabled()) {
+            qemu_log("ubc cmdq process opcode=0x%x bd=%u head=%u tail=%u depth=%u\n",
+                     opcode, head_desc.bd_num, csq->head, csq->tail, csq->depth);
+        }
+        ub_fm_poll_rx_links_now();
         bd_num = head_desc.bd_num ? head_desc.bd_num : 1;
         if (bd_num > csq->depth) {
             bd_num = 1;
@@ -4032,9 +4059,12 @@ static void ubc_try_fill_dcna_from_rmt_eid(UBDevice *ub_dev, const uint8_t *rmt_
         }
         if (ni->remote_node_ip_suffix == target_suffix) {
             *dcna = ni->remote_primary_cna;
-            qemu_log("ubc route by rmt_eid: target_suffix=%u remote_id=%s dcna=%#x\n",
-                     target_suffix, ni->neighbor_id[0] ? ni->neighbor_id : "<unknown>",
-                     *dcna);
+            if (ubc_trace_link_lookup_enabled()) {
+                qemu_log("ubc route by rmt_eid: target_suffix=%u remote_id=%s dcna=%#x\n",
+                         target_suffix,
+                         ni->neighbor_id[0] ? ni->neighbor_id : "<unknown>",
+                         *dcna);
+            }
             return;
         }
     }
@@ -4048,15 +4078,20 @@ static UBFMManagedLink *ubc_find_fm_link(UBDevice *ub_dev, uint32_t *dcna)
     if (!ub_dev) {
         return NULL;
     }
-    qemu_log("ubc_find_fm_link: dev=%s local_cna=%#x input_dcna=%#x\n",
-             ub_dev->qdev.id ? ub_dev->qdev.id : "<null>", ub_dev->cna,
-             dcna ? *dcna : 0);
+    if (ubc_trace_link_lookup_enabled()) {
+        qemu_log("ubc_find_fm_link: dev=%s local_cna=%#x input_dcna=%#x\n",
+                 ub_dev->qdev.id ? ub_dev->qdev.id : "<null>", ub_dev->cna,
+                 dcna ? *dcna : 0);
+    }
 
     if (dcna && *dcna) {
-        fm_link = ub_fm_find_link_by_cna(*dcna);
+        fm_link = ub_fm_find_link_for_device_cna(ub_dev, *dcna);
         if (fm_link) {
             ubc_fill_remote_dcna_from_link(ub_dev, fm_link, dcna);
-            qemu_log("ubc_find_fm_link: matched input dcna=%#x\n", dcna ? *dcna : 0);
+            if (ubc_trace_link_lookup_enabled()) {
+                qemu_log("ubc_find_fm_link: matched input dcna=%#x\n",
+                         dcna ? *dcna : 0);
+            }
             return fm_link;
         }
     }
@@ -4067,14 +4102,16 @@ static UBFMManagedLink *ubc_find_fm_link(UBDevice *ub_dev, uint32_t *dcna)
         if (!ni->is_remote_neighbor || !ni->remote_primary_cna_valid) {
             continue;
         }
-        fm_link = ub_fm_find_link_by_cna(ni->remote_primary_cna);
+        fm_link = ub_fm_find_link_for_device_cna(ub_dev, ni->remote_primary_cna);
         if (fm_link) {
             if (dcna && !*dcna) {
                 *dcna = ni->remote_primary_cna;
             }
             ubc_fill_remote_dcna_from_link(ub_dev, fm_link, dcna);
-            qemu_log("ubc_find_fm_link: matched neighbor[%u] remote_cna=%#x final_dcna=%#x\n",
-                     i, ni->remote_primary_cna, dcna ? *dcna : 0);
+            if (ubc_trace_link_lookup_enabled()) {
+                qemu_log("ubc_find_fm_link: matched neighbor[%u] remote_cna=%#x final_dcna=%#x\n",
+                         i, ni->remote_primary_cna, dcna ? *dcna : 0);
+            }
             return fm_link;
         }
     }
@@ -4082,8 +4119,10 @@ static UBFMManagedLink *ubc_find_fm_link(UBDevice *ub_dev, uint32_t *dcna)
     fm_link = ub_fm_find_link_by_cna(ub_dev->cna);
     if (fm_link) {
         ubc_fill_remote_dcna_from_link(ub_dev, fm_link, dcna);
-        qemu_log("ubc_find_fm_link: matched by local_cna final_dcna=%#x\n",
-                 dcna ? *dcna : 0);
+        if (ubc_trace_link_lookup_enabled()) {
+            qemu_log("ubc_find_fm_link: matched by local_cna final_dcna=%#x\n",
+                     dcna ? *dcna : 0);
+        }
     }
     if (!fm_link) {
         qemu_log("ubc_find_fm_link: miss dev=%s local_cna=%#x\n",
@@ -4165,13 +4204,18 @@ static int ubc_send_msg_over_link(BusControllerDev *ubc_dev, UBLinkState *link,
         memcpy(pkt + sizeof(MsgPktHeader), payload, payload_len);
     }
 
-    if (sub_msg_code == UBC_MSG_SUB_SIM_DEC_READ_REQ &&
+    if (ubc_trace_data_path_enabled() &&
+        sub_msg_code == UBC_MSG_SUB_SIM_DEC_READ_REQ &&
         payload_len >= sizeof(UBCSimDecReadReqPld)) {
         const UBCSimDecReadReqPld *req = payload;
         qemu_log("ubc sim_dec send read_req req=%u uba=%#" PRIx64
-                 " len=%u dcna=%#x\n",
+                 " len=%u scna=%#x dcna=%#x link=%s:%u<->%s:%u\n",
                  req->req_id, (uint64_t)req->remote_uba,
-                 req->read_len, dcna);
+                 req->read_len, ub_dev->cna, dcna,
+                 link->a.device_id ? link->a.device_id : "<null>",
+                 link->a.port_idx,
+                 link->b.device_id ? link->b.device_id : "<null>",
+                 link->b.port_idx);
     }
 
     rc = ub_link_write_message(link, pkt, total_len, &local_err);
@@ -4183,7 +4227,8 @@ static int ubc_send_msg_over_link(BusControllerDev *ubc_dev, UBLinkState *link,
             error_free(local_err);
         }
     } else {
-        if (sub_msg_code == UBC_MSG_SUB_SIM_DEC_READ_REQ &&
+        if (ubc_trace_data_path_enabled() &&
+            sub_msg_code == UBC_MSG_SUB_SIM_DEC_READ_REQ &&
             payload_len >= sizeof(UBCSimDecReadReqPld)) {
             const UBCSimDecReadReqPld *req = payload;
             qemu_log("ubc sim_dec send read_req done req=%u uba=%#" PRIx64
@@ -4310,10 +4355,12 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
     resp->status = 0;
     resp->data_len = req->read_len;
     eff_tid = ubc_tid_or_auto(req->token_id);
-    qemu_log("ubc sim_dec rx read_req req=%u uba=%#" PRIx64
-             " len=%u tid=%u dcna=%#x\n",
-             req->req_id, (uint64_t)req->remote_uba,
-             req->read_len, eff_tid, dcna);
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc sim_dec rx read_req req=%u uba=%#" PRIx64
+                 " len=%u tid=%u dcna=%#x local_cna=%#x\n",
+                 req->req_id, (uint64_t)req->remote_uba,
+                 req->read_len, eff_tid, dcna, ubc_dev->parent.cna);
+    }
 
     ret = ubc_dma_read_local_data_tid_strict(ubc_dev, req->remote_uba,
                                              payload + sizeof(*resp),
@@ -4334,16 +4381,20 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
         qemu_log("ubc sim_dec rx read_req: send resp failed req=%u\n",
                  req->req_id);
     } else {
-        qemu_log("ubc sim_dec rx read_req send_resp done req=%u status=%u"
-                 " data_len=%u dcna=%#x\n",
-                 req->req_id, resp->status, resp->data_len, dcna);
+        if (ubc_trace_data_path_enabled()) {
+            qemu_log("ubc sim_dec rx read_req send_resp done req=%u status=%u"
+                     " data_len=%u dcna=%#x local_cna=%#x\n",
+                     req->req_id, resp->status, resp->data_len, dcna,
+                     ubc_dev->parent.cna);
+        }
     }
     g_free(payload);
 }
 
 void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
                                      const UBCSimDecReadRespPldHdr *hdr,
-                                     const uint8_t *data, uint32_t data_len)
+                                     const uint8_t *data, uint32_t data_len,
+                                     uint32_t peer_cna)
 {
     uint32_t copy_len;
 
@@ -4351,25 +4402,30 @@ void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
         return;
     }
     if (!ubc_dev->sim_dec_sync_read.pending ||
-        ubc_dev->sim_dec_sync_read.req_id != hdr->req_id) {
-        qemu_log("ubc sim_dec rx read_resp: stale req=%u pending=%u cur=%u\n",
-                 hdr->req_id, ubc_dev->sim_dec_sync_read.pending,
-                 ubc_dev->sim_dec_sync_read.req_id);
+        ubc_dev->sim_dec_sync_read.req_id != hdr->req_id ||
+        ubc_dev->sim_dec_sync_read.peer_cna != peer_cna) {
+        qemu_log("ubc sim_dec rx read_resp: stale req=%u peer=%#x pending=%u cur=%u cur_peer=%#x\n",
+                 hdr->req_id, peer_cna, ubc_dev->sim_dec_sync_read.pending,
+                 ubc_dev->sim_dec_sync_read.req_id,
+                 ubc_dev->sim_dec_sync_read.peer_cna);
         return;
     }
 
     copy_len = MIN(hdr->data_len, ubc_dev->sim_dec_sync_read.expect_len);
     copy_len = MIN(copy_len, data_len);
-    qemu_log("ubc sim_dec rx read_resp req=%u status=%u data_len=%u"
-             " wire_len=%u copy_len=%u expect=%u\n",
-             hdr->req_id, hdr->status, hdr->data_len, data_len,
-             copy_len, ubc_dev->sim_dec_sync_read.expect_len);
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc sim_dec rx read_resp req=%u status=%u data_len=%u"
+                 " wire_len=%u copy_len=%u expect=%u peer=%#x\n",
+                 hdr->req_id, hdr->status, hdr->data_len, data_len,
+                 copy_len, ubc_dev->sim_dec_sync_read.expect_len, peer_cna);
+    }
     if (copy_len > 0 && ubc_dev->sim_dec_sync_read.buf) {
         memcpy(ubc_dev->sim_dec_sync_read.buf, data, copy_len);
     }
     ubc_dev->sim_dec_sync_read.actual_len = copy_len;
     ubc_dev->sim_dec_sync_read.status = hdr->status ? -EIO : 0;
     ubc_dev->sim_dec_sync_read.pending = false;
+    ubc_dev->sim_dec_sync_read.peer_cna = 0;
 }
 
 static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
@@ -4445,17 +4501,6 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
         uint32_t chunk = MIN(len - done, UBC_SIM_DEC_READ_CHUNK_MAX);
         int rc;
         int loop;
-        bool probe = (len <= 8 &&
-                      (((remote_uba + done) & 0xfffULL) >= 0x40) &&
-                      (((remote_uba + done) & 0xfffULL) <= 0x50));
-
-        if (probe) {
-            qemu_log("ubc sim_dec read probe enter uba=%#" PRIx64
-                     " len=%u done=%u chunk=%u pending=%d dcna=%#x token=%u\n",
-                     (uint64_t)(remote_uba + done), len, done, chunk,
-                     ubc_dev->sim_dec_sync_read.pending ? 1 : 0, dcna, token_id);
-        }
-
         if (ubc_dev->sim_dec_sync_read.pending) {
             qemu_log("ubc sim_dec read: another sync read pending req=%u\n",
                      ubc_dev->sim_dec_sync_read.req_id);
@@ -4467,6 +4512,7 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
         if (ubc_dev->sim_dec_sync_read.req_id == 0) {
             ubc_dev->sim_dec_sync_read.req_id = ++ubc_dev->next_sim_dec_read_req_id;
         }
+        ubc_dev->sim_dec_sync_read.peer_cna = dcna;
         ubc_dev->sim_dec_sync_read.expect_len = chunk;
         ubc_dev->sim_dec_sync_read.actual_len = 0;
         ubc_dev->sim_dec_sync_read.status = -ETIMEDOUT;
@@ -4476,20 +4522,17 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
         req.token_id = token_id;
         req.remote_uba = remote_uba + done;
         req.read_len = chunk;
-        if (probe) {
-            qemu_log("ubc sim_dec read probe send req=%u uba=%#" PRIx64
-                     " len=%u dcna=%#x\n",
-                     req.req_id, (uint64_t)req.remote_uba, req.read_len, dcna);
+        if (ubc_trace_data_path_enabled()) {
+            qemu_log("ubc sim_dec read send req=%u uba=%#" PRIx64
+                     " len=%u done=%u dcna=%#x token=%u local_cna=%#x\n",
+                     req.req_id, (uint64_t)req.remote_uba, req.read_len,
+                     done, dcna, token_id, ubc_dev->parent.cna);
         }
         rc = ubc_send_msg_over_link(ubc_dev, link, dcna,
                                     UBC_MSG_SUB_SIM_DEC_READ_REQ,
                                     &req, sizeof(req));
         if (rc < 0) {
             ubc_dev->sim_dec_sync_read.pending = false;
-            if (probe) {
-                qemu_log("ubc sim_dec read probe send_failed req=%u rc=%d\n",
-                         req.req_id, rc);
-            }
             return MEMTX_DECODE_ERROR;
         }
 
@@ -4497,31 +4540,28 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
             if (!ubc_dev->sim_dec_sync_read.pending) {
                 break;
             }
-            ubc_sim_dec_process_wait_links(bcs, ubc_dev, link);
+            ub_fm_poll_rx_links_now();
             if (!ubc_dev->sim_dec_sync_read.pending) {
                 break;
             }
-            if (probe && loop == UBC_SIM_DEC_READ_WAIT_LOOPS - 1) {
-                qemu_log("ubc sim_dec read probe wait req=%u loop=%d pending=%d status=%d actual=%u expect=%u\n",
-                         req.req_id, loop,
-                         ubc_dev->sim_dec_sync_read.pending ? 1 : 0,
-                         ubc_dev->sim_dec_sync_read.status,
-                         ubc_dev->sim_dec_sync_read.actual_len,
-                         ubc_dev->sim_dec_sync_read.expect_len);
+            ubc_sim_dec_process_wait_links(bcs, ubc_dev, link);
+            if (!ubc_dev->sim_dec_sync_read.pending) {
+                break;
             }
             g_usleep(UBC_SIM_DEC_READ_WAIT_USEC);
         }
 
         if (ubc_dev->sim_dec_sync_read.pending) {
-            qemu_log("ubc sim_dec read: timeout req=%u\n", req.req_id);
+            qemu_log("ubc sim_dec read: timeout req=%u uba=%#" PRIx64
+                     " len=%u done=%u dcna=%#x token=%u local_cna=%#x"
+                     " status=%d actual=%u expect=%u\n",
+                     req.req_id, (uint64_t)req.remote_uba, req.read_len,
+                     done, dcna, token_id, ubc_dev->parent.cna,
+                     ubc_dev->sim_dec_sync_read.status,
+                     ubc_dev->sim_dec_sync_read.actual_len,
+                     ubc_dev->sim_dec_sync_read.expect_len);
             ubc_dev->sim_dec_sync_read.pending = false;
-            if (probe) {
-                qemu_log("ubc sim_dec read probe timeout req=%u status=%d actual=%u expect=%u\n",
-                         req.req_id,
-                         ubc_dev->sim_dec_sync_read.status,
-                         ubc_dev->sim_dec_sync_read.actual_len,
-                         ubc_dev->sim_dec_sync_read.expect_len);
-            }
+            ubc_dev->sim_dec_sync_read.peer_cna = 0;
             return MEMTX_DECODE_ERROR;
         }
         if (ubc_dev->sim_dec_sync_read.status != 0 ||
@@ -4529,18 +4569,7 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
             qemu_log("ubc sim_dec read: bad resp req=%u status=%d len=%u expect=%u\n",
                      req.req_id, ubc_dev->sim_dec_sync_read.status,
                      ubc_dev->sim_dec_sync_read.actual_len, chunk);
-            if (probe) {
-                qemu_log("ubc sim_dec read probe bad_resp req=%u status=%d actual=%u expect=%u\n",
-                         req.req_id,
-                         ubc_dev->sim_dec_sync_read.status,
-                         ubc_dev->sim_dec_sync_read.actual_len,
-                         chunk);
-            }
             return MEMTX_DECODE_ERROR;
-        }
-        if (probe) {
-            qemu_log("ubc sim_dec read probe done req=%u uba=%#" PRIx64 " chunk=%u\n",
-                     req.req_id, (uint64_t)req.remote_uba, chunk);
         }
         done += chunk;
     }
@@ -4574,13 +4603,15 @@ static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState 
     uint8_t mcast_group = 0;
     bool is_mcast = ubc_extract_link_local_mcast_group(rmt_eid, &mcast_group);
 
-    qemu_log("ubc SEND: jetty=%u rmt_obj_id=%u payload_len=%u rmt_eid=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
-             js->jetty_id, rmt_obj_id, payload_len,
-             rmt_eid[0], rmt_eid[1], rmt_eid[2], rmt_eid[3],
-             rmt_eid[4], rmt_eid[5], rmt_eid[6], rmt_eid[7],
-             rmt_eid[8], rmt_eid[9], rmt_eid[10], rmt_eid[11],
-             rmt_eid[12], rmt_eid[13], rmt_eid[14], rmt_eid[15]);
-    if (payload && payload_len > 0) {
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc SEND: jetty=%u rmt_obj_id=%u payload_len=%u rmt_eid=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
+                 js->jetty_id, rmt_obj_id, payload_len,
+                 rmt_eid[0], rmt_eid[1], rmt_eid[2], rmt_eid[3],
+                 rmt_eid[4], rmt_eid[5], rmt_eid[6], rmt_eid[7],
+                 rmt_eid[8], rmt_eid[9], rmt_eid[10], rmt_eid[11],
+                 rmt_eid[12], rmt_eid[13], rmt_eid[14], rmt_eid[15]);
+    }
+    if (ubc_trace_data_path_enabled() && payload && payload_len > 0) {
         uint32_t dump = payload_len < 32 ? payload_len : 32;
         GString *hex = g_string_new(NULL);
         uint32_t di;
@@ -4611,7 +4642,9 @@ static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState 
 
         link = fm_link->runtime;
         if (!link || !link->link_up || !link->ioc) {
-            qemu_log("ubc SEND: link not up or no ioc, skipping send\n");
+            if (ubc_trace_data_path_enabled()) {
+                qemu_log("ubc SEND: link not up or no ioc, skipping send\n");
+            }
             return;
         }
     }
@@ -4654,8 +4687,10 @@ static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState 
             UBCWritePayloadHdr *write_hdr = (UBCWritePayloadHdr *)(pkt + sizeof(MsgPktHeader));
             write_hdr->remote_addr = remote_addr;
             memcpy(pkt + sizeof(MsgPktHeader) + sizeof(UBCWritePayloadHdr), payload, payload_len);
-            qemu_log("ubc SEND WRITE: remote_addr=%#" PRIx64 " payload_len=%u\n",
-                     remote_addr, payload_len);
+            if (ubc_trace_data_path_enabled()) {
+                qemu_log("ubc SEND WRITE: remote_addr=%#" PRIx64 " payload_len=%u\n",
+                         remote_addr, payload_len);
+            }
         } else {
             /* Copy payload after the MsgPktHeader */
             memcpy(pkt + sizeof(MsgPktHeader), payload, payload_len);
@@ -4665,7 +4700,9 @@ static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState 
             uint32_t i;
             bool sent_any = false;
 
-            qemu_log("ubc SEND: multicast group=%u fanout start\n", mcast_group);
+            if (ubc_trace_data_path_enabled()) {
+                qemu_log("ubc SEND: multicast group=%u fanout start\n", mcast_group);
+            }
             for (i = 0; i < ub_dev->port.port_num; i++) {
                 NeighborInfo *ni = &ub_dev->port.neighbors[i];
                 uint32_t fanout_dcna;
@@ -4699,13 +4736,15 @@ static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState 
                     continue;
                 }
                 sent_any = true;
-                qemu_log("ubc SEND: multicast sent %zu bytes to %s dcna=%#x\n",
-                         total_len,
-                         ni->neighbor_id[0] ? ni->neighbor_id : "<unknown>",
-                         fanout_dcna);
+                if (ubc_trace_data_path_enabled()) {
+                    qemu_log("ubc SEND: multicast sent %zu bytes to %s dcna=%#x\n",
+                             total_len,
+                             ni->neighbor_id[0] ? ni->neighbor_id : "<unknown>",
+                             fanout_dcna);
+                }
                 ub_link_kick_remote(fanout_link, NULL);
             }
-            if (!sent_any) {
+            if (!sent_any && ubc_trace_data_path_enabled()) {
                 qemu_log("ubc SEND: multicast group=%u had no active remote links\n",
                          mcast_group);
             }
@@ -4718,8 +4757,10 @@ static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState 
                     error_free(local_err);
                 }
             } else {
-                qemu_log("ubc SEND: sent %zu bytes (hdr=%zu data=%u) via ub_link\n",
-                         total_len, sizeof(MsgPktHeader), payload_len);
+                if (ubc_trace_data_path_enabled()) {
+                    qemu_log("ubc SEND: sent %zu bytes (hdr=%zu data=%u) via ub_link\n",
+                             total_len, sizeof(MsgPktHeader), payload_len);
+                }
                 ub_link_kick_remote(link, NULL);
             }
         }
@@ -5033,10 +5074,12 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
     }
     {
         const uint32_t *dw = (const uint32_t *)wqe_buf;
-        qemu_log("ubc WQE RAW: jetty=%u idx=%u addr=%#" PRIx64
-                 " dw0=%08x dw1=%08x dw2=%08x dw3=%08x dw4=%08x dw5=%08x dw6=%08x dw7=%08x\n",
-                 js->jetty_id, wqe_idx, (uint64_t)wqe_addr,
-                 dw[0], dw[1], dw[2], dw[3], dw[4], dw[5], dw[6], dw[7]);
+        if (ubc_trace_data_path_enabled()) {
+            qemu_log("ubc WQE RAW: jetty=%u idx=%u addr=%#" PRIx64
+                     " dw0=%08x dw1=%08x dw2=%08x dw3=%08x dw4=%08x dw5=%08x dw6=%08x dw7=%08x\n",
+                     js->jetty_id, wqe_idx, (uint64_t)wqe_addr,
+                     dw[0], dw[1], dw[2], dw[3], dw[4], dw[5], dw[6], dw[7]);
+        }
     }
 
     /* Parse DW0-DW1 fields (little-endian bitfield layout):
@@ -5058,10 +5101,12 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
         memcpy(rmt_eid, &dw[4], 16);
     }
 
-    qemu_log("ubc WQE: jetty=%u idx=%u op=0x%02x inline=%u sge_num=%u "
-             "inline_len=%u rmt_obj_id=%u\n",
-             js->jetty_id, wqe_idx, opcode, inline_en, sge_num,
-             inline_msg_len, rmt_obj_id);
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc WQE: jetty=%u idx=%u op=0x%02x inline=%u sge_num=%u "
+                 "inline_len=%u rmt_obj_id=%u\n",
+                 js->jetty_id, wqe_idx, opcode, inline_en, sge_num,
+                 inline_msg_len, rmt_obj_id);
+    }
 
     /* Opcode dispatch */
     switch (opcode) {
@@ -5127,12 +5172,16 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
                     qemu_log("ubc WQE SEND SGE[%u]: token_en=1 but token_id=0 "
                              "(warning: no access token)\n", i);
                 } else if (token_id != 0) {
-                    qemu_log("ubc WQE SEND SGE[%u]: token_id=%u (valid)\n",
-                             i, token_id);
+                    if (ubc_trace_data_path_enabled()) {
+                        qemu_log("ubc WQE SEND SGE[%u]: token_id=%u (valid)\n",
+                                 i, token_id);
+                    }
                 }
 
-                qemu_log("ubc WQE SEND SGE[%u]: va=%#" PRIx64 " len=%u\n",
-                         i, sge_va, sge_len);
+                if (ubc_trace_data_path_enabled()) {
+                    qemu_log("ubc WQE SEND SGE[%u]: va=%#" PRIx64 " len=%u\n",
+                             i, sge_va, sge_len);
+                }
 
                 uint8_t *payload = g_malloc(sge_len);
                 ret = ubc_dma_read_data_tid(ubc_dev, sge_va, payload, sge_len,
@@ -5168,8 +5217,10 @@ static void ubc_process_sq_wqe(BusControllerDev *ubc_dev, UBCJettyState *js,
                                UDMA_SQE_SIZE : UDMA_SQE_CTL_LEN_SEND;
         uint64_t remote_addr = ((uint64_t)wqe_dw[11] << 32) | wqe_dw[10];
 
-        qemu_log("ubc WQE WRITE: jetty=%u idx=%u remote_addr=%#" PRIx64 "\n",
-                 js->jetty_id, wqe_idx, remote_addr);
+        if (ubc_trace_data_path_enabled()) {
+            qemu_log("ubc WQE WRITE: jetty=%u idx=%u remote_addr=%#" PRIx64 "\n",
+                     js->jetty_id, wqe_idx, remote_addr);
+        }
 
         if (remote_addr == 0) {
             qemu_log("ubc WQE WRITE: remote_addr is zero, failing\n");
@@ -5457,8 +5508,10 @@ static void ubc_generate_cqe(BusControllerDev *ubc_dev, UBCJettyState *js,
         jfc->cq_owner_phase ^= 1;
     }
 
-    qemu_log("ubc CQE: jfc=%u wqe_idx=%u byte_cnt=%u status=%u owner=%u cq_pi=%u rmt_idx=%u\n",
-             jfc_id, wqe_idx, byte_cnt, status, owner, jfc->cq_pi, rmt_idx);
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc CQE: jfc=%u wqe_idx=%u byte_cnt=%u status=%u owner=%u cq_pi=%u rmt_idx=%u\n",
+                 jfc_id, wqe_idx, byte_cnt, status, owner, jfc->cq_pi, rmt_idx);
+    }
 
     /*
      * Completion path expected by guest:
@@ -5586,8 +5639,10 @@ static bool ubc_try_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_
                                               effective_src_eid);
     }
 
-    qemu_log("ubc URMA RX: dst_jetty=%u src_jetty=%u src_scna=%#x len=%u\n",
-             dst_jetty, src_jetty, src_scna, data_len);
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc URMA RX: dst_jetty=%u src_jetty=%u src_scna=%#x len=%u\n",
+                 dst_jetty, src_jetty, src_scna, data_len);
+    }
 
     if (!ubc_dev || dst_jetty >= UBC_MAX_JETTIES) {
         qemu_log("ubc URMA RX: dst_jetty %u out of range\n", dst_jetty);
@@ -5638,9 +5693,11 @@ static bool ubc_try_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_
     memcpy(&sge_token_id, sge_buf + 4, 4);
     memcpy(&sge_va, sge_buf + 8, 8);
 
-    qemu_log("ubc URMA RX: RQE ci=%u sge_va=%#" PRIx64
-             " sge_len=%u sge_tid=%u data_len=%u\n",
-             jfr->rq_ci, sge_va, sge_len, sge_token_id, data_len);
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc URMA RX: RQE ci=%u sge_va=%#" PRIx64
+                 " sge_len=%u sge_tid=%u data_len=%u\n",
+                 jfr->rq_ci, sge_va, sge_len, sge_token_id, data_len);
+    }
 
     /* Boundary check: null VA or zero length → RQ empty error */
     if (!sge_va || sge_len == 0) {
@@ -5675,8 +5732,10 @@ static bool ubc_try_handle_urma_rx_data(BusControllerDev *ubc_dev, uint32_t dst_
     ubc_generate_cqe(ubc_dev, js, js->rx_jfcn, rq_wqe_idx, actual_len,
                      cqe_status, false, src_jetty, effective_src_eid);
 
-    qemu_log("ubc URMA RX: CQE done jetty=%u rq_ci=%u byte_cnt=%u status=%u\n",
-             dst_jetty, jfr->rq_ci, actual_len, cqe_status);
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc URMA RX: CQE done jetty=%u rq_ci=%u byte_cnt=%u status=%u\n",
+                 dst_jetty, jfr->rq_ci, actual_len, cqe_status);
+    }
     return true;
 }
 
