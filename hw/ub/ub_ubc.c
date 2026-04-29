@@ -1594,11 +1594,13 @@ static int ubc_handle_ue2ue_ctrlq(BusControllerDev *ubc_dev,
 
     req_head = (const UBCUe2UeCtrlqHead *)req;
     req_hdr = (const UBCCtrlqMsgHdr *)(req + sizeof(*req_head));
-    qemu_log("ubc cmdq ue2ue req seq=%u service_type=0x%x opcode=0x%x "
-             "in_size=%u out_size=%u flags=0x%x\n",
-             le16_to_cpu(req_head->seq), req_hdr->service_type, req_hdr->opcode,
-             le16_to_cpu(req_head->in_size), le16_to_cpu(req_head->out_size),
-             req_head->flags);
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc cmdq ue2ue req seq=%u service_type=0x%x opcode=0x%x "
+                 "in_size=%u out_size=%u flags=0x%x\n",
+                 le16_to_cpu(req_head->seq), req_hdr->service_type, req_hdr->opcode,
+                 le16_to_cpu(req_head->in_size), le16_to_cpu(req_head->out_size),
+                 req_head->flags);
+    }
     resp_data_len = le16_to_cpu(req_head->out_size);
     if (req_hdr->service_type == UBASE_CTRLQ_SER_TYPE_QOS &&
         req_hdr->opcode == UBASE_CTRLQ_OPC_QUERY_SL) {
@@ -2663,12 +2665,14 @@ static void ubc_sync_cmdq_regs(BusControllerDev *ubc_dev)
     ubc_dev->cmd_crq.depth = ubc_read_q_depth(ubc_dev, UBASE_CRQ_DEPTH_REG);
     ubc_dev->cmd_crq.head = (uint16_t)ubc_ers2_read32(ubc_dev, UBASE_CRQ_HEAD_REG);
     ubc_dev->cmd_crq.tail = (uint16_t)ubc_ers2_read32(ubc_dev, UBASE_CRQ_TAIL_REG);
-    qemu_log("ubc cmdq sync base=%#" PRIx64 " depth=%u head=%u tail=%u crq_base=%#" PRIx64
-             " crq_depth=%u crq_head=%u crq_tail=%u\n",
-             (uint64_t)ubc_dev->cmd_csq.base, ubc_dev->cmd_csq.depth,
-             ubc_dev->cmd_csq.head, ubc_dev->cmd_csq.tail,
-             (uint64_t)ubc_dev->cmd_crq.base, ubc_dev->cmd_crq.depth,
-             ubc_dev->cmd_crq.head, ubc_dev->cmd_crq.tail);
+    if (ubc_trace_data_path_enabled()) {
+        qemu_log("ubc cmdq sync base=%#" PRIx64 " depth=%u head=%u tail=%u crq_base=%#" PRIx64
+                 " crq_depth=%u crq_head=%u crq_tail=%u\n",
+                 (uint64_t)ubc_dev->cmd_csq.base, ubc_dev->cmd_csq.depth,
+                 ubc_dev->cmd_csq.head, ubc_dev->cmd_csq.tail,
+                 (uint64_t)ubc_dev->cmd_crq.base, ubc_dev->cmd_crq.depth,
+                 ubc_dev->cmd_crq.head, ubc_dev->cmd_crq.tail);
+    }
 }
 
 static void ubc_process_cmdq(BusControllerDev *ubc_dev)
@@ -2887,10 +2891,12 @@ static void ubc_process_cmdq(BusControllerDev *ubc_dev)
             /* Use cached CRQ state (already synced by ubc_sync_cmdq_regs
              * at start of ubc_process_cmdq).  Do NOT re-read from storage
              * here — the values are stable for the duration of this call. */
-            fprintf(stderr, "ubc cmdq crq push ue2ue: cached base=%#lx"
-                    " depth=%u head=%u tail=%u\n",
-                    (unsigned long)cmd_crq->base, cmd_crq->depth,
-                    cmd_crq->head, cmd_crq->tail);
+            if (ubc_trace_data_path_enabled()) {
+                qemu_log("ubc cmdq crq push ue2ue: cached base=%#lx"
+                         " depth=%u head=%u tail=%u\n",
+                         (unsigned long)cmd_crq->base, cmd_crq->depth,
+                         cmd_crq->head, cmd_crq->tail);
+            }
 
             if (cmd_crq->base && cmd_crq->depth) {
                 /* Determine actual response length from ctrlq bb_num field */
@@ -2910,10 +2916,12 @@ static void ubc_process_cmdq(BusControllerDev *ubc_dev)
                     crq_bd_num = 1;
                 }
 
-                fprintf(stderr, "ubc cmdq crq push ue2ue: actual_len=%zu"
-                        " crq_bd_num=%u head=%u tail=%u depth=%u\n",
-                        actual_len, crq_bd_num, cmd_crq->head,
-                        cmd_crq->tail, cmd_crq->depth);
+                if (ubc_trace_data_path_enabled()) {
+                    qemu_log("ubc cmdq crq push ue2ue: actual_len=%zu"
+                             " crq_bd_num=%u head=%u tail=%u depth=%u\n",
+                             actual_len, crq_bd_num, cmd_crq->head,
+                             cmd_crq->tail, cmd_crq->depth);
+                }
 
                 /* Write BD0: header + first 24 bytes of resp_flat */
                 memset(&crq_bd, 0, sizeof(crq_bd));
@@ -2960,8 +2968,10 @@ static void ubc_process_cmdq(BusControllerDev *ubc_dev)
                     /* Update CRQ tail register and raise interrupt */
                     ubc_ers2_write32(ubc_dev, UBASE_CRQ_TAIL_REG,
                                      cmd_crq->tail);
-                    fprintf(stderr, "ubc cmdq crq pushed: new_tail=%u\n",
-                            cmd_crq->tail);
+                    if (ubc_trace_data_path_enabled()) {
+                        qemu_log("ubc cmdq crq pushed: new_tail=%u\n",
+                                 cmd_crq->tail);
+                    }
                     ubc_raise_cmdq_event(ubc_dev);
                 }
             } else {
@@ -4257,7 +4267,7 @@ static MemTxResult ubc_dma_read_local_data_tid_strict(BusControllerDev *ubc_dev,
         tid_override_active = true;
     }
     ret = address_space_read(as, iova, MEMTXATTRS_UNSPECIFIED, buf, len);
-    if (len <= 8) {
+    if (ubc_trace_data_path_enabled() && len <= 8) {
         qemu_log("ubc sim_dec strict read iova=%#" PRIx64 " len=%zu tid=%u ret=%d\n",
                  (uint64_t)iova, len, tid, ret);
         if (ret == MEMTX_OK &&
@@ -5852,8 +5862,10 @@ static void ub_ers_region_write(void *opaque, hwaddr addr, uint64_t val, unsigne
 
         if (global_jetty_id < UBC_MAX_JETTIES && ubc_dev->jetties[global_jetty_id].active) {
             UBCJettyState *js = &ubc_dev->jetties[global_jetty_id];
-            qemu_log("ubc ERS1 doorbell: entity=%u jetty=%u new_pi=%u sq_ci=%u sq_depth=%u\n",
-                     entity_idx, global_jetty_id, (uint32_t)val, js->sq_ci, js->sq_depth);
+            if (ubc_trace_data_path_enabled()) {
+                qemu_log("ubc ERS1 doorbell: entity=%u jetty=%u new_pi=%u sq_ci=%u sq_depth=%u\n",
+                         entity_idx, global_jetty_id, (uint32_t)val, js->sq_ci, js->sq_depth);
+            }
             js->sq_pi = (uint32_t)val;
             ubc_process_sq(ubc_dev, js);
             return;

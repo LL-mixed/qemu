@@ -20,7 +20,7 @@
 #include "sysemu/sysemu.h"
 
 #define UB_LINK_WRITE_WAIT_USEC 1000
-#define UB_LINK_WRITE_TIMEOUT_USEC (2 * G_USEC_PER_SEC)
+#define UB_LINK_WRITE_TIMEOUT_USEC (30 * G_USEC_PER_SEC)
 
 typedef struct UBLinkPublishedState {
     char *device_id;
