@@ -3665,9 +3665,11 @@ static uint64_t linqu_uapi_reg_read(BusControllerDev *ubc_dev, hwaddr reg,
         value = ubc_dev->linqu_uapi_cq_head;
         break;
     case LINQU_UAPI_REG_CQ_TAIL:
+        linqu_uapi_flush_cq(ubc_dev);
         value = ubc_dev->linqu_uapi_cq_tail;
         break;
     case LINQU_UAPI_REG_STATUS:
+        linqu_uapi_flush_cq(ubc_dev);
         value = linqu_uapi_status(ubc_dev);
         break;
     case LINQU_UAPI_REG_LAST_ERROR:
