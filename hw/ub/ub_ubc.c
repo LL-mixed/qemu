@@ -214,6 +214,7 @@ typedef struct SimDecMapEntry {
     uint32_t upi;
     uint32_t src_eid;
     bool     active;
+    bool     mapped;
     uint8_t *sync_shadow;
     uint64_t sync_valid_off;
     uint64_t sync_valid_len;
@@ -226,6 +227,7 @@ typedef struct SimDecoderState {
     BusControllerState *bcs;
     uint64_t next_map_id;
     QTAILQ_HEAD(, SimDecMapEntry) map_list;
+    QTAILQ_HEAD(, SimDecMapEntry) retired_map_list;
     QemuMutex lock;
     bool enabled;
 } SimDecoderState;
@@ -6943,10 +6945,22 @@ static void sim_dec_init(BusControllerState *bcs)
     g_sim_decoder->bcs = bcs;
     g_sim_decoder->next_map_id = 1;
     QTAILQ_INIT(&g_sim_decoder->map_list);
+    QTAILQ_INIT(&g_sim_decoder->retired_map_list);
     qemu_mutex_init(&g_sim_decoder->lock);
     g_sim_decoder->enabled = true;
 
     qemu_log("SIM_DEC: decoder simulation initialized\n");
+}
+
+static void sim_dec_map_entry_destroy(SimDecMapEntry *entry)
+{
+    if (entry->mapped) {
+        memory_region_del_subregion(get_system_memory(), &entry->cpu_window);
+        entry->mapped = false;
+    }
+    object_unparent(OBJECT(&entry->cpu_window));
+    g_free(entry->sync_shadow);
+    g_free(entry);
 }
 
 static void sim_dec_cleanup(void)
@@ -6958,10 +6972,12 @@ static void sim_dec_cleanup(void)
 
     qemu_mutex_lock(&g_sim_decoder->lock);
     QTAILQ_FOREACH_SAFE(entry, &g_sim_decoder->map_list, next, tmp) {
-        memory_region_del_subregion(get_system_memory(), &entry->cpu_window);
-        object_unparent(OBJECT(&entry->cpu_window));
         QTAILQ_REMOVE(&g_sim_decoder->map_list, entry, next);
-        g_free(entry);
+        sim_dec_map_entry_destroy(entry);
+    }
+    QTAILQ_FOREACH_SAFE(entry, &g_sim_decoder->retired_map_list, next, tmp) {
+        QTAILQ_REMOVE(&g_sim_decoder->retired_map_list, entry, next);
+        sim_dec_map_entry_destroy(entry);
     }
     qemu_mutex_unlock(&g_sim_decoder->lock);
 
@@ -7072,6 +7088,7 @@ static int sim_dec_handle_map(const SimDecMapReq *req, SimDecMapResp *resp)
                           entry->size);
     memory_region_add_subregion_overlap(get_system_memory(), entry->local_pa,
                                         &entry->cpu_window, 10);
+    entry->mapped = true;
 
     QTAILQ_INSERT_TAIL(&g_sim_decoder->map_list, entry, next);
     qemu_mutex_unlock(&g_sim_decoder->lock);
@@ -7102,14 +7119,21 @@ static int sim_dec_handle_unmap(const SimDecUnmapReq *req)
     }
 
     entry->active = false;
-    memory_region_del_subregion(get_system_memory(), &entry->cpu_window);
-    object_unparent(OBJECT(&entry->cpu_window));
+    if (entry->mapped) {
+        memory_region_del_subregion(get_system_memory(), &entry->cpu_window);
+        entry->mapped = false;
+    }
     QTAILQ_REMOVE(&g_sim_decoder->map_list, entry, next);
+    /*
+     * Keep the MemoryRegion and its opaque entry alive until decoder teardown.
+     * Memory dispatch and in-flight SIM_DEC sync paths can still hold stale
+     * references briefly after del_subregion(); freeing here can corrupt QOM
+     * owner refs or leave callbacks with a dangling opaque pointer.
+     */
+    QTAILQ_INSERT_TAIL(&g_sim_decoder->retired_map_list, entry, next);
     qemu_mutex_unlock(&g_sim_decoder->lock);
 
     qemu_log("SIM_DEC: UNMAP success id=%" PRIx64 "\n", req->map_id);
-    g_free(entry->sync_shadow);
-    g_free(entry);
     return SIM_DEC_STATUS_SUCCESS;
 }
 
