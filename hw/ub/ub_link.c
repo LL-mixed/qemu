@@ -430,53 +430,64 @@ static void ub_link_setup_socket(UBLinkState *s, bool is_server)
 
 static int ub_link_write_all_bounded(UBLinkState *s, const char *buf, size_t len,
                                      Error **errp);
+static void ub_link_reopen_after_write_error(UBLinkState *s);
 
 int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **errp)
 {
-    UBLinkEndpointDesc *local = NULL;
-    UBLinkEndpointDesc *remote = NULL;
-    bool is_server;
     uint32_t plen = cpu_to_le32((uint32_t)len);
+    Error *local_err = NULL;
 
     if (!s || !s->ioc) {
         error_setg(errp, "ub_link: socket is not connected");
         return -1;
     }
-    if (ub_link_write_all_bounded(s, (const char *)&plen, sizeof(plen), errp) < 0) {
+
+    if (ub_link_write_all_bounded(s, (const char *)&plen, sizeof(plen), &local_err) == 0 &&
+        ub_link_write_all_bounded(s, (const char *)buf, len, &local_err) == 0) {
+        return 0;
+    }
+
+    error_free(local_err);
+    local_err = NULL;
+    ub_link_reopen_after_write_error(s);
+
+    if (!s->ioc) {
+        error_setg(errp, "ub_link: socket reconnect failed after write error");
+        return -1;
+    }
+
+    if (ub_link_write_all_bounded(s, (const char *)&plen, sizeof(plen), &local_err) == 0 &&
+        ub_link_write_all_bounded(s, (const char *)buf, len, &local_err) == 0) {
+        return 0;
+    }
+
+    ub_link_reopen_after_write_error(s);
+    error_propagate(errp, local_err);
+    return -1;
+}
+
+static void ub_link_reopen_after_write_error(UBLinkState *s)
+{
+    UBLinkEndpointDesc *local = NULL;
+    UBLinkEndpointDesc *remote = NULL;
+    bool is_server;
+
+    if (s->ioc) {
         qio_channel_close(s->ioc, NULL);
         object_unref(OBJECT(s->ioc));
         s->ioc = NULL;
-        s->link_up = false;
-        s->socket_connected = false;
-        s->remote_guid_valid = false;
-        s->snapshot_reconciled = false;
-        s->applied = false;
-        s->remote_applied = false;
-        s->state = UB_LINK_STATE_PENDING;
-        ub_link_update_status_file(s);
-        ub_link_select_endpoints(s, &local, &remote);
-        is_server = (local == &s->a);
-        ub_link_setup_socket(s, is_server);
-        return -1;
     }
-    if (ub_link_write_all_bounded(s, (const char *)buf, len, errp) < 0) {
-        qio_channel_close(s->ioc, NULL);
-        object_unref(OBJECT(s->ioc));
-        s->ioc = NULL;
-        s->link_up = false;
-        s->socket_connected = false;
-        s->remote_guid_valid = false;
-        s->snapshot_reconciled = false;
-        s->applied = false;
-        s->remote_applied = false;
-        s->state = UB_LINK_STATE_PENDING;
-        ub_link_update_status_file(s);
-        ub_link_select_endpoints(s, &local, &remote);
-        is_server = (local == &s->a);
-        ub_link_setup_socket(s, is_server);
-        return -1;
-    }
-    return 0;
+    s->link_up = false;
+    s->socket_connected = false;
+    s->remote_guid_valid = false;
+    s->snapshot_reconciled = false;
+    s->applied = false;
+    s->remote_applied = false;
+    s->state = UB_LINK_STATE_PENDING;
+    ub_link_update_status_file(s);
+    ub_link_select_endpoints(s, &local, &remote);
+    is_server = (local == &s->a);
+    ub_link_setup_socket(s, is_server);
 }
 
 static int ub_link_write_all_bounded(UBLinkState *s, const char *buf, size_t len,
