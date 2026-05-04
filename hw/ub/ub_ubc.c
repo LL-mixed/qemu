@@ -16,6 +16,7 @@
  */
 #include <sys/file.h>
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "exec/address-spaces.h"
@@ -135,6 +136,8 @@ int linqu_ub_bridge_poll_completion(LinquUbBridge *bridge,
 #define SIM_DEC_OP_UNMAP            0x02
 #define SIM_DEC_OP_SYNC             0x03
 #define SIM_DEC_OP_QUERY            0x04
+#define SIM_DEC_OP_OBMM_BOOTSTRAP_PUBLISH 0x05
+#define SIM_DEC_OP_OBMM_BOOTSTRAP_LOOKUP  0x06
 
 /* SIM_DEC status codes */
 #define SIM_DEC_STATUS_SUCCESS          0x00
@@ -198,6 +201,36 @@ typedef struct QEMU_PACKED SimDecQueryResp {
     uint32_t status;
     uint32_t ref_count;
 } SimDecQueryResp;
+
+#define SIM_DEC_OBMM_BOOTSTRAP_MAX_NODES 8
+
+typedef struct QEMU_PACKED SimDecObmmBootstrapRecord {
+    uint64_t export_mem_id;
+    uint64_t remote_uba;
+    uint64_t size;
+    uint64_t generation;
+    uint64_t flags;
+    uint32_t node_id;
+    uint32_t node_count;
+    uint32_t export_cna;
+    uint32_t token_id;
+} SimDecObmmBootstrapRecord;
+
+typedef struct QEMU_PACKED SimDecObmmBootstrapPublishReq {
+    SimDecObmmBootstrapRecord record;
+} SimDecObmmBootstrapPublishReq;
+
+typedef struct QEMU_PACKED SimDecObmmBootstrapLookupReq {
+    uint64_t generation;
+    uint32_t node_count;
+    uint32_t rsvd;
+} SimDecObmmBootstrapLookupReq;
+
+typedef struct QEMU_PACKED SimDecObmmBootstrapLookupResp {
+    uint32_t count;
+    uint32_t rsvd;
+    SimDecObmmBootstrapRecord records[SIM_DEC_OBMM_BOOTSTRAP_MAX_NODES];
+} SimDecObmmBootstrapLookupResp;
 
 /* Decoder map entry for simulation backend */
 typedef struct SimDecMapEntry {
@@ -7229,6 +7262,179 @@ static int sim_dec_handle_query(const SimDecQueryReq *req, SimDecQueryResp *resp
     return SIM_DEC_STATUS_SUCCESS;
 }
 
+static char *sim_dec_obmm_bootstrap_dir(void)
+{
+    const char *shared_dir = g_getenv("UB_FM_SHARED_DIR");
+
+    if (!shared_dir || !shared_dir[0]) {
+        return NULL;
+    }
+    return g_build_filename(shared_dir, "obmm_bootstrap", NULL);
+}
+
+static char *sim_dec_obmm_bootstrap_path(uint32_t node_id)
+{
+    g_autofree char *dir = sim_dec_obmm_bootstrap_dir();
+    g_autofree char *name = NULL;
+
+    if (!dir) {
+        return NULL;
+    }
+    name = g_strdup_printf("node%u.ini", node_id);
+    return g_build_filename(dir, name, NULL);
+}
+
+static int sim_dec_handle_obmm_bootstrap_publish(
+    const SimDecObmmBootstrapPublishReq *req)
+{
+    const SimDecObmmBootstrapRecord *record = &req->record;
+    g_autofree char *dir = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *tmp_path = NULL;
+    g_autofree char *data = NULL;
+    g_autoptr(GKeyFile) keyfile = NULL;
+    uint64_t generation;
+    GError *err = NULL;
+
+    if (record->node_count < 2 ||
+        record->node_count > SIM_DEC_OBMM_BOOTSTRAP_MAX_NODES ||
+        record->node_id >= record->node_count ||
+        record->export_cna == 0 || record->token_id == 0 ||
+        record->remote_uba == 0 || record->size == 0) {
+        return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+
+    dir = sim_dec_obmm_bootstrap_dir();
+    path = sim_dec_obmm_bootstrap_path(record->node_id);
+    if (!dir || !path) {
+        qemu_log("SIM_DEC: OBMM bootstrap publish requires UB_FM_SHARED_DIR\n");
+        return SIM_DEC_STATUS_NOT_SUPPORTED;
+    }
+    if (g_mkdir_with_parents(dir, 0755) != 0) {
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+
+    if (record->generation == 0) {
+        return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+    generation = record->generation;
+    keyfile = g_key_file_new();
+    g_key_file_set_uint64(keyfile, "obmm_export", "export_mem_id",
+                          record->export_mem_id);
+    g_key_file_set_uint64(keyfile, "obmm_export", "remote_uba",
+                          record->remote_uba);
+    g_key_file_set_uint64(keyfile, "obmm_export", "size", record->size);
+    g_key_file_set_uint64(keyfile, "obmm_export", "generation", generation);
+    g_key_file_set_uint64(keyfile, "obmm_export", "flags", record->flags);
+    g_key_file_set_uint64(keyfile, "obmm_export", "node_id", record->node_id);
+    g_key_file_set_uint64(keyfile, "obmm_export", "node_count",
+                          record->node_count);
+    g_key_file_set_uint64(keyfile, "obmm_export", "export_cna",
+                          record->export_cna);
+    g_key_file_set_uint64(keyfile, "obmm_export", "token_id",
+                          record->token_id);
+
+    data = g_key_file_to_data(keyfile, NULL, NULL);
+    tmp_path = g_strdup_printf("%s.tmp.%d", path, getpid());
+    if (!g_file_set_contents(tmp_path, data, -1, &err)) {
+        qemu_log("SIM_DEC: OBMM bootstrap publish write failed: %s\n",
+                 err ? err->message : "unknown");
+        g_clear_error(&err);
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+    if (g_rename(tmp_path, path) != 0) {
+        qemu_log("SIM_DEC: OBMM bootstrap publish rename failed: %s\n",
+                 g_strerror(errno));
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+
+    qemu_log("SIM_DEC: OBMM bootstrap publish node=%u cna=%u uba=%" PRIx64
+             " token=%u size=%" PRIx64 "\n",
+             record->node_id, record->export_cna, record->remote_uba,
+             record->token_id, record->size);
+    return SIM_DEC_STATUS_SUCCESS;
+}
+
+static bool sim_dec_obmm_bootstrap_load(uint32_t node_id, uint32_t node_count,
+                                        uint64_t generation,
+                                        SimDecObmmBootstrapRecord *record)
+{
+    g_autofree char *path = sim_dec_obmm_bootstrap_path(node_id);
+    g_autoptr(GKeyFile) keyfile = NULL;
+    GError *err = NULL;
+
+    if (!path || !g_file_test(path, G_FILE_TEST_EXISTS)) {
+        return false;
+    }
+
+    keyfile = g_key_file_new();
+    if (!g_key_file_load_from_file(keyfile, path, G_KEY_FILE_NONE, &err)) {
+        qemu_log("SIM_DEC: OBMM bootstrap lookup read failed: %s\n",
+                 err ? err->message : "unknown");
+        g_clear_error(&err);
+        return false;
+    }
+
+    record->export_mem_id = g_key_file_get_uint64(keyfile, "obmm_export",
+                                                  "export_mem_id", NULL);
+    record->remote_uba = g_key_file_get_uint64(keyfile, "obmm_export",
+                                               "remote_uba", NULL);
+    record->size = g_key_file_get_uint64(keyfile, "obmm_export", "size", NULL);
+    record->generation = g_key_file_get_uint64(keyfile, "obmm_export",
+                                               "generation", NULL);
+    record->flags = g_key_file_get_uint64(keyfile, "obmm_export", "flags", NULL);
+    record->node_id = (uint32_t)g_key_file_get_uint64(keyfile, "obmm_export",
+                                                      "node_id", NULL);
+    record->node_count = (uint32_t)g_key_file_get_uint64(keyfile, "obmm_export",
+                                                         "node_count", NULL);
+    record->export_cna = (uint32_t)g_key_file_get_uint64(keyfile, "obmm_export",
+                                                         "export_cna", NULL);
+    record->token_id = (uint32_t)g_key_file_get_uint64(keyfile, "obmm_export",
+                                                       "token_id", NULL);
+
+    return record->node_id == node_id &&
+           record->node_count == node_count &&
+           record->generation == generation &&
+           record->export_cna != 0 &&
+           record->token_id != 0 &&
+           record->remote_uba != 0 &&
+           record->size != 0;
+}
+
+static int sim_dec_handle_obmm_bootstrap_lookup(
+    const SimDecObmmBootstrapLookupReq *req,
+    SimDecObmmBootstrapLookupResp *resp)
+{
+    g_autofree char *dir = NULL;
+    uint32_t i;
+
+    if (req->node_count < 2 ||
+        req->node_count > SIM_DEC_OBMM_BOOTSTRAP_MAX_NODES ||
+        req->generation == 0) {
+        return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+    dir = sim_dec_obmm_bootstrap_dir();
+    if (!dir) {
+        qemu_log("SIM_DEC: OBMM bootstrap lookup requires UB_FM_SHARED_DIR\n");
+        return SIM_DEC_STATUS_NOT_SUPPORTED;
+    }
+
+    memset(resp, 0, sizeof(*resp));
+    for (i = 0; i < req->node_count; i++) {
+        SimDecObmmBootstrapRecord record = {0};
+
+        if (!sim_dec_obmm_bootstrap_load(i, req->node_count, req->generation,
+                                         &record)) {
+            continue;
+        }
+        if (resp->count >= SIM_DEC_OBMM_BOOTSTRAP_MAX_NODES) {
+            return SIM_DEC_STATUS_INVALID_PARAM;
+        }
+        resp->records[resp->count++] = record;
+    }
+    return SIM_DEC_STATUS_SUCCESS;
+}
+
 /*
  * sim_dec_lookup_by_pa - Lookup decoder entry for address translation
  * Called by UMMU to check if a PA is in decoder map for remote access
@@ -7346,6 +7552,33 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             memcpy(resp + sizeof(*resp_hdr), &query_resp, sizeof(query_resp));
             resp_hdr->status = query_resp.status ? SIM_DEC_STATUS_INVALID_PARAM
                                                   : SIM_DEC_STATUS_SUCCESS;
+        }
+        break;
+
+    case SIM_DEC_OP_OBMM_BOOTSTRAP_PUBLISH:
+        min_len = sizeof(*hdr) + sizeof(SimDecObmmBootstrapPublishReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        resp_hdr->status = sim_dec_handle_obmm_bootstrap_publish(
+            (const SimDecObmmBootstrapPublishReq *)(data + sizeof(*hdr)));
+        resp_hdr->payload_len = 0;
+        break;
+
+    case SIM_DEC_OP_OBMM_BOOTSTRAP_LOOKUP:
+        min_len = sizeof(*hdr) + sizeof(SimDecObmmBootstrapLookupReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        {
+            SimDecObmmBootstrapLookupResp lookup_resp = {0};
+            resp_hdr->status = sim_dec_handle_obmm_bootstrap_lookup(
+                (const SimDecObmmBootstrapLookupReq *)(data + sizeof(*hdr)),
+                &lookup_resp);
+            resp_hdr->payload_len = sizeof(lookup_resp);
+            memcpy(resp + sizeof(*resp_hdr), &lookup_resp, sizeof(lookup_resp));
         }
         break;
 
