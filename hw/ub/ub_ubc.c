@@ -309,9 +309,15 @@ static uint64_t sim_dec_cpu_window_read(void *opaque, hwaddr addr,
     ret = ubc_sim_dec_remote_read(g_sim_decoder->bcs->ubc_dev, remote_uba,
                                   entry->token_id, entry->dcna, buf, size);
     if (ret != MEMTX_OK) {
-        qemu_log("SIM_DEC: cpu read failed map=%" PRIx64 " remote_uba=%#" PRIx64
-                 " size=%u ret=%d\n",
-                 entry->map_id, remote_uba, size, ret);
+        if (ret == MEMTX_DECODE_ERROR) {
+            qemu_log("SIM_DEC: cpu read retryable map=%" PRIx64
+                     " remote_uba=%#" PRIx64 " size=%u ret=%d\n",
+                     entry->map_id, remote_uba, size, ret);
+        } else {
+            qemu_log("SIM_DEC: cpu read failed map=%" PRIx64
+                     " remote_uba=%#" PRIx64 " size=%u ret=%d\n",
+                     entry->map_id, remote_uba, size, ret);
+        }
         return 0;
     }
 
