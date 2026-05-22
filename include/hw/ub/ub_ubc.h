@@ -344,6 +344,56 @@ void ubc_handle_read_response(BusControllerDev *ubc_dev, const UBCReadRespPld *r
 #define UBC_MSG_SUB_SIM_DEC_WRITE     1
 #define UBC_MSG_SUB_SIM_DEC_READ_REQ  2
 #define UBC_MSG_SUB_SIM_DEC_READ_RESP 3
+#define UBC_MSG_SUB_SIM_DEC_BATCH     4
+
+/* SIM_DEC batched write payload */
+typedef struct QEMU_PACKED SimDecBatchHdr {
+    uint8_t version;       /* 1 */
+    uint8_t op_count;
+    uint16_t flags;
+    uint32_t barrier_epoch;
+} SimDecBatchHdr;
+
+typedef struct QEMU_PACKED SimDecBatchWriteOp {
+    uint64_t remote_uba;
+    uint32_t token_id;
+    uint32_t data_len;
+    /* data bytes follow after all ops in the payload */
+} SimDecBatchWriteOp;
+
+#define SIM_DEC_BATCH_MAX_OPS     16
+#define SIM_DEC_BATCH_MAX_DATA    (64 * 1024)  /* 64 KiB max per batch frame */
+
+/* SIM_DEC instrumentation counters */
+typedef struct SimDecStats {
+    uint64_t cpu_window_reads;
+    uint64_t cpu_window_writes;
+    uint64_t cpu_window_read_bytes[4]; /* index 0=1B,1=2B,2=4B,3=8B */
+    uint64_t cpu_window_write_bytes[4];
+    uint64_t shadow_hits;
+    uint64_t shadow_misses;
+    uint64_t page_cache_hits;
+    uint64_t page_cache_misses;
+    uint64_t page_cache_prefetches;
+    uint64_t page_cache_prefetch_skips;
+    uint64_t remote_reads;
+    uint64_t remote_writes;
+    uint64_t remote_read_bytes;
+    uint64_t remote_write_bytes;
+    uint64_t dma_path_reads;
+    uint64_t dma_path_writes;
+    uint64_t dma_path_read_bytes;
+    uint64_t dma_path_write_bytes;
+    uint64_t read_timeouts;
+    uint64_t read_errors;
+    uint64_t write_errors;
+    uint64_t batch_frames;
+    uint64_t batch_ops;
+    uint64_t batch_bytes;
+} SimDecStats;
+
+void sim_dec_stats_accumulate(SimDecStats *dst, const SimDecStats *src);
+void sim_dec_print_stats(const SimDecStats *stats, const char *prefix);
 
 typedef struct QEMU_PACKED UBCSimDecWritePldHdr {
     uint64_t remote_uba;

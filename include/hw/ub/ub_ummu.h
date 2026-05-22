@@ -40,6 +40,7 @@ typedef struct UMMUTLBEntry {
     uint8_t level;
     uint8_t granule;
     uint16_t tecte_tag;
+    QTAILQ_ENTRY(UMMUTLBEntry) lru_next;
 } UMMUTLBEntry;
 
 #define __bf_shf(x) (__builtin_ffsll(x) - 1)
@@ -150,11 +151,23 @@ struct UMMUState {
     /* IOTLB cache */
     GHashTable *iotlb;
     uint32_t iotlb_max_size;
+    QTAILQ_HEAD(, UMMUTLBEntry) iotlb_lru;
 
     /* Optional per-DMA-call translation tid override for UBC data path */
     bool dma_tid_override_valid;
     uint32_t dma_tid_override;
+
+    /* UMMU instrumentation counters */
+    uint64_t iotlb_lookups;
+    uint64_t iotlb_hits;
+    uint64_t iotlb_misses;
+    uint64_t ptw_count;
+    uint64_t inv_all_count;
+    uint64_t inv_tecte_count;
+    uint64_t translation_failures;
 };
+
+void ummu_print_stats(UMMUState *s, const char *prefix);
 
 struct UMMUBaseClass {
     /* <private> */

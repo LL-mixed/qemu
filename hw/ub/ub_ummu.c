@@ -1932,6 +1932,7 @@ static void ummu_base_realize(DeviceState *dev, Error **errp)
     static uint8_t NO = 0;
     UMMUState *u = UB_UMMU(dev);
     SysBusDevice *sysdev = SYS_BUS_DEVICE(dev);
+    const char *env;
 
     u->bus_num = NO;
     sysdev->parent_obj.id = g_strdup_printf("ummu.%u", NO++);
@@ -1948,8 +1949,16 @@ static void ummu_base_realize(DeviceState *dev, Error **errp)
     u->ummu_devs = g_hash_table_new_full(NULL, NULL, NULL, g_free);
     u->configs = g_hash_table_new_full(NULL, NULL, NULL, g_free);
     u->iotlb = g_hash_table_new_full(ummu_iotlb_key_hash, ummu_iotlb_key_equal,
-                                      g_free, g_free);
+                                      g_free, (GDestroyNotify)g_free);
     u->iotlb_max_size = UMMU_IOTLB_MAX_SIZE;
+    env = g_getenv("UMMU_IOTLB_MAX_SIZE");
+    if (env) {
+        u->iotlb_max_size = (uint32_t)g_ascii_strtoull(env, NULL, 0);
+        if (u->iotlb_max_size < 16) {
+            u->iotlb_max_size = 16;
+        }
+    }
+    QTAILQ_INIT(&u->iotlb_lru);
     QLIST_INIT(&u->kvtbl);
     u->kvtbl_entrys = 0;
     if (u->primary_bus) {
@@ -2632,6 +2641,15 @@ static void ummu_record_event(UMMUState *u, UMMUEventInfo *info)
 
 /* --- UMMU IOTLB lookup/insert (adapted from SMMUv3 pattern) --- */
 
+static void ummu_iotlb_entry_free(UMMUState *s, UMMUTLBEntry *entry)
+{
+    if (!entry) {
+        return;
+    }
+    QTAILQ_REMOVE(&s->iotlb_lru, entry, lru_next);
+    g_free(entry);
+}
+
 static UMMUTLBEntry *ummu_iotlb_lookup(UMMUState *s, hwaddr iova,
                                         uint16_t tecte_tag,
                                         uint8_t granule_sz)
@@ -2639,6 +2657,7 @@ static UMMUTLBEntry *ummu_iotlb_lookup(UMMUState *s, hwaddr iova,
     int level;
     uint8_t tg = granule_sz - 12;
 
+    s->iotlb_lookups++;
     for (level = 0; level < VMSA_LEVELS; level++) {
         UMMUIOTLBKey key = {
             .iova = iova & ~((1ULL << level_shift(level, granule_sz)) - 1),
@@ -2648,9 +2667,13 @@ static UMMUTLBEntry *ummu_iotlb_lookup(UMMUState *s, hwaddr iova,
         };
         UMMUTLBEntry *entry = g_hash_table_lookup(s->iotlb, &key);
         if (entry) {
+            s->iotlb_hits++;
+            QTAILQ_REMOVE(&s->iotlb_lru, entry, lru_next);
+            QTAILQ_INSERT_HEAD(&s->iotlb_lru, entry, lru_next);
             return entry;
         }
     }
+    s->iotlb_misses++;
     return NULL;
 }
 
@@ -2666,18 +2689,20 @@ static void ummu_iotlb_insert(UMMUState *s, UMMUTLBEntry *new_entry)
     *entry = *new_entry;
 
     if (g_hash_table_size(s->iotlb) >= s->iotlb_max_size) {
-        GHashTableIter iter;
-        gpointer k;
-        g_hash_table_iter_init(&iter, s->iotlb);
-        g_hash_table_iter_next(&iter, &k, NULL);
-        g_hash_table_remove(s->iotlb, k);
+        UMMUTLBEntry *victim = QTAILQ_LAST(&s->iotlb_lru);
+        if (victim) {
+            g_hash_table_remove(s->iotlb, victim);
+        }
     }
     g_hash_table_insert(s->iotlb, key, entry);
+    QTAILQ_INSERT_HEAD(&s->iotlb_lru, entry, lru_next);
 }
 
 void ummu_iotlb_inv_all(UMMUState *s)
 {
     g_hash_table_remove_all(s->iotlb);
+    QTAILQ_INIT(&s->iotlb_lru);
+    s->inv_all_count++;
 }
 
 static gboolean ummu_iotlb_inv_tecte_tag_cb(gpointer key, gpointer value,
@@ -2815,6 +2840,9 @@ do_translation:
     }
 
     ummu_ptw(cfg, addr, &entry, &ptw_info);
+    if (ummu_dev->ummu) {
+        ummu_dev->ummu->ptw_count++;
+    }
     if (ptw_info.type == UMMU_PTW_ERR_NONE) {
         /* Insert into TLB on success */
         if (ummu_dev->ummu->iotlb && entry.perm != IOMMU_NONE) {
@@ -2830,6 +2858,9 @@ do_translation:
     }
 
     entry.perm = IOMMU_NONE;
+    if (ummu_dev->ummu) {
+        ummu_dev->ummu->translation_failures++;
+    }
 
     /* Record translation error event if PTW failed */
     if (ptw_info.type != UMMU_PTW_ERR_NONE && cfg) {
@@ -2941,6 +2972,21 @@ static const TypeInfo ummu_iommu_memory_region_info = {
     .name = TYPE_UMMU_IOMMU_MEMORY_REGION,
     .class_init = ummu_iommu_memory_region_class_init,
 };
+
+void ummu_print_stats(UMMUState *s, const char *prefix)
+{
+    if (!s) {
+        return;
+    }
+    qemu_log("%sUMMU_STATS iotlb_lookups=%" PRIu64 " iotlb_hits=%" PRIu64
+             " iotlb_misses=%" PRIu64 " ptw_count=%" PRIu64
+             " inv_all=%" PRIu64 " inv_tecte=%" PRIu64
+             " translation_failures=%" PRIu64 "\n",
+             prefix ? prefix : "",
+             s->iotlb_lookups, s->iotlb_hits, s->iotlb_misses,
+             s->ptw_count, s->inv_all_count, s->inv_tecte_count,
+             s->translation_failures);
+}
 
 static void ummu_base_register_types(void)
 {

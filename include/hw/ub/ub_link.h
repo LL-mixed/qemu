@@ -29,12 +29,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(UBLinkState, UB_LINK)
 
 /* Maximum sizes for the receive buffer */
 #define UB_LINK_RX_BUF_MAX      (1 << 20)  /* 1 MiB */
+#define UB_LINK_SHM_RING_MAGIC  0x55424c51U /* "UBLQ" */
+#define UB_LINK_SHM_RING_VER    1U
+#define UB_LINK_SHM_RING_DEFAULT_SIZE (4 * 1024 * 1024)
 
 /* A fully received spec-aligned UB packet */
 typedef struct UBLinkRxMsg {
     size_t len;      /* total = UB_LINK_PKT_HDR_SIZE + plen */
     void *data;      /* g_malloc'd: MsgPktHeader + payload */
 } UBLinkRxMsg;
+
+typedef struct UBLinkShmRing {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t header_size;
+    uint32_t ring_size;
+    uint64_t head;
+    uint64_t tail;
+    uint8_t data[];
+} UBLinkShmRing;
 
 /* Link state for Ready Contract */
 typedef enum UBLinkStateEnum {
@@ -66,6 +79,21 @@ struct UBLinkState {
     QIOChannel *ioc;
     QIONetListener *lioc; /* Listener, for server side */
     char *socket_path;
+
+    /* Shared-memory SPSC data path: one tx ring and one rx ring per link. */
+    bool shmem_ready;
+    int shmem_tx_fd;
+    int shmem_rx_fd;
+    int shmem_tx_notify_fd;
+    int shmem_rx_notify_fd;
+    UBLinkShmRing *shmem_tx_ring;
+    UBLinkShmRing *shmem_rx_ring;
+    size_t shmem_tx_map_size;
+    size_t shmem_rx_map_size;
+    char *shmem_tx_path;
+    char *shmem_rx_path;
+    char *shmem_tx_notify_path;
+    char *shmem_rx_notify_path;
 
     /* Receive buffer for the spec-aligned protocol */
     uint8_t *rx_buf;
@@ -99,7 +127,18 @@ struct UBLinkState {
     uint64_t state_set_ts_ms;  /* M1: State change timestamp for age check */
     char *last_error;
     char *status_file_path;
+
+    /* Link instrumentation counters */
+    uint64_t tx_packets[8];
+    uint64_t tx_bytes[8];
+    uint64_t rx_packets[8];
+    uint64_t rx_bytes[8];
+    uint64_t write_retries;
+    uint64_t write_timeouts;
+    uint64_t kick_count;
 };
+
+void ub_link_print_stats(UBLinkState *s, const char *prefix);
 
 void ub_link_configure(UBLinkState *s, const char *a_device_id, uint32_t a_port_idx,
                        const char *b_device_id, uint32_t b_port_idx, bool link_up);

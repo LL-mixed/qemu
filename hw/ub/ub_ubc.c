@@ -233,6 +233,29 @@ typedef struct QEMU_PACKED SimDecObmmBootstrapLookupResp {
 } SimDecObmmBootstrapLookupResp;
 
 /* Decoder map entry for simulation backend */
+/* Page cache for SIM_DEC imported-PA CPU window reads */
+#define SIM_DEC_PAGE_SIZE           4096
+#define SIM_DEC_CACHE_MAX_PER_MAP   1024
+#define SIM_DEC_CACHE_MAX_GLOBAL    8192
+
+typedef struct SimDecPageCacheEntry {
+    uint64_t page_index;
+    uint8_t *page_buf;
+    uint64_t last_used;
+    bool dirty;
+    uint64_t dirty_off;
+    uint64_t dirty_len;
+    QTAILQ_ENTRY(SimDecPageCacheEntry) lru_next;
+} SimDecPageCacheEntry;
+
+typedef struct SimDecPageCache {
+    GHashTable *pages;                 /* key: page_index (uint64_t), value: SimDecPageCacheEntry* */
+    QTAILQ_HEAD(, SimDecPageCacheEntry) lru_list;
+    uint64_t max_pages;
+    uint64_t cur_pages;
+    QemuMutex lock;
+} SimDecPageCache;
+
 typedef struct SimDecMapEntry {
     uint64_t map_id;
     uint64_t local_pa;
@@ -252,10 +275,17 @@ typedef struct SimDecMapEntry {
     uint64_t sync_valid_off;
     uint64_t sync_valid_len;
     MemoryRegion cpu_window;
+    SimDecPageCache *page_cache;
+    uint32_t next_batch_seqno;
     QTAILQ_ENTRY(SimDecMapEntry) next;
 } SimDecMapEntry;
 
 /* Decoder simulation context */
+typedef enum SimDecWriteMode {
+    SIM_DEC_WRITE_THROUGH,
+    SIM_DEC_WRITE_BACK,
+} SimDecWriteMode;
+
 typedef struct SimDecoderState {
     BusControllerState *bcs;
     uint64_t next_map_id;
@@ -263,9 +293,98 @@ typedef struct SimDecoderState {
     QTAILQ_HEAD(, SimDecMapEntry) retired_map_list;
     QemuMutex lock;
     bool enabled;
+    SimDecStats stats;
+    uint64_t page_cache_max_per_map;
+    uint64_t page_cache_max_global;
+    uint64_t page_cache_global_pages;
+    bool page_cache_prefetch;
+    SimDecWriteMode write_mode;
 } SimDecoderState;
 
 static SimDecoderState *g_sim_decoder;
+
+/* SIM_DEC stats helpers */
+void sim_dec_stats_accumulate(SimDecStats *dst, const SimDecStats *src)
+{
+    int i;
+    if (!dst || !src) {
+        return;
+    }
+    dst->cpu_window_reads += src->cpu_window_reads;
+    dst->cpu_window_writes += src->cpu_window_writes;
+    for (i = 0; i < 4; i++) {
+        dst->cpu_window_read_bytes[i] += src->cpu_window_read_bytes[i];
+        dst->cpu_window_write_bytes[i] += src->cpu_window_write_bytes[i];
+    }
+    dst->shadow_hits += src->shadow_hits;
+    dst->shadow_misses += src->shadow_misses;
+    dst->page_cache_hits += src->page_cache_hits;
+    dst->page_cache_misses += src->page_cache_misses;
+    dst->page_cache_prefetches += src->page_cache_prefetches;
+    dst->page_cache_prefetch_skips += src->page_cache_prefetch_skips;
+    dst->remote_reads += src->remote_reads;
+    dst->remote_writes += src->remote_writes;
+    dst->remote_read_bytes += src->remote_read_bytes;
+    dst->remote_write_bytes += src->remote_write_bytes;
+    dst->dma_path_reads += src->dma_path_reads;
+    dst->dma_path_writes += src->dma_path_writes;
+    dst->dma_path_read_bytes += src->dma_path_read_bytes;
+    dst->dma_path_write_bytes += src->dma_path_write_bytes;
+    dst->read_timeouts += src->read_timeouts;
+    dst->read_errors += src->read_errors;
+    dst->write_errors += src->write_errors;
+    dst->batch_frames += src->batch_frames;
+    dst->batch_ops += src->batch_ops;
+    dst->batch_bytes += src->batch_bytes;
+}
+
+void sim_dec_print_stats(const SimDecStats *stats, const char *prefix)
+{
+    uint64_t cpu_rbytes = 0, cpu_wbytes = 0;
+    int i;
+    if (!stats) {
+        return;
+    }
+    for (i = 0; i < 4; i++) {
+        cpu_rbytes += stats->cpu_window_read_bytes[i];
+        cpu_wbytes += stats->cpu_window_write_bytes[i];
+    }
+    qemu_log("%sSIM_DEC_STATS cpu_reads=%" PRIu64 " cpu_writes=%" PRIu64
+             " cpu_rbytes=%" PRIu64 " cpu_wbytes=%" PRIu64
+             " shadow_hits=%" PRIu64 " shadow_misses=%" PRIu64
+             " page_cache_hits=%" PRIu64 " page_cache_misses=%" PRIu64
+             " page_cache_prefetches=%" PRIu64 " page_cache_prefetch_skips=%" PRIu64
+             " remote_reads=%" PRIu64 " remote_writes=%" PRIu64
+             " remote_rbytes=%" PRIu64 " remote_wbytes=%" PRIu64
+             " dma_reads=%" PRIu64 " dma_writes=%" PRIu64
+             " dma_rbytes=%" PRIu64 " dma_wbytes=%" PRIu64
+             " read_timeouts=%" PRIu64 " read_errors=%" PRIu64
+             " write_errors=%" PRIu64
+             " batch_frames=%" PRIu64 " batch_ops=%" PRIu64
+             " batch_bytes=%" PRIu64 "\n",
+             prefix ? prefix : "",
+             stats->cpu_window_reads, stats->cpu_window_writes,
+             cpu_rbytes, cpu_wbytes,
+             stats->shadow_hits, stats->shadow_misses,
+             stats->page_cache_hits, stats->page_cache_misses,
+             stats->page_cache_prefetches, stats->page_cache_prefetch_skips,
+             stats->remote_reads, stats->remote_writes,
+             stats->remote_read_bytes, stats->remote_write_bytes,
+             stats->dma_path_reads, stats->dma_path_writes,
+             stats->dma_path_read_bytes, stats->dma_path_write_bytes,
+             stats->read_timeouts, stats->read_errors, stats->write_errors,
+             stats->batch_frames, stats->batch_ops, stats->batch_bytes);
+}
+
+static void sim_dec_print_global_stats(void)
+{
+    if (!g_sim_decoder) {
+        return;
+    }
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    sim_dec_print_stats(&g_sim_decoder->stats, "");
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+}
 
 /* Forward declarations for SIM decoder */
 static void sim_dec_init(BusControllerState *bcs);
@@ -285,6 +404,320 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
 static uint8_t ubc_node_ip_suffix_from_id(const char *node_id);
 static void ubc_fill_link_local_eid_hw(uint8_t eid_hw[16], uint8_t suffix);
 
+/* Page cache helpers */
+static SimDecPageCache *sim_dec_page_cache_new(uint64_t max_pages)
+{
+    SimDecPageCache *cache = g_malloc0(sizeof(*cache));
+    cache->pages = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                          g_free, NULL);
+    QTAILQ_INIT(&cache->lru_list);
+    cache->max_pages = max_pages;
+    cache->cur_pages = 0;
+    qemu_mutex_init(&cache->lock);
+    return cache;
+}
+
+static void sim_dec_page_cache_free(SimDecPageCache *cache)
+{
+    SimDecPageCacheEntry *ce, *tmp;
+    if (!cache) {
+        return;
+    }
+    qemu_mutex_lock(&cache->lock);
+    QTAILQ_FOREACH_SAFE(ce, &cache->lru_list, lru_next, tmp) {
+        QTAILQ_REMOVE(&cache->lru_list, ce, lru_next);
+        g_free(ce->page_buf);
+        g_free(ce);
+    }
+    if (cache->pages) {
+        g_hash_table_destroy(cache->pages);
+    }
+    qemu_mutex_unlock(&cache->lock);
+    qemu_mutex_destroy(&cache->lock);
+    g_free(cache);
+}
+
+static void sim_dec_page_cache_evict_lru(SimDecPageCache *cache)
+{
+    SimDecPageCacheEntry *victim;
+    victim = QTAILQ_LAST(&cache->lru_list);
+    if (!victim) {
+        return;
+    }
+    QTAILQ_REMOVE(&cache->lru_list, victim, lru_next);
+    g_hash_table_remove(cache->pages, &victim->page_index);
+    g_free(victim->page_buf);
+    g_free(victim);
+    cache->cur_pages--;
+    if (g_sim_decoder) {
+        g_sim_decoder->page_cache_global_pages--;
+    }
+}
+
+static void sim_dec_page_cache_insert(SimDecPageCache *cache,
+                                      uint64_t page_index,
+                                      const uint8_t *data)
+{
+    SimDecPageCacheEntry *ce;
+    uint64_t *key;
+
+    if (!cache || cache->max_pages == 0) {
+        return;
+    }
+
+    /* Evict if at per-map limit or global limit */
+    while (cache->cur_pages >= cache->max_pages ||
+           (g_sim_decoder && g_sim_decoder->page_cache_global_pages >=
+            g_sim_decoder->page_cache_max_global)) {
+        sim_dec_page_cache_evict_lru(cache);
+        if (cache->cur_pages == 0) {
+            break; /* cannot evict further */
+        }
+    }
+
+    ce = g_malloc0(sizeof(*ce));
+    ce->page_index = page_index;
+    ce->page_buf = g_malloc(SIM_DEC_PAGE_SIZE);
+    memcpy(ce->page_buf, data, SIM_DEC_PAGE_SIZE);
+    ce->last_used = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    key = g_malloc(sizeof(*key));
+    *key = page_index;
+    g_hash_table_insert(cache->pages, key, ce);
+    QTAILQ_INSERT_HEAD(&cache->lru_list, ce, lru_next);
+    cache->cur_pages++;
+    if (g_sim_decoder) {
+        g_sim_decoder->page_cache_global_pages++;
+    }
+}
+
+static SimDecPageCacheEntry *sim_dec_page_cache_lookup(SimDecPageCache *cache,
+                                                        uint64_t page_index)
+{
+    SimDecPageCacheEntry *ce;
+    if (!cache) {
+        return NULL;
+    }
+    ce = g_hash_table_lookup(cache->pages, &page_index);
+    if (ce) {
+        ce->last_used = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        QTAILQ_REMOVE(&cache->lru_list, ce, lru_next);
+        QTAILQ_INSERT_HEAD(&cache->lru_list, ce, lru_next);
+    }
+    return ce;
+}
+
+static void sim_dec_page_cache_invalidate_all(SimDecPageCache *cache)
+{
+    SimDecPageCacheEntry *ce, *tmp;
+    if (!cache) {
+        return;
+    }
+    QTAILQ_FOREACH_SAFE(ce, &cache->lru_list, lru_next, tmp) {
+        QTAILQ_REMOVE(&cache->lru_list, ce, lru_next);
+        g_free(ce->page_buf);
+        g_free(ce);
+    }
+    g_hash_table_remove_all(cache->pages);
+    if (g_sim_decoder) {
+        g_sim_decoder->page_cache_global_pages -= cache->cur_pages;
+    }
+    cache->cur_pages = 0;
+}
+
+static void sim_dec_page_cache_invalidate_range(SimDecPageCache *cache,
+                                                uint64_t start_page,
+                                                uint64_t end_page)
+{
+    uint64_t idx;
+    SimDecPageCacheEntry *ce;
+    if (!cache) {
+        return;
+    }
+    for (idx = start_page; idx < end_page; idx++) {
+        ce = g_hash_table_lookup(cache->pages, &idx);
+        if (ce) {
+            QTAILQ_REMOVE(&cache->lru_list, ce, lru_next);
+            g_hash_table_remove(cache->pages, &idx);
+            g_free(ce->page_buf);
+            g_free(ce);
+            cache->cur_pages--;
+            if (g_sim_decoder) {
+                g_sim_decoder->page_cache_global_pages--;
+            }
+        }
+    }
+}
+
+static int sim_dec_send_batch_writes(BusControllerDev *ubc_dev, uint32_t dcna,
+                                       uint32_t token_id,
+                                       SimDecBatchWriteOp *ops,
+                                       uint8_t **datas,
+                                       uint32_t op_count,
+                                       uint32_t barrier_epoch);
+
+static int sim_dec_page_cache_flush_dirty(SimDecMapEntry *entry)
+{
+    SimDecPageCache *cache = entry->page_cache;
+    SimDecPageCacheEntry *ce;
+    MemTxResult ret;
+    int rc = 0;
+    bool use_batch = false;
+
+    if (!cache || cache->max_pages == 0) {
+        return 0;
+    }
+
+    /* Batch dirty writes when write-back mode is enabled */
+    if (g_sim_decoder && g_sim_decoder->write_mode == SIM_DEC_WRITE_BACK) {
+        use_batch = true;
+    }
+
+    qemu_mutex_lock(&cache->lock);
+
+    if (use_batch) {
+        SimDecBatchWriteOp batch_ops[SIM_DEC_BATCH_MAX_OPS];
+        uint8_t *batch_datas[SIM_DEC_BATCH_MAX_OPS];
+        uint32_t batch_count = 0;
+        uint32_t batch_data = 0;
+
+        QTAILQ_FOREACH(ce, &cache->lru_list, lru_next) {
+            if (!ce->dirty) {
+                continue;
+            }
+            batch_ops[batch_count].remote_uba = entry->remote_uba +
+                                                ce->page_index * SIM_DEC_PAGE_SIZE +
+                                                ce->dirty_off;
+            batch_ops[batch_count].data_len = (uint32_t)ce->dirty_len;
+            batch_datas[batch_count] = ce->page_buf + ce->dirty_off;
+            batch_count++;
+            batch_data += (uint32_t)ce->dirty_len;
+
+            if (batch_count >= SIM_DEC_BATCH_MAX_OPS ||
+                batch_data >= SIM_DEC_BATCH_MAX_DATA) {
+                if (sim_dec_send_batch_writes(g_sim_decoder->bcs->ubc_dev,
+                                               entry->dcna, entry->token_id,
+                                               batch_ops, batch_datas,
+                                               batch_count,
+                                               entry->next_batch_seqno++) != 0) {
+                    rc = -1;
+                }
+                batch_count = 0;
+                batch_data = 0;
+            }
+        }
+
+        if (batch_count > 0) {
+            if (sim_dec_send_batch_writes(g_sim_decoder->bcs->ubc_dev,
+                                           entry->dcna, entry->token_id,
+                                           batch_ops, batch_datas,
+                                           batch_count,
+                                           entry->next_batch_seqno++) != 0) {
+                rc = -1;
+            }
+        }
+
+        /* Clear dirty flags after batch attempt */
+        QTAILQ_FOREACH(ce, &cache->lru_list, lru_next) {
+            if (ce->dirty) {
+                ce->dirty = false;
+                ce->dirty_off = 0;
+                ce->dirty_len = 0;
+            }
+        }
+    } else {
+        QTAILQ_FOREACH(ce, &cache->lru_list, lru_next) {
+            if (!ce->dirty) {
+                continue;
+            }
+            ret = ubc_sim_dec_remote_write(g_sim_decoder->bcs->ubc_dev,
+                                           entry->remote_uba + ce->page_index * SIM_DEC_PAGE_SIZE + ce->dirty_off,
+                                           entry->token_id, entry->dcna,
+                                           ce->page_buf + ce->dirty_off,
+                                           (uint32_t)ce->dirty_len);
+            if (ret != MEMTX_OK) {
+                qemu_log("SIM_DEC: flush dirty failed map=%" PRIx64 " page=%" PRIx64
+                         " off=%" PRIx64 " len=%" PRIx64 " ret=%d\n",
+                         entry->map_id, ce->page_index, ce->dirty_off, ce->dirty_len, ret);
+                rc = -1;
+            } else {
+                ce->dirty = false;
+                ce->dirty_off = 0;
+                ce->dirty_len = 0;
+            }
+        }
+    }
+
+    qemu_mutex_unlock(&cache->lock);
+    return rc;
+}
+
+static MemTxResult sim_dec_page_cache_fetch(SimDecMapEntry *entry,
+                                            uint64_t page_index,
+                                            uint8_t *buf)
+{
+    uint64_t remote_uba = entry->remote_uba + page_index * SIM_DEC_PAGE_SIZE;
+    uint32_t fetch_len = SIM_DEC_PAGE_SIZE;
+    MemTxResult ret;
+
+    /* Clamp to map boundary */
+    if (remote_uba + fetch_len > entry->remote_uba + entry->size) {
+        fetch_len = (uint32_t)(entry->remote_uba + entry->size - remote_uba);
+    }
+
+    ret = ubc_sim_dec_remote_read(g_sim_decoder->bcs->ubc_dev,
+                                  remote_uba, entry->token_id, entry->dcna,
+                                  buf, fetch_len);
+    if (ret != MEMTX_OK) {
+        return ret;
+    }
+    /* Zero-fill partial page past end of map */
+    if (fetch_len < SIM_DEC_PAGE_SIZE) {
+        memset(buf + fetch_len, 0, SIM_DEC_PAGE_SIZE - fetch_len);
+    }
+    return MEMTX_OK;
+}
+
+static void sim_dec_page_cache_prefetch_next(SimDecMapEntry *entry,
+                                             uint64_t page_index)
+{
+    uint64_t next_page = page_index + 1;
+    uint64_t next_off = next_page * SIM_DEC_PAGE_SIZE;
+    uint8_t page_buf[SIM_DEC_PAGE_SIZE];
+    SimDecPageCacheEntry *ce;
+    MemTxResult ret;
+
+    if (!g_sim_decoder || !g_sim_decoder->page_cache_prefetch ||
+        !entry || !entry->page_cache || entry->page_cache->max_pages == 0 ||
+        next_off >= entry->size) {
+        return;
+    }
+
+    qemu_mutex_lock(&entry->page_cache->lock);
+    ce = sim_dec_page_cache_lookup(entry->page_cache, next_page);
+    if (ce) {
+        qemu_mutex_unlock(&entry->page_cache->lock);
+        g_sim_decoder->stats.page_cache_prefetch_skips++;
+        return;
+    }
+    qemu_mutex_unlock(&entry->page_cache->lock);
+
+    ret = sim_dec_page_cache_fetch(entry, next_page, page_buf);
+    if (ret != MEMTX_OK) {
+        return;
+    }
+
+    qemu_mutex_lock(&entry->page_cache->lock);
+    ce = sim_dec_page_cache_lookup(entry->page_cache, next_page);
+    if (!ce) {
+        sim_dec_page_cache_insert(entry->page_cache, next_page, page_buf);
+        g_sim_decoder->stats.page_cache_prefetches++;
+    } else {
+        g_sim_decoder->stats.page_cache_prefetch_skips++;
+    }
+    qemu_mutex_unlock(&entry->page_cache->lock);
+}
+
 static uint64_t sim_dec_cpu_window_read(void *opaque, hwaddr addr,
                                         unsigned size)
 {
@@ -292,6 +725,10 @@ static uint64_t sim_dec_cpu_window_read(void *opaque, hwaddr addr,
     uint8_t buf[8] = { 0 };
     uint64_t remote_uba;
     MemTxResult ret;
+    int size_idx;
+    uint64_t page_index;
+    uint64_t page_off;
+    SimDecPageCacheEntry *ce;
 
     if (!entry || !entry->active || size > sizeof(buf) || addr + size > entry->size) {
         qemu_log("SIM_DEC: cpu read invalid addr=%#" PRIx64 " size=%u map=%" PRIx64 "\n",
@@ -299,13 +736,52 @@ static uint64_t sim_dec_cpu_window_read(void *opaque, hwaddr addr,
         return 0;
     }
 
+    size_idx = (size == 1) ? 0 : (size == 2) ? 1 : (size == 4) ? 2 : 3;
+    g_sim_decoder->stats.cpu_window_reads++;
+    g_sim_decoder->stats.cpu_window_read_bytes[size_idx] += size;
+
     remote_uba = entry->remote_uba + addr;
     if (entry->sync_shadow &&
         addr >= entry->sync_valid_off &&
         addr + size <= entry->sync_valid_off + entry->sync_valid_len) {
         memcpy(buf, entry->sync_shadow + addr, size);
+        g_sim_decoder->stats.shadow_hits++;
         goto done;
     }
+
+    /* Page cache lookup */
+    if (entry->page_cache && entry->page_cache->max_pages > 0) {
+        page_index = addr / SIM_DEC_PAGE_SIZE;
+        page_off = addr % SIM_DEC_PAGE_SIZE;
+        qemu_mutex_lock(&entry->page_cache->lock);
+        ce = sim_dec_page_cache_lookup(entry->page_cache, page_index);
+        if (ce) {
+            memcpy(buf, ce->page_buf + page_off, size);
+            qemu_mutex_unlock(&entry->page_cache->lock);
+            g_sim_decoder->stats.page_cache_hits++;
+            sim_dec_page_cache_prefetch_next(entry, page_index);
+            goto done;
+        }
+        qemu_mutex_unlock(&entry->page_cache->lock);
+        g_sim_decoder->stats.page_cache_misses++;
+        /*
+         * Fill the cache page and satisfy this read from that page.  This
+         * avoids the old miss path's scalar remote read followed by a second
+         * full-page fetch for the same page.
+         */
+        uint8_t page_buf[SIM_DEC_PAGE_SIZE];
+        ret = sim_dec_page_cache_fetch(entry, page_index, page_buf);
+        if (ret == MEMTX_OK) {
+            memcpy(buf, page_buf + page_off, size);
+            qemu_mutex_lock(&entry->page_cache->lock);
+            sim_dec_page_cache_insert(entry->page_cache, page_index, page_buf);
+            qemu_mutex_unlock(&entry->page_cache->lock);
+            sim_dec_page_cache_prefetch_next(entry, page_index);
+            goto done;
+        }
+    }
+
+    g_sim_decoder->stats.shadow_misses++;
     ret = ubc_sim_dec_remote_read(g_sim_decoder->bcs->ubc_dev, remote_uba,
                                   entry->token_id, entry->dcna, buf, size);
     if (ret != MEMTX_OK) {
@@ -318,6 +794,7 @@ static uint64_t sim_dec_cpu_window_read(void *opaque, hwaddr addr,
                      " remote_uba=%#" PRIx64 " size=%u ret=%d\n",
                      entry->map_id, remote_uba, size, ret);
         }
+        g_sim_decoder->stats.read_errors++;
         return 0;
     }
 
@@ -343,12 +820,18 @@ static void sim_dec_cpu_window_write(void *opaque, hwaddr addr,
     uint8_t buf[8] = { 0 };
     uint64_t remote_uba;
     MemTxResult ret;
+    int size_idx;
+    bool write_through = true;
 
     if (!entry || !entry->active || size > sizeof(buf) || addr + size > entry->size) {
         qemu_log("SIM_DEC: cpu write invalid addr=%#" PRIx64 " size=%u map=%" PRIx64 "\n",
                  (uint64_t)addr, size, entry ? entry->map_id : 0);
         return;
     }
+
+    size_idx = (size == 1) ? 0 : (size == 2) ? 1 : (size == 4) ? 2 : 3;
+    g_sim_decoder->stats.cpu_window_writes++;
+    g_sim_decoder->stats.cpu_window_write_bytes[size_idx] += size;
 
     switch (size) {
     case 1:
@@ -367,13 +850,55 @@ static void sim_dec_cpu_window_write(void *opaque, hwaddr addr,
         return;
     }
 
-    remote_uba = entry->remote_uba + addr;
-    ret = ubc_sim_dec_remote_write(g_sim_decoder->bcs->ubc_dev, remote_uba,
-                                   entry->token_id, entry->dcna, buf, size);
-    if (ret != MEMTX_OK) {
-        qemu_log("SIM_DEC: cpu write failed map=%" PRIx64 " remote_uba=%#" PRIx64
-                 " size=%u ret=%d\n",
-                 entry->map_id, remote_uba, size, ret);
+    /* Write-back path: update local page cache and mark dirty */
+    if (g_sim_decoder->write_mode == SIM_DEC_WRITE_BACK &&
+        entry->page_cache && entry->page_cache->max_pages > 0) {
+        uint64_t page_index = addr / SIM_DEC_PAGE_SIZE;
+        uint64_t page_off = addr % SIM_DEC_PAGE_SIZE;
+        SimDecPageCacheEntry *ce;
+
+        qemu_mutex_lock(&entry->page_cache->lock);
+        ce = sim_dec_page_cache_lookup(entry->page_cache, page_index);
+        if (!ce) {
+            uint8_t page_buf[SIM_DEC_PAGE_SIZE];
+            qemu_mutex_unlock(&entry->page_cache->lock);
+            /* Fetch page for write-back cache (read-before-write for partial page) */
+            ret = sim_dec_page_cache_fetch(entry, page_index, page_buf);
+            if (ret == MEMTX_OK) {
+                qemu_mutex_lock(&entry->page_cache->lock);
+                sim_dec_page_cache_insert(entry->page_cache, page_index, page_buf);
+                ce = sim_dec_page_cache_lookup(entry->page_cache, page_index);
+            }
+        }
+        if (ce) {
+            memcpy(ce->page_buf + page_off, buf, size);
+            if (!ce->dirty) {
+                ce->dirty = true;
+                ce->dirty_off = page_off;
+                ce->dirty_len = size;
+            } else {
+                uint64_t dstart = MIN(ce->dirty_off, page_off);
+                uint64_t dend = MAX(ce->dirty_off + ce->dirty_len, page_off + size);
+                ce->dirty_off = dstart;
+                ce->dirty_len = dend - dstart;
+            }
+            qemu_mutex_unlock(&entry->page_cache->lock);
+            write_through = false;
+        } else if (entry->page_cache) {
+            qemu_mutex_unlock(&entry->page_cache->lock);
+        }
+    }
+
+    if (write_through) {
+        remote_uba = entry->remote_uba + addr;
+        ret = ubc_sim_dec_remote_write(g_sim_decoder->bcs->ubc_dev, remote_uba,
+                                       entry->token_id, entry->dcna, buf, size);
+        if (ret != MEMTX_OK) {
+            qemu_log("SIM_DEC: cpu write failed map=%" PRIx64 " remote_uba=%#" PRIx64
+                     " size=%u ret=%d\n",
+                     entry->map_id, remote_uba, size, ret);
+            g_sim_decoder->stats.write_errors++;
+        }
     }
 }
 
@@ -586,6 +1111,7 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define UBC_SIM_DEC_READ_CHUNK_MAX \
     (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)sizeof(UBCSimDecReadRespPldHdr))
 #define UBC_SIM_DEC_READ_WAIT_USEC  1000
+#define UBC_SIM_DEC_SHM_READ_WAIT_USEC 50
 #define UBC_SIM_DEC_READ_WAIT_LOOPS 30000
 
 /* Doorbell/MMIO region constants (matches UAPI) */
@@ -1255,6 +1781,10 @@ static MemTxResult ubc_dma_read_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
         sim_dec_lookup_by_pa((uint64_t)iova, &remote_uba, &map_token_id,
                              NULL, &map_dcna) == 0) {
         uint32_t eff_token_id = map_token_id ? map_token_id : tid;
+        if (g_sim_decoder) {
+            g_sim_decoder->stats.dma_path_reads++;
+            g_sim_decoder->stats.dma_path_read_bytes += len;
+        }
         return ubc_sim_dec_remote_read(ubc_dev, remote_uba, eff_token_id,
                                        map_dcna, (uint8_t *)buf, (uint32_t)len);
     }
@@ -1336,6 +1866,10 @@ static MemTxResult ubc_dma_write_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
         sim_dec_lookup_by_pa((uint64_t)iova, &remote_uba, &map_token_id,
                              NULL, &map_dcna) == 0) {
         uint32_t eff_token_id = map_token_id ? map_token_id : tid;
+        if (g_sim_decoder) {
+            g_sim_decoder->stats.dma_path_writes++;
+            g_sim_decoder->stats.dma_path_write_bytes += len;
+        }
         return ubc_sim_dec_remote_write(ubc_dev, remote_uba, eff_token_id,
                                         map_dcna, (const uint8_t *)buf,
                                         (uint32_t)len);
@@ -4197,11 +4731,17 @@ static UBLinkState *ubc_find_active_link(BusControllerDev *ubc_dev, uint32_t *dc
     if (!fm_link || !fm_link->runtime) {
         return NULL;
     }
-    if (!fm_link->runtime->link_up || !fm_link->runtime->ioc) {
+    if (!fm_link->runtime->link_up ||
+        (!fm_link->runtime->ioc && !fm_link->runtime->shmem_ready)) {
         return NULL;
     }
 
     return fm_link->runtime;
+}
+
+static bool ubc_link_has_transport(const UBLinkState *link)
+{
+    return link && link->link_up && (link->ioc || link->shmem_ready);
 }
 
 static void ubc_sim_dec_process_wait_links(BusControllerState *bcs,
@@ -4293,6 +4833,68 @@ static int ubc_send_msg_over_link(BusControllerDev *ubc_dev, UBLinkState *link,
     }
     g_free(pkt);
     return rc;
+}
+
+static int sim_dec_send_batch_writes(BusControllerDev *ubc_dev, uint32_t dcna,
+                                       uint32_t token_id,
+                                       SimDecBatchWriteOp *ops,
+                                       uint8_t **datas,
+                                       uint32_t op_count,
+                                       uint32_t barrier_epoch)
+{
+    UBLinkState *link;
+    size_t payload_len;
+    size_t data_offset;
+    uint8_t *payload;
+    SimDecBatchHdr *hdr;
+    SimDecBatchWriteOp *out_ops;
+    uint32_t i;
+    size_t cur_data_off;
+    int rc;
+
+    if (!ubc_dev || op_count == 0 || dcna == 0) {
+        return -1;
+    }
+
+    link = ubc_find_active_link(ubc_dev, &dcna);
+    if (!link) {
+        qemu_log("ubc sim_dec batch: no active link\n");
+        return -1;
+    }
+
+    payload_len = sizeof(SimDecBatchHdr) + sizeof(SimDecBatchWriteOp) * op_count;
+    data_offset = payload_len;
+    for (i = 0; i < op_count; i++) {
+        payload_len += ops[i].data_len;
+    }
+
+    payload = g_malloc0(payload_len);
+    hdr = (SimDecBatchHdr *)payload;
+    hdr->version = 1;
+    hdr->op_count = (uint8_t)op_count;
+    hdr->flags = 0;
+    hdr->barrier_epoch = barrier_epoch;
+
+    out_ops = (SimDecBatchWriteOp *)(payload + sizeof(SimDecBatchHdr));
+    cur_data_off = data_offset;
+    for (i = 0; i < op_count; i++) {
+        out_ops[i].remote_uba = ops[i].remote_uba;
+        out_ops[i].token_id = token_id;
+        out_ops[i].data_len = ops[i].data_len;
+        memcpy(payload + cur_data_off, datas[i], ops[i].data_len);
+        cur_data_off += ops[i].data_len;
+    }
+
+    rc = ubc_send_msg_over_link(ubc_dev, link, dcna,
+                                UBC_MSG_SUB_SIM_DEC_BATCH,
+                                payload, payload_len);
+    if (rc >= 0 && g_sim_decoder) {
+        g_sim_decoder->stats.batch_frames++;
+        g_sim_decoder->stats.batch_ops += op_count;
+        g_sim_decoder->stats.batch_bytes += payload_len;
+    }
+    g_free(payload);
+    return rc < 0 ? -1 : 0;
 }
 
 static MemTxResult ubc_dma_read_local_data_tid_strict(BusControllerDev *ubc_dev,
@@ -4522,6 +5124,10 @@ static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
         done += chunk;
     }
 
+    if (g_sim_decoder) {
+        g_sim_decoder->stats.remote_writes++;
+        g_sim_decoder->stats.remote_write_bytes += len;
+    }
     return MEMTX_OK;
 }
 
@@ -4601,7 +5207,8 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
             if (!ubc_dev->sim_dec_sync_read.pending) {
                 break;
             }
-            g_usleep(UBC_SIM_DEC_READ_WAIT_USEC);
+            g_usleep(link->shmem_ready ? UBC_SIM_DEC_SHM_READ_WAIT_USEC :
+                                         UBC_SIM_DEC_READ_WAIT_USEC);
         }
 
         if (ubc_dev->sim_dec_sync_read.pending) {
@@ -4613,6 +5220,9 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
                      ubc_dev->sim_dec_sync_read.status,
                      ubc_dev->sim_dec_sync_read.actual_len,
                      ubc_dev->sim_dec_sync_read.expect_len);
+            if (g_sim_decoder) {
+                g_sim_decoder->stats.read_timeouts++;
+            }
             ubc_dev->sim_dec_sync_read.pending = false;
             ubc_dev->sim_dec_sync_read.peer_cna = 0;
             return MEMTX_DECODE_ERROR;
@@ -4627,6 +5237,10 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
         done += chunk;
     }
 
+    if (g_sim_decoder) {
+        g_sim_decoder->stats.remote_reads++;
+        g_sim_decoder->stats.remote_read_bytes += len;
+    }
     return MEMTX_OK;
 }
 
@@ -4694,7 +5308,7 @@ static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState 
         }
 
         link = fm_link->runtime;
-        if (!link || !link->link_up || !link->ioc) {
+        if (!ubc_link_has_transport(link)) {
             if (ubc_trace_data_path_enabled()) {
                 qemu_log("ubc SEND: link not up or no ioc, skipping send\n");
             }
@@ -4772,7 +5386,7 @@ static void ubc_send_data_to_remote_ex(BusControllerDev *ubc_dev, UBCJettyState 
                     continue;
                 }
                 fanout_link = fanout_fm_link->runtime;
-                if (!fanout_link->link_up || !fanout_link->ioc) {
+                if (!ubc_link_has_transport(fanout_link)) {
                     continue;
                 }
 
@@ -4888,7 +5502,7 @@ static void ubc_send_read_request(BusControllerDev *ubc_dev, UBCJettyState *js,
     }
 
     link = fm_link->runtime;
-    if (!link || !link->link_up || !link->ioc) {
+    if (!ubc_link_has_transport(link)) {
         qemu_log("ubc READ_REQ: link not up\n");
         return;
     }
@@ -4965,7 +5579,7 @@ void ubc_handle_read_request(BusControllerDev *ubc_dev,
     }
 
     link = fm_link->runtime;
-    if (!link || !link->link_up || !link->ioc) {
+    if (!ubc_link_has_transport(link)) {
         qemu_log("ubc READ_RESP: link not up\n");
         return;
     }
@@ -6980,6 +7594,8 @@ static const TypeInfo ub_bus_controller_dev_type_info = {
 
 static void sim_dec_init(BusControllerState *bcs)
 {
+    const char *env;
+
     g_sim_decoder = g_malloc0(sizeof(*g_sim_decoder));
     g_sim_decoder->bcs = bcs;
     g_sim_decoder->next_map_id = 1;
@@ -6988,7 +7604,34 @@ static void sim_dec_init(BusControllerState *bcs)
     qemu_mutex_init(&g_sim_decoder->lock);
     g_sim_decoder->enabled = true;
 
-    qemu_log("SIM_DEC: decoder simulation initialized\n");
+    g_sim_decoder->page_cache_max_per_map = SIM_DEC_CACHE_MAX_PER_MAP;
+    env = g_getenv("SIM_DEC_PAGE_CACHE_PER_MAP");
+    if (env) {
+        g_sim_decoder->page_cache_max_per_map = g_ascii_strtoull(env, NULL, 0);
+    }
+
+    g_sim_decoder->page_cache_max_global = SIM_DEC_CACHE_MAX_GLOBAL;
+    env = g_getenv("SIM_DEC_PAGE_CACHE_GLOBAL");
+    if (env) {
+        g_sim_decoder->page_cache_max_global = g_ascii_strtoull(env, NULL, 0);
+    }
+
+    env = g_getenv("SIM_DEC_PREFETCH");
+    g_sim_decoder->page_cache_prefetch = env && env[0] && strcmp(env, "0") != 0;
+
+    g_sim_decoder->write_mode = SIM_DEC_WRITE_THROUGH;
+    env = g_getenv("SIM_DEC_WRITE_MODE");
+    if (env && strcmp(env, "write-back") == 0) {
+        g_sim_decoder->write_mode = SIM_DEC_WRITE_BACK;
+    }
+
+    atexit(sim_dec_print_global_stats);
+    qemu_log("SIM_DEC: decoder simulation initialized cache_per_map=%" PRIu64
+             " cache_global=%" PRIu64 " prefetch=%d write_mode=%s\n",
+             g_sim_decoder->page_cache_max_per_map,
+             g_sim_decoder->page_cache_max_global,
+             g_sim_decoder->page_cache_prefetch,
+             g_sim_decoder->write_mode == SIM_DEC_WRITE_BACK ? "write-back" : "write-through");
 }
 
 static void sim_dec_map_entry_destroy(SimDecMapEntry *entry)
@@ -6999,6 +7642,8 @@ static void sim_dec_map_entry_destroy(SimDecMapEntry *entry)
     }
     object_unparent(OBJECT(&entry->cpu_window));
     g_free(entry->sync_shadow);
+    sim_dec_page_cache_free(entry->page_cache);
+    entry->page_cache = NULL;
     g_free(entry);
 }
 
@@ -7008,6 +7653,8 @@ static void sim_dec_cleanup(void)
 
     if (!g_sim_decoder)
         return;
+
+    sim_dec_print_global_stats();
 
     qemu_mutex_lock(&g_sim_decoder->lock);
     QTAILQ_FOREACH_SAFE(entry, &g_sim_decoder->map_list, next, tmp) {
@@ -7121,6 +7768,9 @@ static int sim_dec_handle_map(const SimDecMapReq *req, SimDecMapResp *resp)
     entry->sync_shadow = g_malloc0(entry->size);
     entry->sync_valid_off = 0;
     entry->sync_valid_len = 0;
+    if (g_sim_decoder->page_cache_max_per_map > 0) {
+        entry->page_cache = sim_dec_page_cache_new(g_sim_decoder->page_cache_max_per_map);
+    }
 
     memory_region_init_io(&entry->cpu_window, OBJECT(DEVICE(g_sim_decoder->bcs->ubc_dev)),
                           &sim_dec_cpu_window_ops, entry, "ub-sim-decoder-cpu",
@@ -7155,6 +7805,11 @@ static int sim_dec_handle_unmap(const SimDecUnmapReq *req)
         qemu_log("SIM_DEC: UNMAP failed - map_id %" PRIx64 " not found\n",
                  req->map_id);
         return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+
+    /* Flush dirty pages before unmapping */
+    if (entry->page_cache) {
+        sim_dec_page_cache_flush_dirty(entry);
     }
 
     entry->active = false;
@@ -7209,6 +7864,19 @@ static int sim_dec_handle_sync(const SimDecSyncReq *req)
     remote_uba = entry->remote_uba;
     offset = req->offset;
     len = req->len;
+
+    /* Flush dirty write-back cache before sync read */
+    if (entry->page_cache) {
+        if (sim_dec_page_cache_flush_dirty(entry) != 0) {
+            qemu_mutex_unlock(&g_sim_decoder->lock);
+            return SIM_DEC_STATUS_BACKEND_ERROR;
+        }
+        uint64_t start_page = offset / SIM_DEC_PAGE_SIZE;
+        uint64_t end_page = (offset + len + SIM_DEC_PAGE_SIZE - 1) / SIM_DEC_PAGE_SIZE;
+        qemu_mutex_lock(&entry->page_cache->lock);
+        sim_dec_page_cache_invalidate_range(entry->page_cache, start_page, end_page);
+        qemu_mutex_unlock(&entry->page_cache->lock);
+    }
 
     qemu_mutex_unlock(&g_sim_decoder->lock);
 

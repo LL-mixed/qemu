@@ -38,7 +38,7 @@ static QEMUTimer *ub_fm_rx_poll_timer;
 static bool ub_fm_rx_poll_active;
 
 #define UB_FM_REMOTE_LINK_RETRY_MS 2000  /* fast retry for remote endpoint .ini */
-#define UB_FM_RX_POLL_MS 10              /* poll connected sockets for incoming data */
+#define UB_FM_RX_POLL_MS 10              /* fallback poll; shmem uses FIFO fd notification */
 
 /* Entity plan dynamic refresh support */
 static QEMUTimer *ub_fm_entity_plan_refresh_timer;
@@ -93,6 +93,12 @@ static void ub_fm_link_arm_aio_rx(UBLinkState *runtime)
                                    NULL,
                                    NULL,
                                    runtime);
+}
+
+static bool ub_fm_link_has_transport(const UBLinkState *runtime)
+{
+    return runtime && runtime->link_up &&
+           (runtime->ioc || runtime->shmem_ready);
 }
 
 static uint8_t ub_fm_node_ip_suffix_from_device_id(const char *device_id)
@@ -870,7 +876,7 @@ static void ub_fm_pending_refresh_cb(void *opaque)
     if (ub_fm_active_links) {
         for (gsize li = 0; li < ub_fm_active_links->len; li++) {
             UBFMManagedLink *ml = g_ptr_array_index(ub_fm_active_links, li);
-            if (ml->runtime && ml->runtime->ioc) {
+            if (ub_fm_link_has_transport(ml->runtime)) {
                 ub_fm_rx_poll_start();
                 break;
             }
@@ -940,7 +946,8 @@ static void ub_fm_remote_link_retry_cb(void *opaque)
             guint j;
             for (j = 0; j < ub_fm_active_links->len; j++) {
                 UBFMManagedLink *lk = g_ptr_array_index(ub_fm_active_links, j);
-                if (lk->runtime && lk->runtime->ioc) {
+                if (lk->runtime &&
+                    (lk->runtime->ioc || lk->runtime->shmem_ready)) {
                     ub_fm_rx_poll_start();
                     break;
                 }
@@ -983,7 +990,8 @@ void ub_fm_poll_rx_links_now(void)
         UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
         UBDevice *dev = NULL;
 
-        if (!link->runtime || !link->runtime->ioc) {
+        if (!link->runtime ||
+            (!link->runtime->ioc && !link->runtime->shmem_ready)) {
             continue;
         }
 
@@ -1027,7 +1035,6 @@ static void ub_fm_rx_poll_start(void)
     }
     timer_mod(ub_fm_rx_poll_timer,
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + UB_FM_RX_POLL_MS);
-    fprintf(stderr, "ub_fm: rx_poll_start scheduled\n"); fflush(stderr);
 }
 
 static void ub_fm_schedule_pending_refresh(bool needed)
@@ -1499,7 +1506,7 @@ int ub_fm_apply_declared_topology(Error **errp)
     if (ub_fm_active_links) {
         for (i = 0; i < ub_fm_active_links->len; i++) {
             UBFMManagedLink *link = g_ptr_array_index(ub_fm_active_links, i);
-            if (link->runtime && link->runtime->ioc) {
+            if (ub_fm_link_has_transport(link->runtime)) {
                 ub_fm_rx_poll_start();
                 break;
             }
@@ -1529,7 +1536,7 @@ int ub_fm_kick_by_cna(uint32_t dcna, Error **errp)
         if (!runtime) {
             continue;
         }
-        if (!fallback && runtime->link_up && runtime->ioc) {
+        if (!fallback && ub_fm_link_has_transport(runtime)) {
             fallback = link;
         }
 
@@ -1591,7 +1598,7 @@ UBFMManagedLink *ub_fm_find_link_by_cna(uint32_t dcna)
         if (!runtime) {
             continue;
         }
-        if (!fallback && runtime->link_up && runtime->ioc) {
+        if (!fallback && ub_fm_link_has_transport(runtime)) {
             fallback = link;
         }
 
@@ -1670,7 +1677,7 @@ UBFMManagedLink *ub_fm_find_link_for_device_cna(UBDevice *local_dev,
         int e;
 
         runtime = link->runtime;
-        if (!runtime || !runtime->link_up || !runtime->ioc) {
+        if (!ub_fm_link_has_transport(runtime)) {
             continue;
         }
 

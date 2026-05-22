@@ -854,6 +854,35 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
                 g_free(buf);
                 continue;
             }
+            case UBC_MSG_SUB_SIM_DEC_BATCH: {
+                if (payload_len >= sizeof(SimDecBatchHdr)) {
+                    const SimDecBatchHdr *batch_hdr = (const SimDecBatchHdr *)payload;
+                    const uint8_t *data_base = payload + sizeof(SimDecBatchHdr) +
+                                               sizeof(SimDecBatchWriteOp) * batch_hdr->op_count;
+                    uint32_t i;
+
+                    if (batch_hdr->version == 1 && batch_hdr->op_count > 0) {
+                        for (i = 0; i < batch_hdr->op_count; i++) {
+                            const SimDecBatchWriteOp *op =
+                                (const SimDecBatchWriteOp *)(payload + sizeof(SimDecBatchHdr) +
+                                                              sizeof(SimDecBatchWriteOp) * i);
+                            UBCSimDecWritePldHdr wr_hdr = {
+                                .remote_uba = op->remote_uba,
+                                .token_id = op->token_id,
+                                .data_len = op->data_len,
+                            };
+                            const uint8_t *wr_data = data_base;
+                            uint32_t wr_len = op->data_len;
+
+                            ubc_handle_sim_dec_rx_write(s->ubc_dev, &wr_hdr,
+                                                        wr_data, wr_len);
+                            data_base += op->data_len;
+                        }
+                    }
+                }
+                g_free(buf);
+                continue;
+            }
             default:
                 break;
             }
