@@ -240,6 +240,7 @@ typedef struct QEMU_PACKED SimDecObmmBootstrapLookupResp {
 #define LINGQU_OBMM_OBJECT_REF_MAGIC 0x514f424d4d524546ULL
 #define LINGQU_OBJECT_STATE_COMMITTED_WIRE 2
 #define QWEN3_OBMM_KIND_HIDDEN_RANGE_RUNTIME_OUTPUT 5
+#define QWEN3_OBMM_KIND_QWEN3_TOKEN_RESULT 6
 #define QWEN3_OBMM_KIND_QWEN3_KV_STATE 7
 #define OBMM_POOL_HEADER_BYTES 64
 #define OBMM_REGION_DIRENT_BYTES 32
@@ -8263,6 +8264,7 @@ static bool linqu_uapi_object_ref_is_qwen3_runtime_payload(
         return false;
     }
     return object_ref->object_kind == QWEN3_OBMM_KIND_HIDDEN_RANGE_RUNTIME_OUTPUT ||
+           object_ref->object_kind == QWEN3_OBMM_KIND_QWEN3_TOKEN_RESULT ||
            object_ref->object_kind == QWEN3_OBMM_KIND_QWEN3_KV_STATE;
 }
 
