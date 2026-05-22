@@ -235,7 +235,7 @@ typedef struct QEMU_PACKED SimDecObmmBootstrapLookupResp {
 /* Decoder map entry for simulation backend */
 /* Page cache for SIM_DEC imported-PA CPU window reads */
 #define SIM_DEC_PAGE_SIZE           4096
-#define SIM_DEC_CACHE_MAX_PER_MAP   1024
+#define SIM_DEC_CACHE_MAX_PER_MAP   0
 #define SIM_DEC_CACHE_MAX_GLOBAL    8192
 
 typedef struct SimDecPageCacheEntry {
@@ -617,12 +617,13 @@ static int sim_dec_page_cache_flush_dirty(SimDecMapEntry *entry)
             }
         }
 
-        /* Clear dirty flags after batch attempt */
-        QTAILQ_FOREACH(ce, &cache->lru_list, lru_next) {
-            if (ce->dirty) {
-                ce->dirty = false;
-                ce->dirty_off = 0;
-                ce->dirty_len = 0;
+        if (rc == 0) {
+            QTAILQ_FOREACH(ce, &cache->lru_list, lru_next) {
+                if (ce->dirty) {
+                    ce->dirty = false;
+                    ce->dirty_off = 0;
+                    ce->dirty_len = 0;
+                }
             }
         }
     } else {
@@ -4852,7 +4853,8 @@ static int sim_dec_send_batch_writes(BusControllerDev *ubc_dev, uint32_t dcna,
     size_t cur_data_off;
     int rc;
 
-    if (!ubc_dev || op_count == 0 || dcna == 0) {
+    if (!ubc_dev || op_count == 0 || op_count > SIM_DEC_BATCH_MAX_OPS ||
+        dcna == 0) {
         return -1;
     }
 
@@ -4865,6 +4867,17 @@ static int sim_dec_send_batch_writes(BusControllerDev *ubc_dev, uint32_t dcna,
     payload_len = sizeof(SimDecBatchHdr) + sizeof(SimDecBatchWriteOp) * op_count;
     data_offset = payload_len;
     for (i = 0; i < op_count; i++) {
+        if (!datas[i] || ops[i].data_len == 0 ||
+            ops[i].data_len > SIM_DEC_BATCH_MAX_DATA ||
+            payload_len > SIZE_MAX - ops[i].data_len ||
+            payload_len + ops[i].data_len >
+                sizeof(SimDecBatchHdr) +
+                    sizeof(SimDecBatchWriteOp) * op_count +
+                    SIM_DEC_BATCH_MAX_DATA) {
+            qemu_log("ubc sim_dec batch: invalid op=%u len=%u\n",
+                     i, ops[i].data_len);
+            return -1;
+        }
         payload_len += ops[i].data_len;
     }
 
@@ -7604,6 +7617,13 @@ static void sim_dec_init(BusControllerState *bcs)
     qemu_mutex_init(&g_sim_decoder->lock);
     g_sim_decoder->enabled = true;
 
+    /*
+     * Imported OBMM mappings are dynamic shared-memory views.  The producer
+     * can update its local export pool without going through this importer's
+     * SIM_DEC CPU window, so a default importer-side read cache can return
+     * stale queue/object metadata.  Keep the cache opt-in until the mapping
+     * contract carries explicit coherency or read-only lifetime semantics.
+     */
     g_sim_decoder->page_cache_max_per_map = SIM_DEC_CACHE_MAX_PER_MAP;
     env = g_getenv("SIM_DEC_PAGE_CACHE_PER_MAP");
     if (env) {

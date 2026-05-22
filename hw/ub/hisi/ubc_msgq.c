@@ -857,11 +857,44 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
             case UBC_MSG_SUB_SIM_DEC_BATCH: {
                 if (payload_len >= sizeof(SimDecBatchHdr)) {
                     const SimDecBatchHdr *batch_hdr = (const SimDecBatchHdr *)payload;
-                    const uint8_t *data_base = payload + sizeof(SimDecBatchHdr) +
-                                               sizeof(SimDecBatchWriteOp) * batch_hdr->op_count;
+                    size_t header_len = sizeof(SimDecBatchHdr) +
+                                        sizeof(SimDecBatchWriteOp) * batch_hdr->op_count;
+                    const uint8_t *data_base = payload + header_len;
+                    const uint8_t *payload_end = payload + payload_len;
                     uint32_t i;
+                    bool valid = true;
 
-                    if (batch_hdr->version == 1 && batch_hdr->op_count > 0) {
+                    if (batch_hdr->version != 1 ||
+                        batch_hdr->op_count == 0 ||
+                        batch_hdr->op_count > SIM_DEC_BATCH_MAX_OPS ||
+                        header_len > payload_len) {
+                        qemu_log("ubc_msgq sim_dec batch invalid header version=%u ops=%u len=%zu payload=%u\n",
+                                 batch_hdr->version, batch_hdr->op_count,
+                                 header_len, payload_len);
+                        valid = false;
+                    }
+                    if (valid) {
+                        for (i = 0; i < batch_hdr->op_count; i++) {
+                            const SimDecBatchWriteOp *op =
+                                (const SimDecBatchWriteOp *)(payload + sizeof(SimDecBatchHdr) +
+                                                              sizeof(SimDecBatchWriteOp) * i);
+                            if (op->data_len == 0 ||
+                                op->data_len > SIM_DEC_BATCH_MAX_DATA ||
+                                data_base > payload_end ||
+                                (size_t)(payload_end - data_base) < op->data_len) {
+                                qemu_log("ubc_msgq sim_dec batch invalid op=%u len=%u remaining=%zu\n",
+                                         i, op->data_len,
+                                         data_base <= payload_end ?
+                                             (size_t)(payload_end - data_base) :
+                                             (size_t)0);
+                                valid = false;
+                                break;
+                            }
+                            data_base += op->data_len;
+                        }
+                    }
+                    if (valid) {
+                        data_base = payload + header_len;
                         for (i = 0; i < batch_hdr->op_count; i++) {
                             const SimDecBatchWriteOp *op =
                                 (const SimDecBatchWriteOp *)(payload + sizeof(SimDecBatchHdr) +
