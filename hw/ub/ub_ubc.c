@@ -82,6 +82,11 @@ int linqu_ub_bridge_read_segment_payload(LinquUbBridge *bridge,
                                          size_t offset,
                                          uint8_t *out,
                                          size_t out_len);
+int linqu_ub_bridge_register_qwen3_runtime_object_payload(LinquUbBridge *bridge,
+                                                          const uint8_t *object_ref,
+                                                          size_t object_ref_len,
+                                                          const uint8_t *payload,
+                                                          size_t payload_len);
 int linqu_ub_bridge_ring_doorbell(LinquUbBridge *bridge,
                                   uint16_t endpoint_id,
                                   uint32_t max_batch,
@@ -231,6 +236,54 @@ typedef struct QEMU_PACKED SimDecObmmBootstrapLookupResp {
     uint32_t rsvd;
     SimDecObmmBootstrapRecord records[SIM_DEC_OBMM_BOOTSTRAP_MAX_NODES];
 } SimDecObmmBootstrapLookupResp;
+
+#define LINGQU_OBMM_OBJECT_REF_MAGIC 0x514f424d4d524546ULL
+#define LINGQU_OBJECT_STATE_COMMITTED_WIRE 2
+#define QWEN3_OBMM_KIND_HIDDEN_RANGE_RUNTIME_OUTPUT 5
+#define QWEN3_OBMM_KIND_QWEN3_KV_STATE 7
+#define OBMM_POOL_HEADER_BYTES 64
+#define OBMM_REGION_DIRENT_BYTES 32
+#define OBMM_REGION_W4_PAYLOAD 5
+
+typedef struct QEMU_PACKED LinquObmmObjectRefWire {
+    uint64_t magic;
+    uint16_t layout_version;
+    uint16_t object_kind;
+    uint16_t state;
+    uint16_t flags;
+    uint32_t owner_entity;
+    uint32_t producer_entity;
+    uint64_t object_version;
+    uint64_t key_hash;
+    uint64_t payload_offset;
+    uint64_t payload_bytes;
+    uint64_t payload_checksum;
+} LinquObmmObjectRefWire;
+
+typedef struct QEMU_PACKED ObmmPoolHeaderWire {
+    uint64_t magic;
+    uint32_t layout_version;
+    uint16_t node_id;
+    uint16_t node_count;
+    uint32_t state;
+    uint32_t generation;
+    uint64_t region_size;
+    uint64_t directory_offset;
+    uint32_t directory_count;
+    uint32_t default_queue_depth;
+    uint32_t flags;
+    uint32_t reserved[3];
+} ObmmPoolHeaderWire;
+
+typedef struct QEMU_PACKED ObmmRegionDirentWire {
+    uint32_t region_id;
+    uint16_t kind;
+    uint16_t peer_node_id;
+    uint64_t offset;
+    uint64_t size;
+    uint32_t flags;
+    uint32_t reserved;
+} ObmmRegionDirentWire;
 
 /* Decoder map entry for simulation backend */
 /* Page cache for SIM_DEC imported-PA CPU window reads */
@@ -401,6 +454,8 @@ static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
                                            uint32_t dcna,
                                            uint8_t *buf,
                                            uint32_t len);
+static void linqu_uapi_maybe_register_qwen3_runtime_object_payload(
+    BusControllerDev *ubc_dev, uint64_t segment, uint64_t write_offset);
 static uint8_t ubc_node_ip_suffix_from_id(const char *node_id);
 static void ubc_fill_link_local_eid_hw(uint8_t eid_hw[16], uint8_t suffix);
 
@@ -4354,6 +4409,11 @@ static bool linqu_uapi_reg_write(BusControllerDev *ubc_dev, hwaddr reg,
                                                   (const uint8_t *)&value,
                                                   sizeof(value)) != 0) {
             ubc_dev->linqu_uapi_last_error = 14;
+        } else {
+            linqu_uapi_maybe_register_qwen3_runtime_object_payload(
+                ubc_dev,
+                ubc_dev->linqu_uapi_default_segment,
+                ubc_dev->linqu_uapi_segment_data_offset);
         }
         return true;
     default:
@@ -8093,6 +8153,177 @@ static bool sim_dec_obmm_bootstrap_load(uint32_t node_id, uint32_t node_count,
            record->token_id != 0 &&
            record->remote_uba != 0 &&
            record->size != 0;
+}
+
+static uint32_t linqu_uapi_cluster_node_count(void)
+{
+    const char *env = getenv("LINQU_UB_NODE_COUNT");
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!env || env[0] == '\0') {
+        return 8;
+    }
+    parsed = strtoul(env, &end, 10);
+    if (end == env || parsed == 0 || parsed > SIM_DEC_OBMM_BOOTSTRAP_MAX_NODES) {
+        return 8;
+    }
+    return (uint32_t)parsed;
+}
+
+static MemTxResult linqu_uapi_read_obmm_export(BusControllerDev *ubc_dev,
+                                                const SimDecObmmBootstrapRecord *record,
+                                                uint64_t offset,
+                                                uint8_t *buf,
+                                                uint64_t len)
+{
+    uint64_t remote_uba;
+
+    if (!ubc_dev || !record || !buf || len == 0 || len > UINT32_MAX ||
+        offset > record->size || len > record->size - offset) {
+        return MEMTX_DECODE_ERROR;
+    }
+    remote_uba = record->remote_uba + offset;
+    if (record->export_cna == ubc_dev->parent.cna) {
+        return ubc_dma_read_local_data_tid_strict(ubc_dev,
+                                                  remote_uba,
+                                                  buf,
+                                                  (size_t)len,
+                                                  ubc_tid_or_auto(record->token_id));
+    }
+    return ubc_sim_dec_remote_read(ubc_dev,
+                                   remote_uba,
+                                   record->token_id,
+                                   record->export_cna,
+                                   buf,
+                                   (uint32_t)len);
+}
+
+static bool linqu_uapi_obmm_payload_region_offset(
+    BusControllerDev *ubc_dev,
+    const SimDecObmmBootstrapRecord *record,
+    uint64_t *payload_region_offset_out)
+{
+    ObmmPoolHeaderWire header;
+    uint32_t index;
+
+    if (!payload_region_offset_out) {
+        return false;
+    }
+    *payload_region_offset_out = 0;
+    if (linqu_uapi_read_obmm_export(ubc_dev,
+                                    record,
+                                    0,
+                                    (uint8_t *)&header,
+                                    sizeof(header)) != MEMTX_OK) {
+        return false;
+    }
+    if (header.region_size == 0 ||
+        header.region_size > record->size ||
+        header.directory_offset < OBMM_POOL_HEADER_BYTES ||
+        header.directory_count == 0 ||
+        header.directory_count > 64) {
+        return false;
+    }
+    for (index = 0; index < header.directory_count; index++) {
+        ObmmRegionDirentWire dirent;
+        uint64_t dirent_offset = header.directory_offset +
+                                 (uint64_t)index * OBMM_REGION_DIRENT_BYTES;
+
+        if (dirent_offset > record->size ||
+            sizeof(dirent) > record->size - dirent_offset ||
+            linqu_uapi_read_obmm_export(ubc_dev,
+                                        record,
+                                        dirent_offset,
+                                        (uint8_t *)&dirent,
+                                        sizeof(dirent)) != MEMTX_OK) {
+            return false;
+        }
+        if (dirent.kind == OBMM_REGION_W4_PAYLOAD) {
+            if (dirent.offset == 0 ||
+                dirent.offset > record->size ||
+                dirent.size > record->size - dirent.offset) {
+                return false;
+            }
+            *payload_region_offset_out = dirent.offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool linqu_uapi_object_ref_is_qwen3_runtime_payload(
+    const LinquObmmObjectRefWire *object_ref)
+{
+    if (!object_ref ||
+        object_ref->magic != LINGQU_OBMM_OBJECT_REF_MAGIC ||
+        object_ref->state != LINGQU_OBJECT_STATE_COMMITTED_WIRE ||
+        object_ref->payload_bytes == 0 ||
+        object_ref->payload_bytes > UINT32_MAX) {
+        return false;
+    }
+    return object_ref->object_kind == QWEN3_OBMM_KIND_HIDDEN_RANGE_RUNTIME_OUTPUT ||
+           object_ref->object_kind == QWEN3_OBMM_KIND_QWEN3_KV_STATE;
+}
+
+static void linqu_uapi_maybe_register_qwen3_runtime_object_payload(
+    BusControllerDev *ubc_dev, uint64_t segment, uint64_t write_offset)
+{
+    LinquObmmObjectRefWire object_ref;
+    SimDecObmmBootstrapRecord record;
+    uint64_t object_ref_offset = write_offset & ~0x3fULL;
+    uint64_t payload_region_offset = 0;
+    uint64_t export_payload_offset;
+    uint8_t *payload;
+    uint32_t node_count;
+
+    if (!ubc_dev || !ubc_dev->linqu_uapi_bridge) {
+        return;
+    }
+    if ((write_offset & 0x3fULL) != 0x38ULL) {
+        return;
+    }
+    if (linqu_ub_bridge_read_segment_payload(ubc_dev->linqu_uapi_bridge,
+                                             segment,
+                                             object_ref_offset,
+                                             (uint8_t *)&object_ref,
+                                             sizeof(object_ref)) != 0 ||
+        !linqu_uapi_object_ref_is_qwen3_runtime_payload(&object_ref)) {
+        return;
+    }
+    node_count = linqu_uapi_cluster_node_count();
+    if (object_ref.owner_entity >= node_count ||
+        !sim_dec_obmm_bootstrap_load(object_ref.owner_entity,
+                                     node_count,
+                                     1,
+                                     &record) ||
+        !linqu_uapi_obmm_payload_region_offset(ubc_dev,
+                                               &record,
+                                               &payload_region_offset)) {
+        return;
+    }
+    if (object_ref.payload_offset > record.size ||
+        payload_region_offset > record.size ||
+        object_ref.payload_bytes > record.size - payload_region_offset ||
+        object_ref.payload_offset >
+            record.size - payload_region_offset - object_ref.payload_bytes) {
+        return;
+    }
+    export_payload_offset = payload_region_offset + object_ref.payload_offset;
+    payload = g_malloc0((gsize)object_ref.payload_bytes);
+    if (linqu_uapi_read_obmm_export(ubc_dev,
+                                    &record,
+                                    export_payload_offset,
+                                    payload,
+                                    object_ref.payload_bytes) == MEMTX_OK) {
+        (void)linqu_ub_bridge_register_qwen3_runtime_object_payload(
+            ubc_dev->linqu_uapi_bridge,
+            (const uint8_t *)&object_ref,
+            sizeof(object_ref),
+            payload,
+            (size_t)object_ref.payload_bytes);
+    }
+    g_free(payload);
 }
 
 static int sim_dec_handle_obmm_bootstrap_lookup(
