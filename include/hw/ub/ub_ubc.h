@@ -366,6 +366,14 @@ typedef struct QEMU_PACKED SimDecBatchWriteOp {
 
 /* SIM_DEC instrumentation counters */
 typedef struct SimDecStats {
+    uint64_t gva_cpu_reads;
+    uint64_t gva_cpu_writes;
+    uint64_t gva_cpu_read_bytes;
+    uint64_t gva_cpu_write_bytes;
+    uint64_t gva_dma_reads;
+    uint64_t gva_dma_writes;
+    uint64_t gva_dma_read_bytes;
+    uint64_t gva_dma_write_bytes;
     uint64_t cpu_window_reads;
     uint64_t cpu_window_writes;
     uint64_t cpu_window_read_bytes[4]; /* index 0=1B,1=2B,2=4B,3=8B */
@@ -434,6 +442,7 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
                                 uint8_t *resp, uint32_t *resp_len);
 int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
                          uint32_t *token_id, uint32_t *src_eid,
+                         uint32_t *address_profile,
                          uint32_t *dcna);
 
 #endif
