@@ -11,6 +11,9 @@
 #include "cpu-features.h"
 #include "exec/exec-all.h"
 #include "exec/helper-proto.h"
+#if !defined(CONFIG_USER_ONLY)
+#include "hw/ub/ub_ubc.h"
+#endif
 
 
 /*
@@ -325,6 +328,8 @@ bool arm_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                         core_to_arm_mmu_idx(&cpu->env, mmu_idx),
                         &res, fi);
     if (likely(!ret)) {
+        uint64_t gva_local_pa = 0;
+        uint64_t gva_page_size = 0;
         /*
          * Map a single [sub]page. Regions smaller than our declared
          * target page size are handled specially, so for those we
@@ -333,6 +338,14 @@ bool arm_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         if (res.f.lg_page_size >= TARGET_PAGE_BITS) {
             res.f.phys_addr &= TARGET_PAGE_MASK;
             address &= TARGET_PAGE_MASK;
+        }
+
+        if (access_type != MMU_INST_FETCH &&
+            sim_dec_gva_tcg_translate(address,
+                                      access_type == MMU_DATA_STORE,
+                                      &gva_local_pa, &gva_page_size)) {
+            res.f.phys_addr = gva_local_pa & TARGET_PAGE_MASK;
+            res.f.lg_page_size = ctz64(gva_page_size);
         }
 
         res.f.extra.arm.pte_attrs = res.cacheattrs.attrs;

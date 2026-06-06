@@ -444,5 +444,7 @@ int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
                          uint32_t *token_id, uint32_t *src_eid,
                          uint32_t *address_profile,
                          uint32_t *dcna);
+bool sim_dec_gva_tcg_translate(uint64_t va, bool is_write,
+                               uint64_t *local_pa, uint64_t *page_size);
 
 #endif

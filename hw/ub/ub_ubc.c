@@ -45,6 +45,8 @@
 #include "hw/ub/ubus_instance.h"
 #include "hw/ub/ub_pool_msg.h"
 
+void tlb_flush_all_cpus_synced(CPUState *src_cpu);
+
 static bool ubc_trace_link_lookup_enabled(void)
 {
     const char *val = g_getenv("UBC_TRACE_LINK_LOOKUP");
@@ -199,6 +201,10 @@ typedef struct QEMU_PACKED SimDecMapResp {
     uint64_t map_id;
     uint32_t status;
     uint32_t rsvd;
+    uint32_t p_tag;
+    uint32_t mp_ubc_port;
+    uint32_t mp_lane;
+    uint32_t mp_link_id;
 } SimDecMapResp;
 
 /* SIM_DEC UNMAP request */
@@ -236,7 +242,11 @@ typedef struct QEMU_PACKED SimDecQueryResp {
 /* cache_policy values for SIM_DEC_GVA_MAP */
 #define SIM_DEC_CACHE_POLICY_NC 0
 #define SIM_DEC_CACHE_POLICY_WRITE_THROUGH 1
+#define SIM_DEC_CACHE_POLICY_READ_CACHE 2
+#define SIM_DEC_CACHE_POLICY_WRITE_BACK 3
 #define SIM_DEC_GVA_FAULT_P_TAG_ROUTE_MISS UINT32_MAX
+#define SIM_DEC_GVA_ACCESS_READ_ONLY BIT(0)
+#define SIM_DEC_GVA_ACCESS_EXPLICIT_SYNC BIT(1)
 #define SIM_DEC_GVA_ACCESS_FAULT_UPI_MISMATCH BIT(31)
 #define SIM_DEC_GVA_MP_UNRESOLVED UINT32_MAX
 
@@ -343,6 +353,14 @@ typedef struct SimDecPageCache {
     QemuMutex lock;
 } SimDecPageCache;
 
+typedef enum SimDecRouteState {
+    SIM_DEC_ROUTE_CREATING = 0,
+    SIM_DEC_ROUTE_ACTIVE = 1,
+    SIM_DEC_ROUTE_STALE = 2,
+    SIM_DEC_ROUTE_ERROR = 3,
+    SIM_DEC_ROUTE_RETIRED = 4,
+} SimDecRouteState;
+
 typedef struct SimDecMapEntry {
     uint64_t map_id;
     uint64_t local_pa;
@@ -371,6 +389,9 @@ typedef struct SimDecMapEntry {
     uint64_t home_va;
     uint64_t pte_offset;
     uint64_t gva_id;
+    SimDecRouteState state;
+    int last_error;
+    bool     gva_ownership_registered;
     bool     active;
     bool     mapped;
     uint8_t *sync_shadow;
@@ -389,12 +410,19 @@ typedef struct SimDecLookupResult {
     uint64_t local_va;
     uint64_t remote_uba;
     uint32_t token_id;
+    uint32_t token_value;
     uint32_t src_eid;
     uint32_t address_profile;
+    uint32_t access_flags;
+    uint32_t vmid;
+    uint32_t asid;
     uint32_t dcna;
     uint32_t tid;
     uint32_t upi;
     uint32_t p_tag;
+    uint32_t mp_ubc_port;
+    uint32_t mp_lane;
+    uint32_t mp_link_id;
 } SimDecLookupResult;
 
 /* Decoder simulation context */
@@ -420,6 +448,7 @@ typedef struct SimDecoderState {
 
 static SimDecoderState *g_sim_decoder;
 static bool sim_dec_is_gva_entry(const SimDecMapEntry *entry);
+static bool sim_dec_entry_write_back(const SimDecMapEntry *entry);
 static void sim_dec_log_gva_path(const SimDecMapEntry *entry, const char *op,
                                  hwaddr addr, unsigned size, uint64_t count);
 static void sim_dec_log_gva_dma_path(const SimDecLookupResult *result,
@@ -428,10 +457,38 @@ static void sim_dec_log_gva_dma_path(const SimDecLookupResult *result,
 static bool sim_dec_gva_access_fault(const SimDecMapEntry *entry,
                                      const char *op, hwaddr addr,
                                      unsigned size);
+static bool sim_dec_gva_dma_access_fault(const SimDecLookupResult *result,
+                                         const char *op, uint64_t iova,
+                                         size_t len);
 static void sim_dec_log_gva_route_dump(const SimDecMapEntry *entry,
                                        const char *state);
 static int sim_dec_lookup_result_by_pa(uint64_t pa,
                                        SimDecLookupResult *result);
+static bool sim_dec_gva_tcg_enabled(void);
+static void sim_dec_flush_gva_tlbs(const char *reason);
+static int sim_dec_gva_ownership_register_req(const SimDecGvaMapReq *req,
+                                              uint64_t map_id);
+static void sim_dec_gva_ownership_unregister_entry(
+    const SimDecMapEntry *entry);
+
+static void sim_dec_flush_gva_tlbs(const char *reason)
+{
+    CPUState *src = current_cpu ? current_cpu : first_cpu;
+
+    if (!sim_dec_gva_tcg_enabled()) {
+        return;
+    }
+
+    if (!src) {
+        qemu_log("GVA_TCG_TLB_FLUSH skipped reason=%s no_cpu=1\n",
+                 reason ? reason : "unspecified");
+        return;
+    }
+
+    tlb_flush_all_cpus_synced(src);
+    qemu_log("GVA_TCG_TLB_FLUSH reason=%s\n",
+             reason ? reason : "unspecified");
+}
 
 /* SIM_DEC stats helpers */
 void sim_dec_stats_accumulate(SimDecStats *dst, const SimDecStats *src)
@@ -1038,7 +1095,7 @@ static void sim_dec_cpu_window_write(void *opaque, hwaddr addr,
     }
 
     /* Write-back path: update local page cache and mark dirty */
-    if (g_sim_decoder->write_mode == SIM_DEC_WRITE_BACK &&
+    if (sim_dec_entry_write_back(entry) &&
         entry->page_cache && entry->page_cache->max_pages > 0) {
         uint64_t page_index = addr / SIM_DEC_PAGE_SIZE;
         uint64_t page_off = addr % SIM_DEC_PAGE_SIZE;
@@ -1071,6 +1128,13 @@ static void sim_dec_cpu_window_write(void *opaque, hwaddr addr,
             }
             qemu_mutex_unlock(&entry->page_cache->lock);
             write_through = false;
+            if (sim_dec_is_gva_entry(entry)) {
+                qemu_log("GVA_WRITE_BACK map_id=%" PRIx64
+                         " gva_id=%" PRIx64 " offset=%#" PRIx64
+                         " size=%u cache_policy=%" PRIu32 "\n",
+                         entry->map_id, entry->gva_id, (uint64_t)addr,
+                         size, entry->cache_policy);
+            }
         } else if (entry->page_cache) {
             qemu_mutex_unlock(&entry->page_cache->lock);
         }
@@ -1965,6 +2029,13 @@ static MemTxResult ubc_dma_read_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
         len > 0 &&
         sim_dec_lookup_result_by_pa((uint64_t)iova, &lookup) == 0) {
         uint32_t eff_token_id = lookup.token_id ? lookup.token_id : tid;
+        if (sim_dec_gva_dma_access_fault(&lookup, "read",
+                                         (uint64_t)iova, len)) {
+            if (g_sim_decoder) {
+                g_sim_decoder->stats.read_errors++;
+            }
+            return MEMTX_DECODE_ERROR;
+        }
         if (g_sim_decoder) {
             g_sim_decoder->stats.dma_path_reads++;
             g_sim_decoder->stats.dma_path_read_bytes += len;
@@ -2055,6 +2126,13 @@ static MemTxResult ubc_dma_write_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
         len > 0 &&
         sim_dec_lookup_result_by_pa((uint64_t)iova, &lookup) == 0) {
         uint32_t eff_token_id = lookup.token_id ? lookup.token_id : tid;
+        if (sim_dec_gva_dma_access_fault(&lookup, "write",
+                                         (uint64_t)iova, len)) {
+            if (g_sim_decoder) {
+                g_sim_decoder->stats.write_errors++;
+            }
+            return MEMTX_DECODE_ERROR;
+        }
         if (g_sim_decoder) {
             g_sim_decoder->stats.dma_path_writes++;
             g_sim_decoder->stats.dma_path_write_bytes += len;
@@ -7880,6 +7958,10 @@ static void sim_dec_cleanup(void)
     qemu_mutex_lock(&g_sim_decoder->lock);
     QTAILQ_FOREACH_SAFE(entry, &g_sim_decoder->map_list, next, tmp) {
         QTAILQ_REMOVE(&g_sim_decoder->map_list, entry, next);
+        if (sim_dec_is_gva_entry(entry)) {
+            sim_dec_gva_ownership_unregister_entry(entry);
+            entry->gva_ownership_registered = false;
+        }
         sim_dec_map_entry_destroy(entry);
     }
     QTAILQ_FOREACH_SAFE(entry, &g_sim_decoder->retired_map_list, next, tmp) {
@@ -7918,13 +8000,231 @@ static SimDecMapEntry *sim_dec_find_entry_by_id(uint64_t map_id)
     return NULL;
 }
 
+static SimDecMapEntry *sim_dec_find_gva_route_by_uba_locked(uint32_t vmid,
+                                                            uint32_t asid,
+                                                            uint64_t uba,
+                                                            uint64_t size)
+{
+    SimDecMapEntry *entry;
+    uint64_t end;
+
+    if (!g_sim_decoder || size == 0 || UINT64_MAX - uba < size) {
+        return NULL;
+    }
+    end = uba + size;
+
+    QTAILQ_FOREACH(entry, &g_sim_decoder->map_list, next) {
+        uint64_t route_end;
+
+        if (!entry->active || entry->address_profile == 0 ||
+            entry->vmid != vmid || entry->asid != asid ||
+            UINT64_MAX - entry->remote_uba < entry->size) {
+            continue;
+        }
+        route_end = entry->remote_uba + entry->size;
+        if (uba >= entry->remote_uba && end <= route_end) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static int sim_dec_gva_lookup_ma_by_uba(uint32_t vmid, uint32_t asid,
+                                        uint64_t uba, uint64_t size,
+                                        SimDecLookupResult *result)
+{
+    SimDecMapEntry *entry;
+    uint64_t offset;
+
+    if (!result || !g_sim_decoder || !g_sim_decoder->enabled) {
+        return -1;
+    }
+
+    memset(result, 0, sizeof(*result));
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    entry = sim_dec_find_gva_route_by_uba_locked(vmid, asid, uba, size);
+    if (!entry) {
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        return -1;
+    }
+
+    offset = uba - entry->remote_uba;
+    result->map_id = entry->map_id;
+    result->gva_id = entry->gva_id;
+    result->local_pa = entry->local_pa + offset;
+    result->local_va = entry->local_va ? entry->local_va + offset : 0;
+    result->remote_uba = uba;
+    result->token_id = entry->token_id;
+    result->token_value = entry->token_value;
+    result->src_eid = entry->src_eid;
+    result->address_profile = entry->address_profile;
+    result->access_flags = entry->access_flags;
+    result->vmid = entry->vmid;
+    result->asid = entry->asid;
+    result->dcna = entry->dcna;
+    result->tid = entry->tid;
+    result->upi = entry->upi;
+    result->p_tag = entry->p_tag;
+    result->mp_ubc_port = entry->mp_ubc_port;
+    result->mp_lane = entry->mp_lane;
+    result->mp_link_id = entry->mp_link_id;
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+    return 0;
+}
+
+static SimDecMapEntry *sim_dec_find_gva_route_by_va_locked(uint64_t va,
+                                                           bool is_write)
+{
+    SimDecMapEntry *entry;
+    uint64_t page_va = va & ~(uint64_t)(SIM_DEC_PAGE_SIZE - 1);
+    uint64_t page_end;
+
+    if (UINT64_MAX - page_va < SIM_DEC_PAGE_SIZE) {
+        return NULL;
+    }
+    page_end = page_va + SIM_DEC_PAGE_SIZE;
+
+    QTAILQ_FOREACH(entry, &g_sim_decoder->map_list, next) {
+        uint64_t route_end;
+        uint64_t uba;
+
+        if (!entry->active || entry->address_profile == 0 ||
+            entry->local_va == 0 ||
+            UINT64_MAX - entry->local_va < entry->size) {
+            continue;
+        }
+
+        route_end = entry->local_va + entry->size;
+        if (va < entry->local_va || page_end > route_end) {
+            continue;
+        }
+
+        if (is_write &&
+            (entry->access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY)) {
+            qemu_log("GVA_TCG_FAULT reason=write_to_read_only map_id=%" PRIx64
+                     " gva_id=%" PRIx64 " va=%" PRIx64
+                     " access_flags=%" PRIu32 "\n",
+                     entry->map_id, entry->gva_id, va, entry->access_flags);
+            continue;
+        }
+
+        if (UINT64_MAX - va < entry->pte_offset) {
+            qemu_log("GVA_TCG_FAULT reason=pte_offset_overflow map_id=%" PRIx64
+                     " gva_id=%" PRIx64 " va=%" PRIx64
+                     " pte_offset=%" PRIx64 "\n",
+                     entry->map_id, entry->gva_id, va, entry->pte_offset);
+            continue;
+        }
+        uba = va + entry->pte_offset;
+
+        /*
+         * Phase C uses the route metadata as the PTE.offset side table.
+         * Validate that VA + offset resolves through the same ma_table entry
+         * before returning the backend CPU-window PA.
+         */
+        if (sim_dec_find_gva_route_by_uba_locked(entry->vmid, entry->asid, uba,
+                                                 SIM_DEC_PAGE_SIZE) != entry) {
+            qemu_log("GVA_TCG_FAULT reason=ma_table map_id=%" PRIx64
+                     " gva_id=%" PRIx64 " va=%" PRIx64
+                     " uba=%" PRIx64 " vmid=%" PRIu32
+                     " asid=%" PRIu32 "\n",
+                     entry->map_id, entry->gva_id, va, uba,
+                     entry->vmid, entry->asid);
+            continue;
+        }
+
+        return entry;
+    }
+
+    return NULL;
+}
+
+static bool sim_dec_gva_tcg_enabled(void)
+{
+    static int cached = -1;
+    const char *env;
+
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    env = g_getenv("SIM_GVA_TCG");
+    cached = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    if (cached) {
+        qemu_log("GVA_TCG enabled: ARM tlb_fill will probe GVA S3 routes\n");
+    }
+    return cached != 0;
+}
+
+bool sim_dec_gva_tcg_translate(uint64_t va, bool is_write,
+                               uint64_t *local_pa, uint64_t *page_size)
+{
+    SimDecMapEntry *entry;
+    uint64_t page_va = va & ~(uint64_t)(SIM_DEC_PAGE_SIZE - 1);
+    uint64_t offset;
+
+    if (!sim_dec_gva_tcg_enabled() || !local_pa || !page_size ||
+        !g_sim_decoder || !g_sim_decoder->enabled) {
+        return false;
+    }
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    entry = sim_dec_find_gva_route_by_va_locked(page_va, is_write);
+    if (!entry) {
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        return false;
+    }
+
+    offset = page_va - entry->local_va;
+    *local_pa = entry->local_pa + offset;
+    *page_size = SIM_DEC_PAGE_SIZE;
+    qemu_log("GVA_TCG_TRANSLATE va=%" PRIx64 " local_pa=%" PRIx64
+             " map_id=%" PRIx64 " gva_id=%" PRIx64
+             " pte_offset=%" PRIx64 " uba=%" PRIx64
+             " vmid=%" PRIu32 " asid=%" PRIu32
+             " p_tag=%" PRIu32 " is_write=%u\n",
+             page_va, *local_pa, entry->map_id, entry->gva_id,
+             entry->pte_offset, page_va + entry->pte_offset,
+             entry->vmid, entry->asid, entry->p_tag, is_write);
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+    return true;
+}
+
+static const char *sim_dec_route_state_name(SimDecRouteState state)
+{
+    switch (state) {
+    case SIM_DEC_ROUTE_CREATING:
+        return "creating";
+    case SIM_DEC_ROUTE_ACTIVE:
+        return "active";
+    case SIM_DEC_ROUTE_STALE:
+        return "stale";
+    case SIM_DEC_ROUTE_ERROR:
+        return "error";
+    case SIM_DEC_ROUTE_RETIRED:
+        return "retired";
+    default:
+        return "unknown";
+    }
+}
+
+static bool sim_dec_route_blocks_overlap(const SimDecMapEntry *entry)
+{
+    return entry &&
+           (entry->state == SIM_DEC_ROUTE_CREATING ||
+            entry->state == SIM_DEC_ROUTE_ACTIVE ||
+            entry->state == SIM_DEC_ROUTE_STALE ||
+            entry->state == SIM_DEC_ROUTE_ERROR);
+}
+
 static bool sim_dec_check_overlap(uint64_t pa, uint64_t size)
 {
     SimDecMapEntry *entry;
     uint64_t end = pa + size;
 
     QTAILQ_FOREACH(entry, &g_sim_decoder->map_list, next) {
-        if (entry->active) {
+        if (sim_dec_route_blocks_overlap(entry)) {
             uint64_t entry_end = entry->local_pa + entry->size;
             if (!(end <= entry->local_pa || pa >= entry_end)) {
                 return true;
@@ -7937,6 +8237,404 @@ static bool sim_dec_check_overlap(uint64_t pa, uint64_t size)
 static bool sim_dec_is_gva_entry(const SimDecMapEntry *entry)
 {
     return entry && entry->address_profile != 0;
+}
+
+static void sim_dec_ensure_gva_write_back_cache(SimDecMapEntry *entry)
+{
+    uint64_t pages;
+
+    if (!entry || entry->page_cache ||
+        entry->cache_policy != SIM_DEC_CACHE_POLICY_WRITE_BACK) {
+        return;
+    }
+
+    pages = (entry->size + SIM_DEC_PAGE_SIZE - 1) / SIM_DEC_PAGE_SIZE;
+    if (pages == 0) {
+        return;
+    }
+
+    entry->page_cache = sim_dec_page_cache_new(pages);
+    qemu_log("GVA_WRITE_BACK_CACHE map_id=%" PRIx64
+             " gva_id=%" PRIx64 " pages=%" PRIu64
+             " size=%#" PRIx64 " cache_policy=%" PRIu32 "\n",
+             entry->map_id, entry->gva_id, pages, entry->size,
+             entry->cache_policy);
+}
+
+static bool sim_dec_entry_write_back(const SimDecMapEntry *entry)
+{
+    if (!entry) {
+        return false;
+    }
+    if (sim_dec_is_gva_entry(entry)) {
+        return entry->cache_policy == SIM_DEC_CACHE_POLICY_WRITE_BACK;
+    }
+    return g_sim_decoder && g_sim_decoder->write_mode == SIM_DEC_WRITE_BACK;
+}
+
+static bool sim_dec_is_explicit_gva_route_entry(const SimDecMapEntry *entry)
+{
+    return entry &&
+           (entry->map_source == SIM_DEC_MAP_SOURCE_GVA_MANAGER ||
+            entry->address_profile == SIM_DEC_ADDRESS_PROFILE_GSVA_IDENTITY);
+}
+
+static bool sim_dec_is_explicit_gva_route_req(const SimDecGvaMapReq *req)
+{
+    return req &&
+           (req->map_source == SIM_DEC_MAP_SOURCE_GVA_MANAGER ||
+            req->address_profile == SIM_DEC_ADDRESS_PROFILE_GSVA_IDENTITY);
+}
+
+static bool sim_dec_gva_ownership_required_req(const SimDecGvaMapReq *req)
+{
+    return sim_dec_is_explicit_gva_route_req(req) &&
+           req->address_profile == SIM_DEC_ADDRESS_PROFILE_GENERIC_GVA;
+}
+
+static bool sim_dec_check_gva_route_overlap(const SimDecGvaMapReq *req)
+{
+    SimDecMapEntry *entry;
+    uint64_t end;
+
+    if (!sim_dec_is_explicit_gva_route_req(req)) {
+        return false;
+    }
+
+    end = req->map_req.remote_uba + req->map_req.size;
+    QTAILQ_FOREACH(entry, &g_sim_decoder->map_list, next) {
+        uint64_t entry_end;
+
+        if (!sim_dec_route_blocks_overlap(entry) ||
+            !sim_dec_is_explicit_gva_route_entry(entry) ||
+            entry->vmid != req->vmid ||
+            entry->asid != req->asid) {
+            continue;
+        }
+
+        entry_end = entry->remote_uba + entry->size;
+        if (!(end <= entry->remote_uba ||
+              req->map_req.remote_uba >= entry_end)) {
+            qemu_log("SIM_DEC: GVA route overlap detected vmid=%" PRIu32
+                     " asid=%" PRIu32 " uba[%" PRIx64 "-%" PRIx64
+                     "] existing[%" PRIx64 "-%" PRIx64 "]\n",
+                     req->vmid, req->asid, req->map_req.remote_uba, end,
+                     entry->remote_uba, entry_end);
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct SimDecGvaOwnershipRecord {
+    char node_id[64];
+    char role[16];
+    uint64_t map_id;
+    uint64_t gva_id;
+    uint64_t uba;
+    uint64_t size;
+    uint32_t vmid;
+    uint32_t asid;
+} SimDecGvaOwnershipRecord;
+
+static bool sim_dec_gva_ownership_enabled(void)
+{
+    const char *env = g_getenv("SIM_GVA_OWNERSHIP");
+
+    return !env || strcmp(env, "0") != 0;
+}
+
+static bool sim_dec_gva_read_only_req(const SimDecGvaMapReq *req)
+{
+    return req && (req->access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY);
+}
+
+static bool sim_dec_gva_ranges_overlap(uint64_t base_a, uint64_t size_a,
+                                       uint64_t base_b, uint64_t size_b)
+{
+    uint64_t end_a;
+    uint64_t end_b;
+
+    if (size_a == 0 || size_b == 0 ||
+        UINT64_MAX - base_a < size_a ||
+        UINT64_MAX - base_b < size_b) {
+        return false;
+    }
+
+    end_a = base_a + size_a;
+    end_b = base_b + size_b;
+    return !(end_a <= base_b || base_a >= end_b);
+}
+
+static const char *sim_dec_gva_node_id(void)
+{
+    const char *node_id = g_getenv("UB_FM_NODE_ID");
+
+    return (node_id && node_id[0]) ? node_id : "unknown";
+}
+
+static char *sim_dec_gva_ownership_dir(void)
+{
+    const char *shared_dir = g_getenv("UB_FM_SHARED_DIR");
+
+    if (!shared_dir || !shared_dir[0]) {
+        return NULL;
+    }
+    return g_build_filename(shared_dir, "gva_ownership", NULL);
+}
+
+static int sim_dec_gva_ownership_lock(char **dir_out,
+                                      char **registry_path_out)
+{
+    g_autofree char *lock_path = NULL;
+    char *dir;
+    int fd;
+
+    if (!sim_dec_gva_ownership_enabled()) {
+        return -ENOENT;
+    }
+
+    dir = sim_dec_gva_ownership_dir();
+    if (!dir) {
+        return -ENOENT;
+    }
+    if (g_mkdir_with_parents(dir, 0755) != 0) {
+        qemu_log("GVA_OWNERSHIP error=create_dir dir=%s err=%s\n",
+                 dir, strerror(errno));
+        g_free(dir);
+        return -errno;
+    }
+
+    lock_path = g_build_filename(dir, "registry.lock", NULL);
+    fd = open(lock_path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) {
+        qemu_log("GVA_OWNERSHIP error=open_lock path=%s err=%s\n",
+                 lock_path, strerror(errno));
+        g_free(dir);
+        return -errno;
+    }
+
+    if (flock(fd, LOCK_EX) != 0) {
+        qemu_log("GVA_OWNERSHIP error=lock path=%s err=%s\n",
+                 lock_path, strerror(errno));
+        close(fd);
+        g_free(dir);
+        return -errno;
+    }
+
+    *dir_out = dir;
+    *registry_path_out = g_build_filename(dir, "registry.tsv", NULL);
+    return fd;
+}
+
+static void sim_dec_gva_ownership_unlock(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+    if (flock(fd, LOCK_UN) != 0) {
+        qemu_log("GVA_OWNERSHIP error=unlock err=%s\n", strerror(errno));
+    }
+    close(fd);
+}
+
+static bool sim_dec_gva_ownership_parse_line(const char *line,
+                                             SimDecGvaOwnershipRecord *rec)
+{
+    unsigned long long map_id;
+    unsigned long long gva_id;
+    unsigned long long uba;
+    unsigned long long size;
+    unsigned int vmid;
+    unsigned int asid;
+
+    if (!line || !rec || line[0] == '\0' || line[0] == '#') {
+        return false;
+    }
+
+    memset(rec, 0, sizeof(*rec));
+    if (sscanf(line,
+               "node=%63s map_id=%llx gva_id=%llx vmid=%u asid=%u uba=%llx size=%llx role=%15s",
+               rec->node_id, &map_id, &gva_id, &vmid, &asid, &uba, &size,
+               rec->role) != 8) {
+        return false;
+    }
+
+    rec->map_id = (uint64_t)map_id;
+    rec->gva_id = (uint64_t)gva_id;
+    rec->vmid = (uint32_t)vmid;
+    rec->asid = (uint32_t)asid;
+    rec->uba = (uint64_t)uba;
+    rec->size = (uint64_t)size;
+    return true;
+}
+
+static int sim_dec_gva_ownership_register_req(const SimDecGvaMapReq *req,
+                                              uint64_t map_id)
+{
+    g_autofree char *dir = NULL;
+    g_autofree char *registry_path = NULL;
+    g_autofree char *data = NULL;
+    g_autoptr(GError) err = NULL;
+    g_auto(GStrv) lines = NULL;
+    g_autoptr(GString) next_data = NULL;
+    const char *node_id;
+    const char *role;
+    bool want_writer;
+    int lock_fd;
+    int i;
+
+    if (!sim_dec_is_explicit_gva_route_req(req)) {
+        return 0;
+    }
+
+    lock_fd = sim_dec_gva_ownership_lock(&dir, &registry_path);
+    if (lock_fd == -ENOENT) {
+        return 0;
+    }
+    if (lock_fd < 0) {
+        return lock_fd;
+    }
+
+    if (g_file_test(registry_path, G_FILE_TEST_EXISTS) &&
+        !g_file_get_contents(registry_path, &data, NULL, &err)) {
+        qemu_log("GVA_OWNERSHIP error=read path=%s err=%s\n",
+                 registry_path, err ? err->message : "unknown");
+        sim_dec_gva_ownership_unlock(lock_fd);
+        return -EIO;
+    }
+
+    node_id = sim_dec_gva_node_id();
+    role = sim_dec_gva_read_only_req(req) ? "reader" : "writer";
+    want_writer = strcmp(role, "writer") == 0;
+    lines = g_strsplit(data ? data : "", "\n", -1);
+    next_data = g_string_new(NULL);
+
+    for (i = 0; lines && lines[i]; i++) {
+        SimDecGvaOwnershipRecord rec;
+        bool rec_writer;
+
+        if (lines[i][0] == '\0') {
+            continue;
+        }
+        if (!sim_dec_gva_ownership_parse_line(lines[i], &rec)) {
+            g_string_append_printf(next_data, "%s\n", lines[i]);
+            continue;
+        }
+        if (strcmp(rec.node_id, node_id) == 0 && rec.map_id == map_id) {
+            continue;
+        }
+
+        rec_writer = strcmp(rec.role, "writer") == 0;
+        if (sim_dec_gva_ranges_overlap(req->map_req.remote_uba,
+                                       req->map_req.size, rec.uba,
+                                       rec.size) &&
+            (want_writer || rec_writer)) {
+            qemu_log("GVA_OWNERSHIP_CONFLICT node=%s map_id=%" PRIx64
+                     " role=%s uba=%" PRIx64 " size=%" PRIx64
+                     " existing_node=%s existing_map_id=%" PRIx64
+                     " existing_role=%s existing_uba=%" PRIx64
+                     " existing_size=%" PRIx64 "\n",
+                     node_id, map_id, role, req->map_req.remote_uba,
+                     req->map_req.size, rec.node_id, rec.map_id, rec.role,
+                     rec.uba, rec.size);
+            sim_dec_gva_ownership_unlock(lock_fd);
+            return -EBUSY;
+        }
+        g_string_append_printf(next_data, "%s\n", lines[i]);
+    }
+
+    g_string_append_printf(next_data,
+                           "node=%s map_id=%" PRIx64 " gva_id=%" PRIx64
+                           " vmid=%" PRIu32 " asid=%" PRIu32
+                           " uba=%" PRIx64 " size=%" PRIx64
+                           " role=%s\n",
+                           node_id, map_id, req->gva_id, req->vmid,
+                           req->asid, req->map_req.remote_uba,
+                           req->map_req.size, role);
+    if (!g_file_set_contents(registry_path, next_data->str, -1, &err)) {
+        qemu_log("GVA_OWNERSHIP error=write path=%s err=%s\n",
+                 registry_path, err ? err->message : "unknown");
+        sim_dec_gva_ownership_unlock(lock_fd);
+        return -EIO;
+    }
+
+    qemu_log("GVA_OWNERSHIP_REGISTER node=%s map_id=%" PRIx64
+             " gva_id=%" PRIx64 " role=%s uba=%" PRIx64
+             " size=%" PRIx64 " vmid=%" PRIu32 " asid=%" PRIu32 "\n",
+             node_id, map_id, req->gva_id, role, req->map_req.remote_uba,
+             req->map_req.size, req->vmid, req->asid);
+    sim_dec_gva_ownership_unlock(lock_fd);
+    return 0;
+}
+
+static void sim_dec_gva_ownership_unregister_entry(const SimDecMapEntry *entry)
+{
+    g_autofree char *dir = NULL;
+    g_autofree char *registry_path = NULL;
+    g_autofree char *data = NULL;
+    g_autoptr(GError) err = NULL;
+    g_auto(GStrv) lines = NULL;
+    g_autoptr(GString) next_data = NULL;
+    const char *node_id;
+    bool removed = false;
+    int lock_fd;
+    int i;
+
+    if (!entry || !entry->gva_ownership_registered) {
+        return;
+    }
+
+    lock_fd = sim_dec_gva_ownership_lock(&dir, &registry_path);
+    if (lock_fd == -ENOENT) {
+        return;
+    }
+    if (lock_fd < 0) {
+        return;
+    }
+
+    if (g_file_test(registry_path, G_FILE_TEST_EXISTS) &&
+        !g_file_get_contents(registry_path, &data, NULL, &err)) {
+        qemu_log("GVA_OWNERSHIP error=read path=%s err=%s\n",
+                 registry_path, err ? err->message : "unknown");
+        sim_dec_gva_ownership_unlock(lock_fd);
+        return;
+    }
+
+    node_id = sim_dec_gva_node_id();
+    lines = g_strsplit(data ? data : "", "\n", -1);
+    next_data = g_string_new(NULL);
+    for (i = 0; lines && lines[i]; i++) {
+        SimDecGvaOwnershipRecord rec;
+
+        if (lines[i][0] == '\0') {
+            continue;
+        }
+        if (sim_dec_gva_ownership_parse_line(lines[i], &rec) &&
+            strcmp(rec.node_id, node_id) == 0 &&
+            rec.map_id == entry->map_id &&
+            rec.gva_id == entry->gva_id) {
+            removed = true;
+            continue;
+        }
+        g_string_append_printf(next_data, "%s\n", lines[i]);
+    }
+
+    if (!g_file_set_contents(registry_path, next_data->str, -1, &err)) {
+        qemu_log("GVA_OWNERSHIP error=write path=%s err=%s\n",
+                 registry_path, err ? err->message : "unknown");
+        sim_dec_gva_ownership_unlock(lock_fd);
+        return;
+    }
+
+    if (removed) {
+        qemu_log("GVA_OWNERSHIP_UNREGISTER node=%s map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " uba=%" PRIx64
+                 " size=%" PRIx64 "\n",
+                 node_id, entry->map_id, entry->gva_id,
+                 entry->remote_uba, entry->size);
+    }
+    sim_dec_gva_ownership_unlock(lock_fd);
 }
 
 static bool sim_dec_should_log_gva_path(uint64_t count)
@@ -7954,10 +8652,11 @@ static void sim_dec_log_gva_path(const SimDecMapEntry *entry, const char *op,
     qemu_log("GVA_PATH gva_path=cpu_window op=%s map_id=%" PRIx64
              " gva_id=%" PRIx64 " local_va=%" PRIx64
              " offset=%" PRIx64 " remote_uba=%" PRIx64
-             " size=%u count=%" PRIu64 " address_profile=%" PRIu32 "\n",
+             " size=%u count=%" PRIu64 " vmid=%" PRIu32
+             " asid=%" PRIu32 " address_profile=%" PRIu32 "\n",
              op, entry->map_id, entry->gva_id, entry->local_va,
              (uint64_t)addr, entry->remote_uba + addr, size, count,
-             entry->address_profile);
+             entry->vmid, entry->asid, entry->address_profile);
 }
 
 static void sim_dec_log_gva_dma_path(const SimDecLookupResult *result,
@@ -7985,8 +8684,34 @@ static bool sim_dec_gva_access_fault(const SimDecMapEntry *entry,
                                      const char *op, hwaddr addr,
                                      unsigned size)
 {
+    SimDecLookupResult ma = {0};
+    uint64_t uba;
+
     if (!sim_dec_is_gva_entry(entry)) {
         return false;
+    }
+
+    uba = entry->remote_uba + addr;
+    if (sim_dec_gva_lookup_ma_by_uba(entry->vmid, entry->asid, uba, size,
+                                     &ma) != 0 ||
+        ma.map_id != entry->map_id) {
+        qemu_log("GVA_ROUTE_MISS reason=ma_table map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " op=%s vmid=%" PRIu32
+                 " asid=%" PRIu32 " uba=%" PRIx64 " size=%u\n",
+                 entry->map_id, entry->gva_id, op ? op : "unknown",
+                 entry->vmid, entry->asid, uba, size);
+        return true;
+    }
+
+    if (entry->access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY &&
+        op && strcmp(op, "write") == 0) {
+        qemu_log("GVA_FAULT reason=write_to_read_only map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " op=%s cache_policy=%" PRIu32
+                 " access_flags=%" PRIu32 " local_va=%" PRIx64
+                 " offset=%" PRIx64 " size=%u\n",
+                 entry->map_id, entry->gva_id, op, entry->cache_policy,
+                 entry->access_flags, entry->local_va, (uint64_t)addr, size);
+        return true;
     }
 
     if (entry->p_tag == SIM_DEC_GVA_FAULT_P_TAG_ROUTE_MISS) {
@@ -7996,6 +8721,27 @@ static bool sim_dec_gva_access_fault(const SimDecMapEntry *entry,
                  " size=%u\n",
                  entry->map_id, entry->gva_id, op ? op : "unknown",
                  entry->p_tag, entry->local_va, (uint64_t)addr, size);
+        return true;
+    }
+
+    if (entry->mp_link_id == SIM_DEC_GVA_MP_UNRESOLVED) {
+        qemu_log("GVA_ROUTE_MISS reason=dcna map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " op=%s dcna=%" PRIu32
+                 " local_va=%" PRIx64 " offset=%" PRIx64
+                 " size=%u\n",
+                 entry->map_id, entry->gva_id, op ? op : "unknown",
+                 entry->dcna, entry->local_va, (uint64_t)addr, size);
+        return true;
+    }
+
+    if (entry->p_tag != 0 && entry->p_tag != entry->mp_link_id) {
+        qemu_log("GVA_ROUTE_MISS reason=p_tag_mismatch map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " op=%s p_tag=%" PRIu32
+                 " expected_link_id=%" PRIu32 " local_va=%" PRIx64
+                 " offset=%" PRIx64 " size=%u\n",
+                 entry->map_id, entry->gva_id, op ? op : "unknown",
+                 entry->p_tag, entry->mp_link_id, entry->local_va,
+                 (uint64_t)addr, size);
         return true;
     }
 
@@ -8018,6 +8764,79 @@ static bool sim_dec_gva_access_fault(const SimDecMapEntry *entry,
                  entry->map_id, entry->gva_id, op ? op : "unknown",
                  entry->token_id, entry->token_value, entry->local_va,
                  (uint64_t)addr, size);
+        return true;
+    }
+
+    return false;
+}
+
+static bool sim_dec_gva_dma_access_fault(const SimDecLookupResult *result,
+                                         const char *op, uint64_t iova,
+                                         size_t len)
+{
+    if (!result || result->address_profile == 0) {
+        return false;
+    }
+
+    if (result->access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY &&
+        op && strcmp(op, "write") == 0) {
+        qemu_log("GVA_FAULT reason=write_to_read_only gva_path=dma map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " op=%s access_flags=%" PRIu32
+                 " local_va=%" PRIx64 " iova=%" PRIx64 " len=%zu\n",
+                 result->map_id, result->gva_id, op, result->access_flags,
+                 result->local_va, iova, len);
+        return true;
+    }
+
+    if (result->p_tag == SIM_DEC_GVA_FAULT_P_TAG_ROUTE_MISS) {
+        qemu_log("GVA_ROUTE_MISS reason=p_tag gva_path=dma map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " op=%s p_tag=%" PRIu32
+                 " local_va=%" PRIx64 " iova=%" PRIx64 " len=%zu\n",
+                 result->map_id, result->gva_id, op ? op : "unknown",
+                 result->p_tag, result->local_va, iova, len);
+        return true;
+    }
+
+    if (result->mp_link_id == SIM_DEC_GVA_MP_UNRESOLVED) {
+        qemu_log("GVA_ROUTE_MISS reason=dcna gva_path=dma map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " op=%s dcna=%" PRIu32
+                 " local_va=%" PRIx64 " iova=%" PRIx64 " len=%zu\n",
+                 result->map_id, result->gva_id, op ? op : "unknown",
+                 result->dcna, result->local_va, iova, len);
+        return true;
+    }
+
+    if (result->p_tag != 0 && result->p_tag != result->mp_link_id) {
+        qemu_log("GVA_ROUTE_MISS reason=p_tag_mismatch gva_path=dma map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " op=%s p_tag=%" PRIu32
+                 " expected_link_id=%" PRIu32 " local_va=%" PRIx64
+                 " iova=%" PRIx64 " len=%zu\n",
+                 result->map_id, result->gva_id, op ? op : "unknown",
+                 result->p_tag, result->mp_link_id, result->local_va,
+                 iova, len);
+        return true;
+    }
+
+    if (result->access_flags & SIM_DEC_GVA_ACCESS_FAULT_UPI_MISMATCH) {
+        qemu_log("GVA_FAULT reason=upi_mismatch gva_path=dma map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " op=%s upi=%" PRIu32
+                 " access_flags=%" PRIu32 " local_va=%" PRIx64
+                 " iova=%" PRIx64 " len=%zu\n",
+                 result->map_id, result->gva_id, op ? op : "unknown",
+                 result->upi, result->access_flags, result->local_va,
+                 iova, len);
+        return true;
+    }
+
+    if (result->token_value != 0 &&
+        result->token_value != result->token_id) {
+        qemu_log("GVA_FAULT reason=token_mismatch gva_path=dma map_id=%" PRIx64
+                 " gva_id=%" PRIx64 " op=%s token=%" PRIu32
+                 " token_value=%" PRIu32 " local_va=%" PRIx64
+                 " iova=%" PRIx64 " len=%zu\n",
+                 result->map_id, result->gva_id, op ? op : "unknown",
+                 result->token_id, result->token_value, result->local_va,
+                 iova, len);
         return true;
     }
 
@@ -8076,6 +8895,21 @@ static void sim_dec_resolve_gva_mp_entry(SimDecMapEntry *entry)
     }
 }
 
+static void sim_dec_derive_gva_p_tag(SimDecMapEntry *entry)
+{
+    if (!entry || entry->p_tag != 0 ||
+        entry->mp_link_id == SIM_DEC_GVA_MP_UNRESOLVED) {
+        return;
+    }
+
+    entry->p_tag = entry->mp_link_id;
+    qemu_log("GVA_MP_TAG_DERIVE map_id=%" PRIx64 " gva_id=%" PRIx64
+             " p_tag=%" PRIu32 " ubc_port=%" PRIu32
+             " lane=%" PRIu32 " link_id=%" PRIu32 "\n",
+             entry->map_id, entry->gva_id, entry->p_tag,
+             entry->mp_ubc_port, entry->mp_lane, entry->mp_link_id);
+}
+
 static void sim_dec_log_gva_route_dump(const SimDecMapEntry *entry,
                                        const char *state)
 {
@@ -8084,7 +8918,7 @@ static void sim_dec_log_gva_route_dump(const SimDecMapEntry *entry,
     }
 
     qemu_log("GVA_ROUTE_DUMP state=%s map_id=%" PRIx64
-             " gva_id=%" PRIx64 " vmid=%" PRIu32 " asid=%" PRIu32
+             " last_error=%d gva_id=%" PRIx64 " vmid=%" PRIu32 " asid=%" PRIu32
              " local_va=%" PRIx64 " home_va=%" PRIx64
              " pte_offset=%" PRIx64 " uba=%" PRIx64
              " pa=%" PRIx64 " size=%" PRIx64
@@ -8095,8 +8929,8 @@ static void sim_dec_log_gva_route_dump(const SimDecMapEntry *entry,
              " map_source=%" PRIu32
              " address_profile=%" PRIu32 " cache_policy=%" PRIu32
              " access_flags=%" PRIu32 "\n",
-             state ? state : "unknown", entry->map_id, entry->gva_id,
-             entry->vmid, entry->asid, entry->local_va, entry->home_va,
+             state ? state : "unknown", entry->map_id, entry->last_error,
+             entry->gva_id, entry->vmid, entry->asid, entry->local_va, entry->home_va,
              entry->pte_offset, entry->remote_uba, entry->local_pa,
              entry->size, entry->dcna, entry->tid, entry->token_id,
              entry->upi, entry->p_tag, entry->mp_ubc_port, entry->mp_lane,
@@ -8138,6 +8972,7 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
 {
     SimDecMapEntry *entry;
     uint64_t map_id;
+    bool ownership_required;
 
     if (!g_sim_decoder || !g_sim_decoder->enabled) {
         resp->status = SIM_DEC_STATUS_BACKEND_ERROR;
@@ -8178,9 +9013,27 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
     }
 
     if (req->cache_policy != SIM_DEC_CACHE_POLICY_NC &&
-        req->cache_policy != SIM_DEC_CACHE_POLICY_WRITE_THROUGH) {
+        req->cache_policy != SIM_DEC_CACHE_POLICY_WRITE_THROUGH &&
+        req->cache_policy != SIM_DEC_CACHE_POLICY_READ_CACHE &&
+        req->cache_policy != SIM_DEC_CACHE_POLICY_WRITE_BACK) {
         qemu_log("SIM_DEC: GVA unsupported cache_policy=%" PRIu32 "\n",
                  req->cache_policy);
+        resp->status = SIM_DEC_STATUS_INVALID_PARAM;
+        return -1;
+    }
+
+    if (req->cache_policy == SIM_DEC_CACHE_POLICY_READ_CACHE &&
+        !(req->access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY)) {
+        qemu_log("SIM_DEC: GVA read_cache requires READ_ONLY access_flags=%" PRIu32 "\n",
+                 req->access_flags);
+        resp->status = SIM_DEC_STATUS_INVALID_PARAM;
+        return -1;
+    }
+
+    if (req->cache_policy == SIM_DEC_CACHE_POLICY_WRITE_BACK &&
+        !(req->access_flags & SIM_DEC_GVA_ACCESS_EXPLICIT_SYNC)) {
+        qemu_log("SIM_DEC: GVA write_back requires EXPLICIT_SYNC access_flags=%" PRIu32 "\n",
+                 req->access_flags);
         resp->status = SIM_DEC_STATUS_INVALID_PARAM;
         return -1;
     }
@@ -8200,13 +9053,35 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
         resp->status = SIM_DEC_STATUS_RESOURCE_BUSY;
         return -1;
     }
+    if (sim_dec_check_gva_route_overlap(req)) {
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        resp->status = SIM_DEC_STATUS_RESOURCE_BUSY;
+        return -1;
+    }
 
-    entry = g_malloc0(sizeof(*entry));
     map_id = g_sim_decoder->next_map_id++;
     if (map_id == 0)
         map_id = g_sim_decoder->next_map_id++;
 
+    ownership_required = sim_dec_gva_ownership_required_req(req);
+    if (ownership_required &&
+        sim_dec_gva_ownership_register_req(req, map_id) != 0) {
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        resp->status = SIM_DEC_STATUS_RESOURCE_BUSY;
+        return -1;
+    }
+
+    entry = g_malloc0(sizeof(*entry));
     if (sim_dec_populate_map_entry(entry, &req->map_req) != 0) {
+        SimDecMapEntry unregister_entry = {
+            .map_id = map_id,
+            .gva_id = req->gva_id,
+            .remote_uba = req->map_req.remote_uba,
+            .size = req->map_req.size,
+            .gva_ownership_registered = ownership_required,
+        };
+
+        sim_dec_gva_ownership_unregister_entry(&unregister_entry);
         qemu_mutex_unlock(&g_sim_decoder->lock);
         g_free(entry);
         resp->status = SIM_DEC_STATUS_BACKEND_ERROR;
@@ -8214,6 +9089,8 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
     }
 
     entry->map_id = map_id;
+    entry->state = SIM_DEC_ROUTE_CREATING;
+    entry->last_error = 0;
     entry->map_source = req->map_source;
     entry->address_profile = req->address_profile;
     entry->cache_policy = req->cache_policy;
@@ -8226,7 +9103,10 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
     entry->home_va = req->home_va;
     entry->pte_offset = req->pte_offset;
     entry->gva_id = req->gva_id;
+    entry->gva_ownership_registered = ownership_required;
     sim_dec_resolve_gva_mp_entry(entry);
+    sim_dec_derive_gva_p_tag(entry);
+    sim_dec_ensure_gva_write_back_cache(entry);
 
     memory_region_init_io(&entry->cpu_window, OBJECT(DEVICE(g_sim_decoder->bcs->ubc_dev)),
                           &sim_dec_cpu_window_ops, entry, "ub-sim-decoder-cpu",
@@ -8234,6 +9114,7 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
     memory_region_add_subregion_overlap(get_system_memory(), entry->local_pa,
                                         &entry->cpu_window, 10);
     entry->mapped = true;
+    entry->state = SIM_DEC_ROUTE_ACTIVE;
     entry->active = true;
 
     QTAILQ_INSERT_TAIL(&g_sim_decoder->map_list, entry, next);
@@ -8241,6 +9122,10 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
 
     resp->map_id = map_id;
     resp->status = SIM_DEC_STATUS_SUCCESS;
+    resp->p_tag = entry->p_tag;
+    resp->mp_ubc_port = entry->mp_ubc_port;
+    resp->mp_lane = entry->mp_lane;
+    resp->mp_link_id = entry->mp_link_id;
 
     qemu_log("SIM_DEC: GVA_MAP success id=%" PRIx64 " pa=%" PRIx64
              " sz=%" PRIx64 " remote_uba=%" PRIx64 " token=%u"
@@ -8251,7 +9136,7 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
              req->map_req.remote_uba, req->map_req.token_id,
              req->map_source, req->address_profile,
              req->local_va, req->home_va, req->pte_offset,
-             req->vmid, req->asid, req->p_tag, req->gva_id);
+             req->vmid, req->asid, entry->p_tag, req->gva_id);
     qemu_log("GVA_S3_MAP id=%" PRIx64 " gva_id=%" PRIx64
              " vmid=%" PRIu32 " asid=%" PRIu32
              " local_va=%" PRIx64 " home_va=%" PRIx64
@@ -8267,10 +9152,11 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
              req->local_va, req->home_va, req->pte_offset,
              req->map_req.remote_uba, req->map_req.local_pa,
              req->map_req.size, req->map_req.dcna, req->tid,
-             req->map_req.token_id, req->map_req.upi, req->p_tag,
+             req->map_req.token_id, req->map_req.upi, entry->p_tag,
              entry->mp_ubc_port, entry->mp_lane, entry->mp_link_id,
              req->map_source, req->address_profile, req->cache_policy);
-    sim_dec_log_gva_route_dump(entry, "active");
+    sim_dec_log_gva_route_dump(entry, sim_dec_route_state_name(entry->state));
+    sim_dec_flush_gva_tlbs("gva_map");
     return 0;
 }
 
@@ -8320,6 +9206,8 @@ static int sim_dec_handle_map(const SimDecMapReq *req, SimDecMapResp *resp)
         return -1;
     }
     entry->map_id = map_id;
+    entry->state = SIM_DEC_ROUTE_CREATING;
+    entry->last_error = 0;
 
     memory_region_init_io(&entry->cpu_window, OBJECT(DEVICE(g_sim_decoder->bcs->ubc_dev)),
                           &sim_dec_cpu_window_ops, entry, "ub-sim-decoder-cpu",
@@ -8327,6 +9215,7 @@ static int sim_dec_handle_map(const SimDecMapReq *req, SimDecMapResp *resp)
     memory_region_add_subregion_overlap(get_system_memory(), entry->local_pa,
                                         &entry->cpu_window, 10);
     entry->mapped = true;
+    entry->state = SIM_DEC_ROUTE_ACTIVE;
     entry->active = true;
 
     QTAILQ_INSERT_TAIL(&g_sim_decoder->map_list, entry, next);
@@ -8345,6 +9234,7 @@ static int sim_dec_handle_unmap(const SimDecUnmapReq *req)
 {
     SimDecMapEntry *entry;
     bool gva_entry;
+    int flush_ret;
 
     if (!g_sim_decoder)
         return -1;
@@ -8360,11 +9250,32 @@ static int sim_dec_handle_unmap(const SimDecUnmapReq *req)
 
     /* Flush dirty pages before unmapping */
     if (entry->page_cache) {
-        sim_dec_page_cache_flush_dirty(entry);
+        flush_ret = sim_dec_page_cache_flush_dirty(entry);
+        if (flush_ret != 0) {
+            entry->active = false;
+            entry->state = SIM_DEC_ROUTE_ERROR;
+            entry->last_error = flush_ret;
+            gva_entry = sim_dec_is_gva_entry(entry);
+            qemu_mutex_unlock(&g_sim_decoder->lock);
+            qemu_log("SIM_DEC: UNMAP failed - flush dirty map_id=%" PRIx64
+                     " ret=%d\n", req->map_id, flush_ret);
+            if (gva_entry) {
+                sim_dec_log_gva_route_dump(entry,
+                                           sim_dec_route_state_name(entry->state));
+                sim_dec_flush_gva_tlbs("gva_unmap_error");
+            }
+            return SIM_DEC_STATUS_BACKEND_ERROR;
+        }
     }
 
     gva_entry = sim_dec_is_gva_entry(entry);
     entry->active = false;
+    entry->state = SIM_DEC_ROUTE_RETIRED;
+    entry->last_error = 0;
+    if (gva_entry) {
+        sim_dec_gva_ownership_unregister_entry(entry);
+        entry->gva_ownership_registered = false;
+    }
     if (entry->mapped) {
         memory_region_del_subregion(get_system_memory(), &entry->cpu_window);
         entry->mapped = false;
@@ -8381,8 +9292,9 @@ static int sim_dec_handle_unmap(const SimDecUnmapReq *req)
 
     qemu_log("SIM_DEC: UNMAP success id=%" PRIx64 "\n", req->map_id);
     if (gva_entry) {
-        sim_dec_log_gva_route_dump(entry, "retired");
+        sim_dec_log_gva_route_dump(entry, sim_dec_route_state_name(entry->state));
         sim_dec_print_stats(&g_sim_decoder->stats, "");
+        sim_dec_flush_gva_tlbs("gva_unmap");
     }
     return SIM_DEC_STATUS_SUCCESS;
 }
@@ -8862,12 +9774,19 @@ static int sim_dec_lookup_result_by_pa(uint64_t pa,
         result->local_va = entry->local_va;
         result->remote_uba = entry->remote_uba + offset;
         result->token_id = entry->token_id;
+        result->token_value = entry->token_value;
         result->src_eid = entry->src_eid;
         result->address_profile = entry->address_profile;
+        result->access_flags = entry->access_flags;
+        result->vmid = entry->vmid;
+        result->asid = entry->asid;
         result->dcna = entry->dcna;
         result->tid = entry->tid;
         result->upi = entry->upi;
         result->p_tag = entry->p_tag;
+        result->mp_ubc_port = entry->mp_ubc_port;
+        result->mp_lane = entry->mp_lane;
+        result->mp_link_id = entry->mp_link_id;
         qemu_mutex_unlock(&g_sim_decoder->lock);
         return 0;
     }
