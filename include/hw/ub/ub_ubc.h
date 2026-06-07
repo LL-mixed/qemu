@@ -220,6 +220,22 @@ typedef struct BusControllerDev {
         uint8_t *buf;
     } sim_dec_sync_read;
 
+    /* OBMM coherence synchronous wait (same pattern as sim_dec_sync_read) */
+    struct {
+        bool     pending;
+        uint32_t req_id;
+        uint32_t peer_cna;
+        uint32_t msg_type;
+        int      status;
+        uint32_t data_len;
+        uint32_t grant_state;
+        uint8_t  data[64];
+        /* For multi-ack protocols (INV_ACK collection) */
+        uint32_t pending_ack_count;
+        uint64_t ack_bitmap;
+    } coh_sync_wait;
+    uint32_t next_coh_req_id;
+
     void *linqu_uapi_bridge;
     bool linqu_uapi_bridge_ready;
     uint64_t linqu_uapi_cmdq_iova;
@@ -303,6 +319,26 @@ void ubc_handle_urma_rx_write(BusControllerDev *ubc_dev, uint32_t dst_jetty,
                               uint64_t remote_addr, const uint8_t *data,
                               uint32_t data_len);
 
+/* SIM_DEC remote memory access (used by coherence module) */
+MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
+                                     uint64_t remote_uba,
+                                     uint32_t token_id,
+                                     uint32_t dcna,
+                                     const uint8_t *data,
+                                     uint32_t len);
+MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
+                                    uint64_t remote_uba,
+                                    uint32_t token_id,
+                                    uint32_t dcna,
+                                    uint8_t *data,
+                                    uint32_t len);
+
+/* Coherence message send helper (obmm_coherence.c uses these) */
+int obmm_coh_send_ub_link_msg(BusControllerDev *ubc_dev, uint32_t dcna,
+                               uint8_t sub_msg_code,
+                               const void *payload, uint32_t payload_len);
+void obmm_coh_poll_rx_links(BusControllerDev *ubc_dev);
+
 /* Entity table management */
 void ub_entity_table_init(BusControllerDev *ubc_dev);
 UBEntityDesc *ub_entity_desc_for_idx(BusControllerDev *ubc_dev, uint32_t entity_idx);
@@ -345,6 +381,19 @@ void ubc_handle_read_response(BusControllerDev *ubc_dev, const UBCReadRespPld *r
 #define UBC_MSG_SUB_SIM_DEC_READ_REQ  2
 #define UBC_MSG_SUB_SIM_DEC_READ_RESP 3
 #define UBC_MSG_SUB_SIM_DEC_BATCH     4
+
+/* OBMM coherence protocol messages (msg_code=7, sub_msg_code 5+). */
+#define UBC_MSG_SUB_COH_GETS          5
+#define UBC_MSG_SUB_COH_GETM          6
+#define UBC_MSG_SUB_COH_INV           7
+#define UBC_MSG_SUB_COH_INV_ACK       8
+#define UBC_MSG_SUB_COH_WB            9
+#define UBC_MSG_SUB_COH_WB_ACK       10
+#define UBC_MSG_SUB_COH_DATA         11
+#define UBC_MSG_SUB_COH_FENCE        12
+#define UBC_MSG_SUB_COH_FENCE_ACK    13
+#define UBC_MSG_SUB_COH_DOWNGRADE    14
+#define UBC_MSG_SUB_COH_DOWNGRADE_ACK 15
 
 /* SIM_DEC batched write payload */
 typedef struct QEMU_PACKED SimDecBatchHdr {
@@ -402,6 +451,12 @@ typedef struct SimDecStats {
 
 void sim_dec_stats_accumulate(SimDecStats *dst, const SimDecStats *src);
 void sim_dec_print_stats(const SimDecStats *stats, const char *prefix);
+MemTxResult obmm_coh_local_read(BusControllerDev *ubc_dev, uint64_t uba,
+                                uint32_t token_id, uint8_t *buf,
+                                uint32_t len);
+MemTxResult obmm_coh_local_write(BusControllerDev *ubc_dev, uint64_t uba,
+                                 uint32_t token_id, const uint8_t *buf,
+                                 uint32_t len);
 
 typedef struct QEMU_PACKED UBCSimDecWritePldHdr {
     uint64_t remote_uba;

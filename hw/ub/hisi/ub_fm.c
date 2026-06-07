@@ -35,7 +35,7 @@ static GPtrArray *ub_fm_snapshot_source_links;
 static QEMUTimer *ub_fm_pending_refresh_timer;
 static QEMUTimer *ub_fm_remote_link_retry_timer;
 static QEMUTimer *ub_fm_rx_poll_timer;
-static bool ub_fm_rx_poll_active;
+static uint32_t ub_fm_rx_poll_depth;
 
 #define UB_FM_REMOTE_LINK_RETRY_MS 2000  /* fast retry for remote endpoint .ini */
 #define UB_FM_RX_POLL_MS 10              /* fallback poll; shmem uses FIFO fd notification */
@@ -976,13 +976,13 @@ void ub_fm_poll_rx_links_now(void)
 {
     guint i;
 
-    if (ub_fm_rx_poll_active) {
+    if (ub_fm_rx_poll_depth >= 8) {
         return;
     }
-    ub_fm_rx_poll_active = true;
+    ub_fm_rx_poll_depth++;
 
     if (!ub_fm_active_links) {
-        ub_fm_rx_poll_active = false;
+        ub_fm_rx_poll_depth--;
         return;
     }
 
@@ -1018,7 +1018,7 @@ void ub_fm_poll_rx_links_now(void)
         }
     }
 
-    ub_fm_rx_poll_active = false;
+    ub_fm_rx_poll_depth--;
 }
 
 static void ub_fm_rx_poll_cb(void *opaque)

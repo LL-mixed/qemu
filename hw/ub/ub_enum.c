@@ -230,13 +230,26 @@ static void enum_query_set_rsp_cap_info_remote(EnumTopoQueryRspPdu *rsp_pdu,
                                                const UBRemoteDeviceSnapshot *snapshot)
 {
     EnumTlvCapInfo *tlv_cap_info = NULL;
+    uint16_t class_code;
 
     tlv_cap_info = (EnumTlvCapInfo *)((uint8_t *)rsp_pdu + ENUM_PLD_SCAN_PDU_COMMON_SIZE +
                                       rsp_num_ports * sizeof(EnumTlvPortInfo) + sizeof(EnumTlvPortNum) +
                                       sizeof(EnumTlvSliceInfo));
+    class_code = snapshot->class_code;
+    /*
+     * A remote UBC snapshot represents a non-root topology entity from the
+     * querying guest's perspective.  The guest rejects topo_rank > 0 entities
+     * that still look like BUS/IBUS controllers.  Preserve the local UBC
+     * config-space class, but expose the remote topology view as a network
+     * idevice so multi-peer full-mesh enumeration can continue.
+     */
+    if (snapshot->guid.type == UB_GUID_TYPE_IBUS_CONTROLLER &&
+        class_code == UBC_CLASS_CODE) {
+        class_code = 0x0002; /* UB_CLASS_NETWORK_UB */
+    }
     tlv_cap_info->type = TLV_CAP_INFO;
     tlv_cap_info->len = sizeof(EnumTlvCapInfo);
-    tlv_cap_info->class_code = snapshot->class_code;
+    tlv_cap_info->class_code = class_code;
 }
 
 // #pragma GCC push_options

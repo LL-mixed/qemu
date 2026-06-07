@@ -30,6 +30,7 @@
 #include "hw/ub/ub.h"
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_ubc.h"
+#include "hw/ub/obmm_coherence.h"
 #include "hw/ub/ub_ummu.h"
 #include "hw/ub/ub_config.h"
 #include "hw/ub/ub_usi.h"
@@ -146,6 +147,7 @@ int linqu_ub_bridge_poll_completion(LinquUbBridge *bridge,
 #define SIM_DEC_OP_OBMM_BOOTSTRAP_PUBLISH 0x05
 #define SIM_DEC_OP_OBMM_BOOTSTRAP_LOOKUP  0x06
 #define SIM_DEC_OP_GVA_MAP          0x07
+#define SIM_DEC_OP_COH_FENCE        0x08
 
 /* SIM_DEC status codes */
 #define SIM_DEC_STATUS_SUCCESS          0x00
@@ -244,6 +246,7 @@ typedef struct QEMU_PACKED SimDecQueryResp {
 #define SIM_DEC_CACHE_POLICY_WRITE_THROUGH 1
 #define SIM_DEC_CACHE_POLICY_READ_CACHE 2
 #define SIM_DEC_CACHE_POLICY_WRITE_BACK 3
+#define SIM_DEC_CACHE_POLICY_DIRECTORY_MESI 4
 #define SIM_DEC_GVA_FAULT_P_TAG_ROUTE_MISS UINT32_MAX
 #define SIM_DEC_GVA_ACCESS_READ_ONLY BIT(0)
 #define SIM_DEC_GVA_ACCESS_EXPLICIT_SYNC BIT(1)
@@ -423,6 +426,7 @@ typedef struct SimDecLookupResult {
     uint32_t mp_ubc_port;
     uint32_t mp_lane;
     uint32_t mp_link_id;
+    uint32_t cache_policy;
 } SimDecLookupResult;
 
 /* Decoder simulation context */
@@ -608,14 +612,14 @@ static void sim_dec_print_global_stats(void)
 /* Forward declarations for SIM decoder */
 static void sim_dec_init(BusControllerState *bcs);
 static void sim_dec_cleanup(void);
-static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
-                                            uint64_t remote_uba,
-                                            uint32_t token_id,
-                                            uint32_t dcna,
-                                            const uint8_t *buf,
-                                            uint32_t len);
-static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
-                                           uint64_t remote_uba,
+MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
+                                     uint64_t remote_uba,
+                                     uint32_t token_id,
+                                     uint32_t dcna,
+                                     const uint8_t *buf,
+                                     uint32_t len);
+MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
+                                    uint64_t remote_uba,
                                            uint32_t token_id,
                                            uint32_t dcna,
                                            uint8_t *buf,
@@ -973,6 +977,18 @@ static uint64_t sim_dec_cpu_window_read(void *opaque, hwaddr addr,
                              g_sim_decoder->stats.gva_cpu_reads);
     }
 
+    /* Directory MESI coherence path */
+    if (entry->cache_policy == SIM_DEC_CACHE_POLICY_DIRECTORY_MESI) {
+        remote_uba = entry->remote_uba + addr;
+        ret = obmm_coh_read(g_sim_decoder->bcs->ubc_dev,
+                            remote_uba, entry->token_id, entry->dcna,
+                            buf, (uint32_t)size);
+        if (ret != MEMTX_OK) {
+            g_sim_decoder->stats.read_errors++;
+        }
+        goto done;
+    }
+
     remote_uba = entry->remote_uba + addr;
     if (entry->sync_shadow &&
         addr >= entry->sync_valid_off &&
@@ -1075,6 +1091,25 @@ static void sim_dec_cpu_window_write(void *opaque, hwaddr addr,
         g_sim_decoder->stats.gva_cpu_write_bytes += size;
         sim_dec_log_gva_path(entry, "write", addr, size,
                              g_sim_decoder->stats.gva_cpu_writes);
+    }
+
+    /* Directory MESI coherence path */
+    if (entry->cache_policy == SIM_DEC_CACHE_POLICY_DIRECTORY_MESI) {
+        switch (size) {
+        case 1: buf[0] = (uint8_t)value; break;
+        case 2: stw_le_p(buf, (uint16_t)value); break;
+        case 4: stl_le_p(buf, (uint32_t)value); break;
+        case 8: stq_le_p(buf, value); break;
+        default: return;
+        }
+        remote_uba = entry->remote_uba + addr;
+        ret = obmm_coh_write(g_sim_decoder->bcs->ubc_dev,
+                             remote_uba, entry->token_id, entry->dcna,
+                             buf, (uint32_t)size);
+        if (ret != MEMTX_OK) {
+            g_sim_decoder->stats.write_errors++;
+        }
+        return;
     }
 
     switch (size) {
@@ -1991,16 +2026,16 @@ static inline void ubc_close_dma_fallback_window(BusControllerDev *ubc_dev,
              reason ? reason : "unspecified");
 }
 
-static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
-                                            uint64_t remote_uba,
-                                            uint32_t token_id,
-                                            uint32_t dcna,
-                                            const uint8_t *data,
-                                            uint32_t len);
-static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
-                                           uint64_t remote_uba,
-                                           uint32_t token_id,
-                                           uint32_t dcna,
+MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
+                                     uint64_t remote_uba,
+                                     uint32_t token_id,
+                                     uint32_t dcna,
+                                     const uint8_t *data,
+                                     uint32_t len);
+MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
+                                    uint64_t remote_uba,
+                                    uint32_t token_id,
+                                    uint32_t dcna,
                                            uint8_t *data,
                                            uint32_t len);
 
@@ -2046,6 +2081,14 @@ static MemTxResult ubc_dma_read_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
                                          len,
                                          g_sim_decoder->stats.gva_dma_reads);
             }
+        }
+        if (lookup.cache_policy == SIM_DEC_CACHE_POLICY_DIRECTORY_MESI) {
+            if (len > UINT32_MAX) {
+                return MEMTX_DECODE_ERROR;
+            }
+            return obmm_coh_read(ubc_dev, lookup.remote_uba,
+                                 eff_token_id, lookup.dcna,
+                                 (uint8_t *)buf, (uint32_t)len);
         }
         return ubc_sim_dec_remote_read(ubc_dev, lookup.remote_uba,
                                        eff_token_id, lookup.dcna,
@@ -2143,6 +2186,14 @@ static MemTxResult ubc_dma_write_ex(BusControllerDev *ubc_dev, dma_addr_t iova,
                                          len,
                                          g_sim_decoder->stats.gva_dma_writes);
             }
+        }
+        if (lookup.cache_policy == SIM_DEC_CACHE_POLICY_DIRECTORY_MESI) {
+            if (len > UINT32_MAX) {
+                return MEMTX_DECODE_ERROR;
+            }
+            return obmm_coh_write(ubc_dev, lookup.remote_uba,
+                                  eff_token_id, lookup.dcna,
+                                  (const uint8_t *)buf, (uint32_t)len);
         }
         return ubc_sim_dec_remote_write(ubc_dev, lookup.remote_uba,
                                         eff_token_id, lookup.dcna,
@@ -5115,6 +5166,25 @@ static int ubc_send_msg_over_link(BusControllerDev *ubc_dev, UBLinkState *link,
     return rc;
 }
 
+/* Coherence message send helper (non-static, used by obmm_coherence.c) */
+int obmm_coh_send_ub_link_msg(BusControllerDev *ubc_dev, uint32_t dcna,
+                               uint8_t sub_msg_code,
+                               const void *payload, uint32_t payload_len)
+{
+    UBLinkState *link = ubc_find_active_link(ubc_dev, &dcna);
+    if (!link) {
+        qemu_log("OBMM_COH: no active link to dcna=%#x\n", dcna);
+        return -1;
+    }
+    return ubc_send_msg_over_link(ubc_dev, link, dcna,
+                                  sub_msg_code, payload, payload_len);
+}
+
+void obmm_coh_poll_rx_links(BusControllerDev *ubc_dev)
+{
+    ub_fm_poll_rx_links_now();
+}
+
 static int sim_dec_send_batch_writes(BusControllerDev *ubc_dev, uint32_t dcna,
                                        uint32_t token_id,
                                        SimDecBatchWriteOp *ops,
@@ -5242,6 +5312,42 @@ static MemTxResult ubc_dma_write_local_data_tid_strict(BusControllerDev *ubc_dev
     ret = address_space_write(as, iova, MEMTXATTRS_UNSPECIFIED, buf, len);
     if (tid_override_active) {
         ummu_dma_tid_override_leave(ubc_dev->ummu, tid_scope);
+    }
+    return ret;
+}
+
+MemTxResult obmm_coh_local_read(BusControllerDev *ubc_dev, uint64_t uba,
+                                uint32_t token_id, uint8_t *buf,
+                                uint32_t len)
+{
+    MemTxResult ret;
+
+    if (!ubc_dev || !buf || len == 0) {
+        return MEMTX_DECODE_ERROR;
+    }
+    ret = ubc_dma_read_local_data_tid_strict(ubc_dev, uba, buf, len,
+                                             ubc_tid_or_auto(token_id));
+    if (ret != MEMTX_OK && token_id != 0) {
+        ret = ubc_dma_read_local_data_tid_strict(ubc_dev, uba, buf, len,
+                                                 UBC_DMA_TID_AUTO);
+    }
+    return ret;
+}
+
+MemTxResult obmm_coh_local_write(BusControllerDev *ubc_dev, uint64_t uba,
+                                 uint32_t token_id, const uint8_t *buf,
+                                 uint32_t len)
+{
+    MemTxResult ret;
+
+    if (!ubc_dev || !buf || len == 0) {
+        return MEMTX_DECODE_ERROR;
+    }
+    ret = ubc_dma_write_local_data_tid_strict(ubc_dev, uba, buf, len,
+                                              ubc_tid_or_auto(token_id));
+    if (ret != MEMTX_OK && token_id != 0) {
+        ret = ubc_dma_write_local_data_tid_strict(ubc_dev, uba, buf, len,
+                                                  UBC_DMA_TID_AUTO);
     }
     return ret;
 }
@@ -5375,12 +5481,12 @@ void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
     ubc_dev->sim_dec_sync_read.peer_cna = 0;
 }
 
-static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
-                                            uint64_t remote_uba,
-                                            uint32_t token_id,
-                                            uint32_t dcna,
-                                            const uint8_t *data,
-                                            uint32_t len)
+MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
+                                     uint64_t remote_uba,
+                                     uint32_t token_id,
+                                     uint32_t dcna,
+                                     const uint8_t *data,
+                                     uint32_t len)
 {
     UBLinkState *link;
     uint32_t done = 0;
@@ -5423,12 +5529,12 @@ static MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
     return MEMTX_OK;
 }
 
-static MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
-                                           uint64_t remote_uba,
-                                           uint32_t token_id,
-                                           uint32_t dcna,
-                                           uint8_t *data,
-                                           uint32_t len)
+MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
+                                    uint64_t remote_uba,
+                                    uint32_t token_id,
+                                    uint32_t dcna,
+                                    uint8_t *data,
+                                    uint32_t len)
 {
     UBLinkState *link;
     BusControllerState *bcs;
@@ -7946,9 +8052,33 @@ static void sim_dec_map_entry_destroy(SimDecMapEntry *entry)
     g_free(entry);
 }
 
+static void sim_dec_cleanup_coherence_entry(SimDecMapEntry *entry)
+{
+    int fence_ret;
+
+    if (!entry || entry->cache_policy != SIM_DEC_CACHE_POLICY_DIRECTORY_MESI ||
+        !g_sim_decoder || !g_sim_decoder->bcs || !g_sim_decoder->bcs->ubc_dev ||
+        entry->size == 0) {
+        return;
+    }
+
+    fence_ret = obmm_coh_send_fence(g_sim_decoder->bcs->ubc_dev, entry->dcna,
+                                    entry->remote_uba, entry->size,
+                                    entry->token_id);
+    if (fence_ret != 0) {
+        qemu_log("SIM_DEC: cleanup coherence fence failed map_id=%" PRIx64
+                 " ret=%d\n", entry->map_id, fence_ret);
+        return;
+    }
+
+    obmm_coh_invalidate_local_range(g_sim_decoder->bcs->ubc_dev, entry->dcna,
+                                    entry->remote_uba, entry->size,
+                                    entry->token_id);
+}
+
 static void sim_dec_cleanup(void)
 {
-    SimDecMapEntry *entry, *tmp;
+    SimDecMapEntry *entry;
 
     if (!g_sim_decoder)
         return;
@@ -7956,15 +8086,24 @@ static void sim_dec_cleanup(void)
     sim_dec_print_global_stats();
 
     qemu_mutex_lock(&g_sim_decoder->lock);
-    QTAILQ_FOREACH_SAFE(entry, &g_sim_decoder->map_list, next, tmp) {
+    while ((entry = QTAILQ_FIRST(&g_sim_decoder->map_list)) != NULL) {
         QTAILQ_REMOVE(&g_sim_decoder->map_list, entry, next);
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+
+        sim_dec_cleanup_coherence_entry(entry);
+
+        qemu_mutex_lock(&g_sim_decoder->lock);
         if (sim_dec_is_gva_entry(entry)) {
             sim_dec_gva_ownership_unregister_entry(entry);
             entry->gva_ownership_registered = false;
         }
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+
         sim_dec_map_entry_destroy(entry);
+
+        qemu_mutex_lock(&g_sim_decoder->lock);
     }
-    QTAILQ_FOREACH_SAFE(entry, &g_sim_decoder->retired_map_list, next, tmp) {
+    while ((entry = QTAILQ_FIRST(&g_sim_decoder->retired_map_list)) != NULL) {
         QTAILQ_REMOVE(&g_sim_decoder->retired_map_list, entry, next);
         sim_dec_map_entry_destroy(entry);
     }
@@ -8069,6 +8208,7 @@ static int sim_dec_gva_lookup_ma_by_uba(uint32_t vmid, uint32_t asid,
     result->mp_ubc_port = entry->mp_ubc_port;
     result->mp_lane = entry->mp_lane;
     result->mp_link_id = entry->mp_link_id;
+    result->cache_policy = entry->cache_policy;
     qemu_mutex_unlock(&g_sim_decoder->lock);
     return 0;
 }
@@ -8218,14 +8358,33 @@ static bool sim_dec_route_blocks_overlap(const SimDecMapEntry *entry)
             entry->state == SIM_DEC_ROUTE_ERROR);
 }
 
+static bool sim_dec_range_end(uint64_t base, uint64_t size, uint64_t *end)
+{
+    if (size == 0 || UINT64_MAX - base < size) {
+        return false;
+    }
+    if (end) {
+        *end = base + size;
+    }
+    return true;
+}
+
 static bool sim_dec_check_overlap(uint64_t pa, uint64_t size)
 {
     SimDecMapEntry *entry;
-    uint64_t end = pa + size;
+    uint64_t end;
+
+    if (!sim_dec_range_end(pa, size, &end)) {
+        return true;
+    }
 
     QTAILQ_FOREACH(entry, &g_sim_decoder->map_list, next) {
         if (sim_dec_route_blocks_overlap(entry)) {
-            uint64_t entry_end = entry->local_pa + entry->size;
+            uint64_t entry_end;
+
+            if (!sim_dec_range_end(entry->local_pa, entry->size, &entry_end)) {
+                return true;
+            }
             if (!(end <= entry->local_pa || pa >= entry_end)) {
                 return true;
             }
@@ -8301,7 +8460,9 @@ static bool sim_dec_check_gva_route_overlap(const SimDecGvaMapReq *req)
         return false;
     }
 
-    end = req->map_req.remote_uba + req->map_req.size;
+    if (!sim_dec_range_end(req->map_req.remote_uba, req->map_req.size, &end)) {
+        return true;
+    }
     QTAILQ_FOREACH(entry, &g_sim_decoder->map_list, next) {
         uint64_t entry_end;
 
@@ -8312,7 +8473,9 @@ static bool sim_dec_check_gva_route_overlap(const SimDecGvaMapReq *req)
             continue;
         }
 
-        entry_end = entry->remote_uba + entry->size;
+        if (!sim_dec_range_end(entry->remote_uba, entry->size, &entry_end)) {
+            return true;
+        }
         if (!(end <= entry->remote_uba ||
               req->map_req.remote_uba >= entry_end)) {
             qemu_log("SIM_DEC: GVA route overlap detected vmid=%" PRIu32
@@ -8358,7 +8521,7 @@ static bool sim_dec_gva_ranges_overlap(uint64_t base_a, uint64_t size_a,
     if (size_a == 0 || size_b == 0 ||
         UINT64_MAX - base_a < size_a ||
         UINT64_MAX - base_b < size_b) {
-        return false;
+        return true;
     }
 
     end_a = base_a + size_a;
@@ -8521,7 +8684,9 @@ static int sim_dec_gva_ownership_register_req(const SimDecGvaMapReq *req,
             g_string_append_printf(next_data, "%s\n", lines[i]);
             continue;
         }
-        if (strcmp(rec.node_id, node_id) == 0 && rec.map_id == map_id) {
+        if (strcmp(rec.node_id, node_id) == 0 &&
+            rec.map_id == map_id &&
+            rec.gva_id == req->gva_id) {
             continue;
         }
 
@@ -8989,6 +9154,15 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
         resp->status = SIM_DEC_STATUS_INVALID_PARAM;
         return -1;
     }
+    if (!sim_dec_range_end(req->map_req.local_pa, req->map_req.size, NULL) ||
+        !sim_dec_range_end(req->map_req.remote_uba, req->map_req.size, NULL)) {
+        qemu_log("SIM_DEC: GVA invalid range local_pa=%" PRIx64
+                 " remote_uba=%" PRIx64 " size=%" PRIx64 "\n",
+                 req->map_req.local_pa, req->map_req.remote_uba,
+                 req->map_req.size);
+        resp->status = SIM_DEC_STATUS_INVALID_PARAM;
+        return -1;
+    }
 
     if (req->map_req.token_id == 0) {
         qemu_log("SIM_DEC: GVA token_id cannot be 0\n");
@@ -9015,7 +9189,8 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
     if (req->cache_policy != SIM_DEC_CACHE_POLICY_NC &&
         req->cache_policy != SIM_DEC_CACHE_POLICY_WRITE_THROUGH &&
         req->cache_policy != SIM_DEC_CACHE_POLICY_READ_CACHE &&
-        req->cache_policy != SIM_DEC_CACHE_POLICY_WRITE_BACK) {
+        req->cache_policy != SIM_DEC_CACHE_POLICY_WRITE_BACK &&
+        req->cache_policy != SIM_DEC_CACHE_POLICY_DIRECTORY_MESI) {
         qemu_log("SIM_DEC: GVA unsupported cache_policy=%" PRIu32 "\n",
                  req->cache_policy);
         resp->status = SIM_DEC_STATUS_INVALID_PARAM;
@@ -9034,6 +9209,16 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
         !(req->access_flags & SIM_DEC_GVA_ACCESS_EXPLICIT_SYNC)) {
         qemu_log("SIM_DEC: GVA write_back requires EXPLICIT_SYNC access_flags=%" PRIu32 "\n",
                  req->access_flags);
+        resp->status = SIM_DEC_STATUS_INVALID_PARAM;
+        return -1;
+    }
+
+    if (req->cache_policy == SIM_DEC_CACHE_POLICY_DIRECTORY_MESI &&
+        g_sim_decoder->bcs && g_sim_decoder->bcs->ubc_dev &&
+        req->map_req.dcna == g_sim_decoder->bcs->ubc_dev->parent.cna) {
+        qemu_log("SIM_DEC: GVA directory_mesi requires remote home dcna=%" PRIu32
+                 " local_cna=%" PRIu32 "\n",
+                 req->map_req.dcna, g_sim_decoder->bcs->ubc_dev->parent.cna);
         resp->status = SIM_DEC_STATUS_INVALID_PARAM;
         return -1;
     }
@@ -9176,6 +9361,14 @@ static int sim_dec_handle_map(const SimDecMapReq *req, SimDecMapResp *resp)
         resp->status = SIM_DEC_STATUS_INVALID_PARAM;
         return -1;
     }
+    if (!sim_dec_range_end(req->local_pa, req->size, NULL) ||
+        !sim_dec_range_end(req->remote_uba, req->size, NULL)) {
+        qemu_log("SIM_DEC: invalid range local_pa=%" PRIx64
+                 " remote_uba=%" PRIx64 " size=%" PRIx64 "\n",
+                 req->local_pa, req->remote_uba, req->size);
+        resp->status = SIM_DEC_STATUS_INVALID_PARAM;
+        return -1;
+    }
 
     if (req->token_id == 0) {
         qemu_log("SIM_DEC: token_id cannot be 0\n");
@@ -9268,6 +9461,28 @@ static int sim_dec_handle_unmap(const SimDecUnmapReq *req)
         }
     }
 
+    /* Flush dirty coherence cache lines before unmapping */
+    if (entry->cache_policy == SIM_DEC_CACHE_POLICY_DIRECTORY_MESI) {
+        uint32_t home_cna = entry->dcna;
+        uint32_t token_id = entry->token_id;
+        int fence_ret;
+
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        fence_ret = obmm_coh_send_fence(g_sim_decoder->bcs->ubc_dev, home_cna,
+                                        entry->remote_uba, entry->size,
+                                        token_id);
+        qemu_mutex_lock(&g_sim_decoder->lock);
+        if (fence_ret != 0) {
+            qemu_mutex_unlock(&g_sim_decoder->lock);
+            qemu_log("SIM_DEC: UNMAP failed - coherence fence map_id=%" PRIx64
+                     " ret=%d\n", req->map_id, fence_ret);
+            return SIM_DEC_STATUS_BACKEND_ERROR;
+        }
+        obmm_coh_invalidate_local_range(g_sim_decoder->bcs->ubc_dev, home_cna,
+                                        entry->remote_uba, entry->size,
+                                        token_id);
+    }
+
     gva_entry = sim_dec_is_gva_entry(entry);
     entry->active = false;
     entry->state = SIM_DEC_ROUTE_RETIRED;
@@ -9323,7 +9538,7 @@ static int sim_dec_handle_sync(const SimDecSyncReq *req)
         return SIM_DEC_STATUS_INVALID_PARAM;
     }
 
-    if (req->offset + req->len > entry->size) {
+    if (req->offset > entry->size || req->len > entry->size - req->offset) {
         qemu_mutex_unlock(&g_sim_decoder->lock);
         return SIM_DEC_STATUS_INVALID_PARAM;
     }
@@ -9332,6 +9547,17 @@ static int sim_dec_handle_sync(const SimDecSyncReq *req)
     remote_uba = entry->remote_uba;
     offset = req->offset;
     len = req->len;
+    if (entry->cache_policy == SIM_DEC_CACHE_POLICY_DIRECTORY_MESI) {
+        uint32_t home_cna = entry->dcna;
+        uint32_t token_id = entry->token_id;
+
+        qemu_mutex_unlock(&g_sim_decoder->lock);
+        if (obmm_coh_send_fence(g_sim_decoder->bcs->ubc_dev, home_cna,
+                                remote_uba + offset, len, token_id) != 0) {
+            return SIM_DEC_STATUS_BACKEND_ERROR;
+        }
+        return SIM_DEC_STATUS_SUCCESS;
+    }
 
     /* Flush dirty write-back cache before sync read */
     if (entry->page_cache) {
@@ -9787,6 +10013,7 @@ static int sim_dec_lookup_result_by_pa(uint64_t pa,
         result->mp_ubc_port = entry->mp_ubc_port;
         result->mp_lane = entry->mp_lane;
         result->mp_link_id = entry->mp_link_id;
+        result->cache_policy = entry->cache_policy;
         qemu_mutex_unlock(&g_sim_decoder->lock);
         return 0;
     }
@@ -9921,6 +10148,18 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             resp_hdr->status = query_resp.status ? SIM_DEC_STATUS_INVALID_PARAM
                                                   : SIM_DEC_STATUS_SUCCESS;
         }
+        break;
+
+    case SIM_DEC_OP_COH_FENCE:
+        min_len = sizeof(*hdr) + sizeof(SimDecSyncReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        resp_hdr->status = sim_dec_handle_sync(
+            (const SimDecSyncReq *)(data + sizeof(*hdr)));
+        resp_hdr->payload_len = 0;
+        ret = 0;
         break;
 
     case SIM_DEC_OP_OBMM_BOOTSTRAP_PUBLISH:

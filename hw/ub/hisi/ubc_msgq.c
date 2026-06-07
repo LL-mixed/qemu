@@ -21,6 +21,7 @@
 #include "hw/ub/ub.h"
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_ubc.h"
+#include "hw/ub/obmm_coherence.h"
 #include "hw/ub/ub_config.h"
 #include "hw/ub/ub_msg.h"
 #include "hw/ub/ub_sec.h"
@@ -912,6 +913,98 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
                             data_base += op->data_len;
                         }
                     }
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_FENCE: {
+                if (payload_len >= sizeof(ObmmCohFencePld)) {
+                    const ObmmCohFencePld *pld = (const ObmmCohFencePld *)payload;
+                    obmm_coh_handle_rx_fence(s->ubc_dev, pld, header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_FENCE_ACK: {
+                if (payload_len >= sizeof(ObmmCohFenceAckPld)) {
+                    const ObmmCohFenceAckPld *pld = (const ObmmCohFenceAckPld *)payload;
+                    obmm_coh_handle_rx_fence_ack(s->ubc_dev, pld, header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_GETS: {
+                if (payload_len >= sizeof(ObmmCohMsgHdr)) {
+                    const ObmmCohMsgHdr *pld = (const ObmmCohMsgHdr *)payload;
+                    obmm_coh_handle_rx_gets(s->ubc_dev, pld, header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_DATA: {
+                if (payload_len >= sizeof(ObmmCohDataPld)) {
+                    const ObmmCohDataPld *pld = (const ObmmCohDataPld *)payload;
+                    obmm_coh_handle_rx_data(s->ubc_dev, pld, header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_GETM: {
+                if (payload_len >= sizeof(ObmmCohMsgHdr)) {
+                    const ObmmCohMsgHdr *pld = (const ObmmCohMsgHdr *)payload;
+                    obmm_coh_handle_rx_getm(s->ubc_dev, pld, header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_INV: {
+                if (payload_len >= sizeof(ObmmCohInvPld)) {
+                    const ObmmCohInvPld *pld = (const ObmmCohInvPld *)payload;
+                    obmm_coh_handle_rx_inv(s->ubc_dev, pld, header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_INV_ACK: {
+                if (payload_len >= sizeof(ObmmCohInvAckPld)) {
+                    const ObmmCohInvAckPld *pld = (const ObmmCohInvAckPld *)payload;
+                    obmm_coh_handle_rx_inv_ack(s->ubc_dev, pld, header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_DOWNGRADE: {
+                if (payload_len >= sizeof(ObmmCohDowngradePld)) {
+                    const ObmmCohDowngradePld *pld =
+                        (const ObmmCohDowngradePld *)payload;
+                    obmm_coh_handle_rx_downgrade(s->ubc_dev, pld,
+                                                 header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_DOWNGRADE_ACK: {
+                if (payload_len >= sizeof(ObmmCohDowngradeAckPld)) {
+                    const ObmmCohDowngradeAckPld *pld =
+                        (const ObmmCohDowngradeAckPld *)payload;
+                    obmm_coh_handle_rx_downgrade_ack(s->ubc_dev, pld,
+                                                     header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_WB: {
+                if (payload_len >= sizeof(ObmmCohWbPld)) {
+                    const ObmmCohWbPld *pld = (const ObmmCohWbPld *)payload;
+                    obmm_coh_handle_rx_wb(s->ubc_dev, pld, header->nth.scna);
+                }
+                g_free(buf);
+                continue;
+            }
+            case UBC_MSG_SUB_COH_WB_ACK: {
+                if (payload_len >= sizeof(ObmmCohWbAckPld)) {
+                    const ObmmCohWbAckPld *pld = (const ObmmCohWbAckPld *)payload;
+                    obmm_coh_handle_rx_wb_ack(s->ubc_dev, pld, header->nth.scna);
                 }
                 g_free(buf);
                 continue;
