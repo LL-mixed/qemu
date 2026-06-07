@@ -1338,6 +1338,7 @@ void obmm_coh_handle_rx_gets(BusControllerDev *ubc_dev,
     }
 
     obmm_coh_init_once();
+retry_dir:
     qemu_mutex_lock(&g_obmm_coh_lock);
     dir = obmm_coh_get_dir_locked(pld->line_addr, ubc_dev->parent.cna,
                                   pld->token_id);
@@ -1346,14 +1347,7 @@ void obmm_coh_handle_rx_gets(BusControllerDev *ubc_dev,
         (void)obmm_coh_wait_dir_not_pending(ubc_dev, pld->line_addr,
                                             ubc_dev->parent.cna,
                                             pld->token_id, "GETS");
-        qemu_mutex_lock(&g_obmm_coh_lock);
-        dir = obmm_coh_get_dir_locked(pld->line_addr, ubc_dev->parent.cna,
-                                      pld->token_id);
-        dir->pending = true;
-        dir_pending = true;
-    } else {
-        dir->pending = true;
-        dir_pending = true;
+        goto retry_dir;
     }
     if (data.status == 0 && dir->has_owner && dir->owner_cna != src_cna) {
         owner_cna = dir->owner_cna;
@@ -1375,6 +1369,32 @@ void obmm_coh_handle_rx_gets(BusControllerDev *ubc_dev,
         data.status = 1;
         data.data_len = 0;
         fail_reason = "sharer_overflow";
+    }
+    if (data.status == 0 && !need_owner_downgrade && !need_owner_inv) {
+        if (obmm_coh_home_read_line(ubc_dev, dir, pld->line_addr,
+                                    pld->token_id, data.data) != MEMTX_OK) {
+            data.status = 1;
+            data.data_len = 0;
+            fail_reason = "local_read_failed";
+        } else {
+            dir->has_owner = false;
+            dir->dirty = false;
+            data.grant_state = OBMM_COH_S;
+            dir->state = OBMM_COH_S;
+            if (!obmm_coh_dir_add_sharer(dir, src_cna)) {
+                data.status = 1;
+                data.data_len = 0;
+                fail_reason = "requester_add_sharer_failed";
+            } else {
+                dir->version++;
+            }
+        }
+        qemu_mutex_unlock(&g_obmm_coh_lock);
+        goto send_data;
+    }
+    if (data.status == 0) {
+        dir->pending = true;
+        dir_pending = true;
     }
     qemu_mutex_unlock(&g_obmm_coh_lock);
 
@@ -1452,15 +1472,8 @@ void obmm_coh_handle_rx_gets(BusControllerDev *ubc_dev,
         }
         dir->has_owner = false;
         dir->dirty = false;
-        if (dir->sharer_count == 0) {
-            data.grant_state = OBMM_COH_E;
-            dir->owner_cna = src_cna;
-            dir->has_owner = true;
-            dir->state = OBMM_COH_E;
-        } else {
-            data.grant_state = OBMM_COH_S;
-            dir->state = OBMM_COH_S;
-        }
+        data.grant_state = OBMM_COH_S;
+        dir->state = OBMM_COH_S;
         if (!obmm_coh_dir_add_sharer(dir, src_cna)) {
             data.status = 1;
             data.data_len = 0;
