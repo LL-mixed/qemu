@@ -293,6 +293,7 @@ typedef struct QEMU_PACKED SimDecGsvaMapReq {
     uint64_t token_value;
     uint32_t source;
     uint32_t address_profile;
+    uint32_t access_flags;
 } SimDecGsvaMapReq;
 
 /* GSVA map response */
@@ -10356,7 +10357,7 @@ static int sim_dec_handle_gsva_map(const SimDecGsvaMapReq *req,
                                   0, /* home_cna from key context */
                                   (uint32_t)req->token_id,
                                   (uint32_t)req->token_value,
-                                  0, /* access_flags from key context */
+                                  req->access_flags,
                                   &resp->map_id);
 
     if (resp->error != GSVA_OK) {
