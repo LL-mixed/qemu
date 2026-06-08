@@ -19,6 +19,59 @@ void gsva_coh_table_init(GsvaCohTable *tbl)
     tbl->object_count = 0;
 }
 
+static uint64_t gsva_coh_timeout_ms(void)
+{
+    const char *env = g_getenv("GSVA_COH_TIMEOUT_MS");
+    char *end = NULL;
+    uint64_t value = 5000;
+
+    if (env && *env) {
+        value = g_ascii_strtoull(env, &end, 0);
+        if (end == env) {
+            value = 5000;
+        }
+    }
+    return value;
+}
+
+static bool gsva_coh_hold_pending_enabled(void)
+{
+    const char *env = g_getenv("GSVA_COH_HOLD_PENDING");
+
+    return env && g_strcmp0(env, "1") == 0;
+}
+
+static bool gsva_coh_object_maybe_timeout(GsvaCohObject *obj,
+                                           uint64_t now_ms,
+                                           uint64_t timeout_ms)
+{
+    uint64_t start_ms;
+    uint64_t elapsed;
+
+    if (!obj || !obj->pending || obj->state == GSVA_COH_RETIRED ||
+        obj->state == GSVA_COH_TIMEOUT || timeout_ms == 0) {
+        return false;
+    }
+
+    start_ms = obj->pending_start_ms ? obj->pending_start_ms :
+                                       obj->create_time_ms;
+    elapsed = now_ms >= start_ms ? now_ms - start_ms : 0;
+    if (elapsed < timeout_ms) {
+        return false;
+    }
+
+    qemu_log("GSVA_COH: TIMEOUT segment_id=%#" PRIx64
+             " seq=%" PRIu64 " elapsed=%" PRIu64 "ms"
+             " waiting_for=%#" PRIx64 "\n",
+             obj->key.segment_id, obj->pending_seq, elapsed,
+             obj->pending_ack_bitmap);
+    obj->state = GSVA_COH_TIMEOUT;
+    obj->pending = false;
+    obj->pending_ack_bitmap = 0;
+    obj->pending_start_ms = 0;
+    return true;
+}
+
 void gsva_coh_table_destroy(GsvaCohTable *tbl)
 {
     GsvaCohObject *obj;
@@ -67,6 +120,7 @@ int gsva_coh_object_create(GsvaCohTable *tbl, const GsvaKeyV1 *key,
     obj->pending_op = 0;
     obj->pending_target = 0;
     obj->pending_ack_bitmap = 0;
+    obj->pending_start_ms = 0;
     obj->map_id = map_id;
     obj->create_time_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
 
@@ -148,8 +202,17 @@ int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
         return GSVA_ERR_SEGMENT_RETIRED;
     }
 
+    if (gsva_coh_object_maybe_timeout(obj,
+                                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                                      gsva_coh_timeout_ms())) {
+        return GSVA_ERR_COH_TIMEOUT;
+    }
+
     if (obj->state == GSVA_COH_TIMEOUT) {
-        return GSVA_ERR_COH_PENDING;
+        qemu_log("GSVA_COH: ReadAcquire timeout segment_id=%#" PRIx64
+                 " cna=%" PRIu32 "\n",
+                 key->segment_id, requester_cna);
+        return GSVA_ERR_COH_TIMEOUT;
     }
 
     if (obj->pending) {
@@ -245,8 +308,17 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
         return GSVA_ERR_SEGMENT_RETIRED;
     }
 
+    if (gsva_coh_object_maybe_timeout(obj,
+                                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                                      gsva_coh_timeout_ms())) {
+        return GSVA_ERR_COH_TIMEOUT;
+    }
+
     if (obj->state == GSVA_COH_TIMEOUT) {
-        return GSVA_ERR_COH_PENDING;
+        qemu_log("GSVA_COH: WriteAcquire timeout segment_id=%#" PRIx64
+                 " cna=%" PRIu32 "\n",
+                 key->segment_id, requester_cna);
+        return GSVA_ERR_COH_TIMEOUT;
     }
 
     if (obj->pending) {
@@ -288,14 +360,25 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
             obj->pending_op = 1; /* invalidate */
             obj->pending_target = requester_cna;
             obj->pending_ack_bitmap = other_sharers;
+            obj->pending_start_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
             qemu_log("GSVA_COH: WriteAcquire S->M pending inv"
                      " cna=%" PRIu32 " waiting_for=%#" PRIx64
                      " seq=%" PRIu64 "\n",
                      requester_cna, other_sharers, obj->pending_seq);
 
+            if (gsva_coh_hold_pending_enabled()) {
+                qemu_log("GSVA_COH: pending held seq=%" PRIu64
+                         " segment_id=%#" PRIx64
+                         " timeout_ms=%" PRIu64 "\n",
+                         obj->pending_seq, key->segment_id,
+                         gsva_coh_timeout_ms());
+                return GSVA_ERR_COH_PENDING;
+            }
+
             /* V1 sim: immediately acknowledge all invalidations */
             obj->pending_ack_bitmap = 0;
             obj->pending = false;
+            obj->pending_start_ms = 0;
         }
         obj->state = GSVA_COH_M;
         obj->owner_cna = requester_cna;
@@ -436,6 +519,19 @@ int gsva_coh_retry(GsvaCohTable *tbl, const GsvaKeyV1 *key, uint64_t seq)
         return GSVA_ERR_ROUTE_MISSING;
     }
 
+    if (gsva_coh_object_maybe_timeout(obj,
+                                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                                      gsva_coh_timeout_ms())) {
+        qemu_log("GSVA_COH: Retry timeout seq=%" PRIu64
+                 " segment_id=%#" PRIx64 "\n",
+                 seq, key->segment_id);
+        return GSVA_ERR_COH_TIMEOUT;
+    }
+
+    if (obj->state == GSVA_COH_TIMEOUT) {
+        return GSVA_ERR_COH_TIMEOUT;
+    }
+
     if (!obj->pending) {
         return GSVA_OK; /* already complete */
     }
@@ -447,6 +543,7 @@ int gsva_coh_retry(GsvaCohTable *tbl, const GsvaKeyV1 *key, uint64_t seq)
     /* V1 sim: synchronous — if still pending, treat as timeout check */
     if (obj->pending_ack_bitmap == 0) {
         obj->pending = false;
+        obj->pending_start_ms = 0;
         return GSVA_OK;
     }
 
@@ -479,14 +576,8 @@ int gsva_coh_check_timeouts(GsvaCohTable *tbl, uint64_t now_ms,
     QTAILQ_FOREACH(obj, &tbl->objects, next) {
         if (obj->pending && obj->state != GSVA_COH_RETIRED &&
             obj->state != GSVA_COH_TIMEOUT) {
-            uint64_t elapsed = now_ms - obj->create_time_ms;
-            if (elapsed > timeout_ms) {
-                obj->state = GSVA_COH_TIMEOUT;
-                obj->pending = false;
+            if (gsva_coh_object_maybe_timeout(obj, now_ms, timeout_ms)) {
                 count++;
-                qemu_log("GSVA_COH: TIMEOUT segment_id=%#" PRIx64
-                         " elapsed=%" PRIu64 "ms\n",
-                         obj->key.segment_id, elapsed);
             }
         }
     }

@@ -70,6 +70,7 @@ typedef struct GsvaCohObject {
     uint32_t pending_op;
     uint32_t pending_target;
     uint64_t pending_ack_bitmap;
+    uint64_t pending_start_ms;
     uint64_t map_id;
     uint64_t create_time_ms;
     QTAILQ_ENTRY(GsvaCohObject) next;

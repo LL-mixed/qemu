@@ -10461,7 +10461,8 @@ int gsva_arm_mmu_translate_full(uint64_t va, bool is_write,
                  " segment_id=%#" PRIx64 "\n",
                  gsva_coh_state_name(coh_obj->state),
                  va, coh_obj->key.segment_id);
-        return GSVA_ERR_COH_PENDING;
+        return coh_obj->state == GSVA_COH_TIMEOUT ?
+               GSVA_ERR_COH_TIMEOUT : GSVA_ERR_COH_PENDING;
     }
 
     if (is_write && coh_obj->state != GSVA_COH_M &&
