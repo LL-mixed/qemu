@@ -125,6 +125,10 @@ int gsva_coh_write_acquire_tx(GsvaCohTable *tbl, const GsvaRouteTable *routes,
 int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
                     uint32_t requester_cna);
 
+/* Retire with optional UB Link transport for remote holder revoke. */
+int gsva_coh_retire_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
+                       const GsvaKeyV1 *key, uint32_t requester_cna);
+
 /* Check and set timeout on pending objects. Returns count of timed-out objects. */
 int gsva_coh_check_timeouts(GsvaCohTable *tbl, uint64_t now_ms,
                             uint64_t timeout_ms);

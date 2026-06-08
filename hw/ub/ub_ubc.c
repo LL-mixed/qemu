@@ -11054,6 +11054,18 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             } else {
                 SimDecGsvaUnmapReq unmap_req = {0};
                 SimDecGsvaUnmapResp unmap_resp = {0};
+                ev_rc = gsva_coh_retire_tx(&g_gsva_coh,
+                                           g_sim_decoder &&
+                                           g_sim_decoder->bcs ?
+                                           g_sim_decoder->bcs->ubc_dev : NULL,
+                                           ev_key, requester_cna);
+                if (ev_rc == GSVA_ERR_COH_PENDING) {
+                    break;
+                }
+                if (ev_rc != GSVA_OK &&
+                    ev_rc != GSVA_ERR_SEGMENT_RETIRED) {
+                    break;
+                }
                 unmap_req.version = 1;
                 unmap_req.key = *ev_key;
                 unmap_req.map_id = route->map_id;
