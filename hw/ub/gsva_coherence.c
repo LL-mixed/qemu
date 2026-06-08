@@ -371,7 +371,12 @@ int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
         return GSVA_ERR_SEGMENT_RETIRED;
     }
 
-    /* V1 sim: directly retire, no pending revoke in sim mode.
+    qemu_log("GSVA_COH: Retire revoke holders segment_id=%#" PRIx64
+             " state=%s owner=%" PRIu32 " sharers=%#" PRIx64 "\n",
+             key->segment_id, gsva_coh_state_name(obj->state),
+             obj->owner_cna, obj->sharer_bitmap);
+
+    /* V1 sim: directly retire after holder revoke accounting.
      * Also allow retiring from TIMEOUT state for cleanup. */
     obj->state = GSVA_COH_RETIRED;
     obj->owner_cna = 0;

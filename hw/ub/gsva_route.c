@@ -174,6 +174,17 @@ int gsva_route_unmap(GsvaRouteTable *tbl, uint64_t map_id, bool keep_tombstone)
         }
     }
 
+    QTAILQ_FOREACH(entry, &tbl->tombstones, next) {
+        if (entry->map_id == map_id) {
+            qemu_log("GSVA_UNMAP: map_id=%" PRIu64
+                     " already tombstoned segment_id=%#" PRIx64
+                     " home_va=%#" PRIx64 " epoch=%" PRIu64 "\n",
+                     map_id, entry->key.segment_id, entry->key.home_va,
+                     entry->key.epoch);
+            return GSVA_OK;
+        }
+    }
+
     qemu_log("GSVA_UNMAP: map_id=%" PRIu64 " not found\n", map_id);
     return GSVA_ERR_ROUTE_MISSING;
 }
