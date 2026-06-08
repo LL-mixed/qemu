@@ -8378,6 +8378,9 @@ static bool sim_dec_gva_tcg_enabled(void)
     return cached != 0;
 }
 
+static bool sim_dec_gsva_route_translate(uint64_t page_va, bool is_write,
+                                    uint64_t *local_pa, uint64_t *page_size);
+
 bool sim_dec_gva_tcg_translate(uint64_t va, bool is_write,
                                uint64_t *local_pa, uint64_t *page_size)
 {
@@ -8394,6 +8397,10 @@ bool sim_dec_gva_tcg_translate(uint64_t va, bool is_write,
     entry = sim_dec_find_gva_route_by_va_locked(page_va, is_write);
     if (!entry) {
         qemu_mutex_unlock(&g_sim_decoder->lock);
+        /* Try GSVA route table as fallback */
+        if (sim_dec_gsva_route_translate(page_va, is_write, local_pa, page_size)) {
+            return true;
+        }
         return false;
     }
 
@@ -10151,6 +10158,26 @@ static void gsva_tables_init(void)
         g_gsva_initialized = true;
     }
 }
+/* Helper for sim_dec_gva_tcg_translate to look up GSVA routes.
+ * Defined here after g_gsva_routes/g_gsva_initialized are declared. */
+bool sim_dec_gsva_route_translate(uint64_t page_va, bool is_write,
+                                  uint64_t *local_pa, uint64_t *page_size)
+{
+    GsvaRouteEntry *gsva_entry;
+    if (!g_gsva_initialized) {
+        return false;
+    }
+    gsva_entry = gsva_route_lookup_va(&g_gsva_routes, 0, 0, page_va);
+    if (gsva_entry && gsva_entry->local_pa) {
+        *local_pa = gsva_entry->local_pa + (page_va - gsva_entry->local_va);
+        *page_size = SIM_DEC_PAGE_SIZE;
+        qemu_log("GSVA_TCG va=0x%" PRIx64 " -> pa=0x%" PRIx64
+                 " map_id=0x%" PRIx64 "\n",
+                 page_va, *local_pa, gsva_entry->map_id);
+        return true;
+    }
+    return false;
+}
 
 static unsigned gsva_tlb_stable_index(uint64_t va)
 {
@@ -10378,6 +10405,27 @@ static int sim_dec_handle_gsva_map(const SimDecGsvaMapReq *req,
         return -1;
     }
 
+    /* Register IO memory region so CPU accesses to local_pa are intercepted */
+    if (g_sim_decoder && g_sim_decoder->bcs && g_sim_decoder->bcs->ubc_dev) {
+        GsvaRouteEntry *route = NULL;
+        QTAILQ_FOREACH(route, &g_gsva_routes.routes, next) {
+            if (route->map_id == resp->map_id)
+                break;
+        }
+        if (route && route->local_pa && req->key.size) {
+            memory_region_init_io(&route->cpu_window,
+                                  OBJECT(DEVICE(g_sim_decoder->bcs->ubc_dev)),
+                                  &sim_dec_cpu_window_ops, route,
+                                  "gsva-cpu-window", req->key.size);
+            memory_region_add_subregion_overlap(get_system_memory(),
+                                                route->local_pa,
+                                                &route->cpu_window, 10);
+            route->cpu_window_mapped = true;
+            qemu_log("GSVA_MAP: cpu_window registered at pa=%" PRIx64
+                     " size=%" PRIx64 "\n", route->local_pa, req->key.size);
+        }
+    }
+
     gsva_stats_map(&g_gsva_stats, true);
     return 0;
 }
@@ -10439,6 +10487,15 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
                          route->key.segment_id);
             }
         }
+    }
+
+    /* Remove IO memory region before route cleanup */
+    if (route && route->cpu_window_mapped) {
+        memory_region_del_subregion(get_system_memory(), &route->cpu_window);
+        object_unparent(OBJECT(&route->cpu_window));
+        route->cpu_window_mapped = false;
+        qemu_log("GSVA_UNMAP: cpu_window removed from pa=%" PRIx64 "\n",
+                 route->local_pa);
     }
 
     /* Always keep tombstone for GSVA unmap (epoch tracking) */

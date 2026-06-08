@@ -11,6 +11,7 @@
 #include "qemu/osdep.h"
 #include "qemu/queue.h"
 #include "hw/ub/gsva_key.h"
+#include "exec/memory.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -44,6 +45,8 @@ typedef struct GsvaRouteEntry {
     uint32_t owner_cna;
     GsvaTokenLease token;
     uint64_t map_id;
+    MemoryRegion cpu_window;
+    bool cpu_window_mapped;
     QTAILQ_ENTRY(GsvaRouteEntry) next;
 } GsvaRouteEntry;
 
