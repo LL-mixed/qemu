@@ -554,6 +554,8 @@ static int sim_dec_lookup_result_by_pa(uint64_t pa,
 static bool sim_dec_gva_tcg_enabled(void);
 static void sim_dec_flush_gva_tlbs(const char *reason);
 static void gsva_tlb_stable_flush_all(const char *reason);
+static void gsva_tlb_stable_flush_key(const GsvaKeyV1 *key,
+                                      const char *reason);
 static int sim_dec_gva_ownership_register_req(const SimDecGvaMapReq *req,
                                               uint64_t map_id);
 static void sim_dec_gva_ownership_unregister_entry(
@@ -10317,6 +10319,41 @@ static void gsva_tlb_stable_flush_all(const char *reason)
              reason ? reason : "unspecified");
 }
 
+static void gsva_tlb_stable_flush_key(const GsvaKeyV1 *key,
+                                      const char *reason)
+{
+    CPUState *src = current_cpu ? current_cpu : first_cpu;
+    uint64_t end;
+    unsigned cleared = 0;
+    int i;
+
+    if (!key || key->size == 0 || UINT64_MAX - key->home_va < key->size) {
+        return;
+    }
+
+    end = key->home_va + key->size;
+    for (i = 0; i < GSVA_TLB_STABLE_SIZE; i++) {
+        GsvaTlbSideEntry *e = &g_gsva_tlb_stable[i];
+
+        if (!e->valid || e->segment_id != key->segment_id ||
+            e->va < key->home_va || e->va >= end) {
+            continue;
+        }
+        memset(e, 0, sizeof(*e));
+        cleared++;
+    }
+
+    if (src && gsva_arm_mmu_enabled()) {
+        tlb_flush_all_cpus_synced(src);
+    }
+
+    qemu_log("GSVA_TLB: flush reason=%s segment_id=%#" PRIx64
+             " home_va=%#" PRIx64 " size=%#" PRIx64
+             " cleared=%u\n",
+             reason ? reason : "unspecified",
+             key->segment_id, key->home_va, key->size, cleared);
+}
+
 static int gsva_tlb_stale_check(uint64_t va, uint64_t current_epoch)
 {
     unsigned idx = gsva_tlb_stable_index(va);
@@ -10954,6 +10991,9 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
                 ev_rc = gsva_route_ack_token_revoke(&g_gsva_routes, ev_key,
                                                     token_id, token_value,
                                                     requester_cna);
+                if (ev_rc == GSVA_OK) {
+                    gsva_tlb_stable_flush_key(ev_key, "token_revoke_ack");
+                }
             } else {
                 ev_rc = gsva_coh_inv_ack(&g_gsva_coh, ev_key, requester_cna,
                                          token_id /* reuse as seq */);
@@ -10966,6 +11006,9 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         case 6: /* TokenChange */
             ev_rc = gsva_route_rotate_token(&g_gsva_routes, ev_key,
                                             token_id, token_value);
+            if (ev_rc == GSVA_OK) {
+                gsva_tlb_stable_flush_key(ev_key, "token_revoke_pending");
+            }
             break;
         default:
             ev_rc = GSVA_ERR_BAD_VERSION;
