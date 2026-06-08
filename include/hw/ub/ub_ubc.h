@@ -395,7 +395,14 @@ void ubc_handle_read_response(BusControllerDev *ubc_dev, const UBCReadRespPld *r
 #define UBC_MSG_SUB_COH_DOWNGRADE    14
 #define UBC_MSG_SUB_COH_DOWNGRADE_ACK 15
 
-/* GSVA coherence subcodes (16-23) */
+/*
+ * GSVA coherence uses one 4-bit carrier subcode and carries the concrete
+ * operation in GsvaCohMsgV1.op.  The UB message header stores sub_msg_code in
+ * 4 bits, so values above 15 are not wire-safe.
+ */
+#define UBC_MSG_SUB_GSVA_COH             15
+
+/* Legacy symbolic GSVA op subcodes. Do not put these values on the wire. */
 #define UBC_MSG_SUB_GSVA_COH_READ_ACQ    16
 #define UBC_MSG_SUB_GSVA_COH_READ_ACK    17
 #define UBC_MSG_SUB_GSVA_COH_WRITE_ACQ   18

@@ -798,6 +798,25 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
             src_eid[1] = (header->seid_l >> 8) & 0xFF;
             src_eid[2] = header->seid_h & 0xFF;
 
+            if (header->msgetah.sub_msg_code == UBC_MSG_SUB_GSVA_COH &&
+                payload_len >= sizeof(GsvaCohMsgV1)) {
+                const GsvaCohMsgV1 *gsva_msg = (const GsvaCohMsgV1 *)payload;
+
+                if (gsva_msg->version == 1 &&
+                    gsva_msg->op >= GSVA_COH_MSG_INVALIDATE &&
+                    gsva_msg->op <= GSVA_COH_MSG_TOKEN_ACK) {
+                    qemu_log("GSVA_COH: ub_link rx sub=%u op=%u scna=%#x"
+                             " payload_len=%u\n",
+                             header->msgetah.sub_msg_code, gsva_msg->op,
+                             header->nth.scna, payload_len);
+                    gsva_coh_dispatch_rx(s->ubc_dev,
+                                         header->msgetah.sub_msg_code,
+                                         payload, payload_len);
+                    g_free(buf);
+                    continue;
+                }
+            }
+
             switch (header->msgetah.sub_msg_code) {
             case UBC_MSG_SUB_URMA_DATA: {
                 uint32_t dst_jetty = header->deid & 0xFFFFF;
@@ -1025,6 +1044,10 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
             case UBC_MSG_SUB_GSVA_COH_TOKEN_REVOKE:
             case UBC_MSG_SUB_GSVA_COH_TOKEN_ACK:
                 if (s->ubc_dev) {
+                    qemu_log("GSVA_COH: ub_link rx sub=%u scna=%#x"
+                             " payload_len=%u\n",
+                             header->msgetah.sub_msg_code,
+                             header->nth.scna, payload_len);
                     gsva_coh_dispatch_rx(s->ubc_dev,
                                          header->msgetah.sub_msg_code,
                                          payload, payload_len);

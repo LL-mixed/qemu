@@ -57,6 +57,8 @@ typedef enum GsvaCohState {
     GSVA_COH_TIMEOUT = 5,
 } GsvaCohState;
 
+#define GSVA_COH_MAX_HOLDERS 64
+
 /* GSVA coherence object state */
 typedef struct GsvaCohObject {
     GsvaKeyV1 key;
@@ -64,12 +66,16 @@ typedef struct GsvaCohObject {
     uint32_t home_cna;
     uint32_t owner_cna;
     uint64_t sharer_bitmap;
+    uint32_t sharer_count;
+    uint32_t sharer_cnas[GSVA_COH_MAX_HOLDERS];
     uint64_t epoch;
     bool pending;
     uint64_t pending_seq;
     uint32_t pending_op;
     uint32_t pending_target;
     uint64_t pending_ack_bitmap;
+    uint32_t pending_ack_count;
+    uint32_t pending_ack_cnas[GSVA_COH_MAX_HOLDERS];
     uint64_t pending_start_ms;
     uint64_t map_id;
     uint64_t create_time_ms;
@@ -109,6 +115,12 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
                            const GsvaKeyV1 *key, uint32_t requester_cna,
                            uint32_t token_id, uint32_t token_value);
 
+/* WriteAcquire with optional UB Link transport for remote invalidation. */
+int gsva_coh_write_acquire_tx(GsvaCohTable *tbl, const GsvaRouteTable *routes,
+                              BusControllerDev *ubc_dev,
+                              const GsvaKeyV1 *key, uint32_t requester_cna,
+                              uint32_t token_id, uint32_t token_value);
+
 /* Retire: start retire transaction. Returns GSVA_OK or error. */
 int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
                     uint32_t requester_cna);
@@ -123,6 +135,9 @@ int gsva_coh_inv_ack(GsvaCohTable *tbl, const GsvaKeyV1 *key,
 
 /* Retry a pending acquire (idempotent). Returns GSVA_OK if op completed. */
 int gsva_coh_retry(GsvaCohTable *tbl, const GsvaKeyV1 *key, uint64_t seq);
+
+/* Register process-local default table used by UB Link RX ACK handlers. */
+void gsva_coh_set_default_table(GsvaCohTable *tbl);
 
 /* Get object state as string */
 const char *gsva_coh_state_name(GsvaCohState state);

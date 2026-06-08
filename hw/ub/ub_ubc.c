@@ -5330,6 +5330,18 @@ static int ubc_send_msg_over_link(BusControllerDev *ubc_dev, UBLinkState *link,
         memcpy(pkt + sizeof(MsgPktHeader), payload, payload_len);
     }
 
+    if (sub_msg_code == UBC_MSG_SUB_GSVA_COH ||
+        (sub_msg_code >= UBC_MSG_SUB_GSVA_COH_READ_ACQ &&
+         sub_msg_code <= UBC_MSG_SUB_GSVA_COH_TOKEN_ACK)) {
+        qemu_log("GSVA_COH: ub_link send sub=%u scna=%#x dcna=%#x"
+                 " payload_len=%u link=%s:%u<->%s:%u\n",
+                 sub_msg_code, ub_dev->cna, dcna, payload_len,
+                 link->a.device_id ? link->a.device_id : "<null>",
+                 link->a.port_idx,
+                 link->b.device_id ? link->b.device_id : "<null>",
+                 link->b.port_idx);
+    }
+
     if (ubc_trace_data_path_enabled() &&
         sub_msg_code == UBC_MSG_SUB_SIM_DEC_READ_REQ &&
         payload_len >= sizeof(UBCSimDecReadReqPld)) {
@@ -10290,6 +10302,7 @@ static void gsva_tables_init(void)
     if (!g_gsva_initialized) {
         gsva_route_table_init(&g_gsva_routes);
         gsva_coh_table_init(&g_gsva_coh);
+        gsva_coh_set_default_table(&g_gsva_coh);
         gsva_stats_init(&g_gsva_stats);
         memset(g_gsva_tlb_stable, 0, sizeof(g_gsva_tlb_stable));
         g_gsva_initialized = true;
@@ -10427,10 +10440,13 @@ int gsva_arm_mmu_translate_full(uint64_t va, bool is_write,
     }
 
     if (is_write) {
-        acq_rc = gsva_coh_write_acquire(&g_gsva_coh, &g_gsva_routes,
-                                        &route->key, requester_cna,
-                                        route->token.token_id,
-                                        route->token.token_value);
+        acq_rc = gsva_coh_write_acquire_tx(&g_gsva_coh, &g_gsva_routes,
+                                           g_sim_decoder &&
+                                           g_sim_decoder->bcs ?
+                                           g_sim_decoder->bcs->ubc_dev : NULL,
+                                           &route->key, requester_cna,
+                                           route->token.token_id,
+                                           route->token.token_value);
     } else {
         acq_rc = gsva_coh_read_acquire(&g_gsva_coh, &g_gsva_routes,
                                        &route->key, requester_cna,
@@ -10941,6 +10957,13 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         }
         {
             SimDecGsvaQueryResp gsva_resp = {0};
+            if (g_sim_decoder && g_sim_decoder->bcs &&
+                g_sim_decoder->bcs->ubc_dev) {
+                obmm_coh_poll_rx_links(g_sim_decoder->bcs->ubc_dev);
+                ubc_sim_dec_process_wait_links(g_sim_decoder->bcs,
+                                               g_sim_decoder->bcs->ubc_dev,
+                                               NULL);
+            }
             (void)sim_dec_handle_gsva_query(
                 (const SimDecGsvaQueryReq *)(data + sizeof(*hdr)),
                 &gsva_resp);
@@ -11013,9 +11036,12 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             gsva_stats_read_acquire(&g_gsva_stats, ev_rc == GSVA_OK);
             break;
         case 2: /* WriteAcquire */
-            ev_rc = gsva_coh_write_acquire(&g_gsva_coh, &g_gsva_routes,
-                                           ev_key, requester_cna,
-                                           token_id, token_value);
+            ev_rc = gsva_coh_write_acquire_tx(&g_gsva_coh, &g_gsva_routes,
+                                              g_sim_decoder &&
+                                              g_sim_decoder->bcs ?
+                                              g_sim_decoder->bcs->ubc_dev : NULL,
+                                              ev_key, requester_cna,
+                                              token_id, token_value);
             gsva_stats_write_acquire(&g_gsva_stats, ev_rc == GSVA_OK);
             break;
         case 3: /* Retire */
@@ -11054,6 +11080,13 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             }
             break;
         case 5: /* Retry */
+            if (g_sim_decoder && g_sim_decoder->bcs &&
+                g_sim_decoder->bcs->ubc_dev) {
+                obmm_coh_poll_rx_links(g_sim_decoder->bcs->ubc_dev);
+                ubc_sim_dec_process_wait_links(g_sim_decoder->bcs,
+                                               g_sim_decoder->bcs->ubc_dev,
+                                               NULL);
+            }
             ev_rc = gsva_coh_retry(&g_gsva_coh, ev_key,
                                     token_id /* reuse as seq */);
             break;

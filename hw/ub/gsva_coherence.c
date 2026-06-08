@@ -12,6 +12,13 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 
+static GsvaCohTable *g_gsva_coh_default_table;
+
+void gsva_coh_set_default_table(GsvaCohTable *tbl)
+{
+    g_gsva_coh_default_table = tbl;
+}
+
 void gsva_coh_table_init(GsvaCohTable *tbl)
 {
     QTAILQ_INIT(&tbl->objects);
@@ -41,6 +48,112 @@ static bool gsva_coh_hold_pending_enabled(void)
     return env && g_strcmp0(env, "1") == 0;
 }
 
+static bool gsva_coh_ub_link_tx_enabled(void)
+{
+    const char *env = g_getenv("GSVA_COH_UB_LINK_TX");
+
+    return env && g_strcmp0(env, "1") == 0;
+}
+
+static void gsva_coh_set_bitmap_bit(uint64_t *bitmap, uint32_t cna)
+{
+    if (cna < 64) {
+        *bitmap |= (1ULL << cna);
+    }
+}
+
+static void gsva_coh_clear_bitmap_bit(uint64_t *bitmap, uint32_t cna)
+{
+    if (cna < 64) {
+        *bitmap &= ~(1ULL << cna);
+    }
+}
+
+static bool gsva_coh_sharer_has(const GsvaCohObject *obj, uint32_t cna)
+{
+    uint32_t i;
+
+    for (i = 0; obj && i < obj->sharer_count; i++) {
+        if (obj->sharer_cnas[i] == cna) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void gsva_coh_sharer_add(GsvaCohObject *obj, uint32_t cna)
+{
+    if (!obj || gsva_coh_sharer_has(obj, cna)) {
+        return;
+    }
+    if (obj->sharer_count < GSVA_COH_MAX_HOLDERS) {
+        obj->sharer_cnas[obj->sharer_count++] = cna;
+    }
+    gsva_coh_set_bitmap_bit(&obj->sharer_bitmap, cna);
+}
+
+static void gsva_coh_sharers_clear(GsvaCohObject *obj)
+{
+    if (!obj) {
+        return;
+    }
+    obj->sharer_bitmap = 0;
+    obj->sharer_count = 0;
+    memset(obj->sharer_cnas, 0, sizeof(obj->sharer_cnas));
+}
+
+static void gsva_coh_pending_clear(GsvaCohObject *obj)
+{
+    if (!obj) {
+        return;
+    }
+    obj->pending_ack_bitmap = 0;
+    obj->pending_ack_count = 0;
+    memset(obj->pending_ack_cnas, 0, sizeof(obj->pending_ack_cnas));
+}
+
+static bool gsva_coh_pending_has(const GsvaCohObject *obj, uint32_t cna)
+{
+    uint32_t i;
+
+    for (i = 0; obj && i < obj->pending_ack_count; i++) {
+        if (obj->pending_ack_cnas[i] == cna) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void gsva_coh_pending_add(GsvaCohObject *obj, uint32_t cna)
+{
+    if (!obj || gsva_coh_pending_has(obj, cna)) {
+        return;
+    }
+    if (obj->pending_ack_count < GSVA_COH_MAX_HOLDERS) {
+        obj->pending_ack_cnas[obj->pending_ack_count++] = cna;
+    }
+    gsva_coh_set_bitmap_bit(&obj->pending_ack_bitmap, cna);
+}
+
+static void gsva_coh_pending_remove(GsvaCohObject *obj, uint32_t cna)
+{
+    uint32_t i;
+
+    if (!obj) {
+        return;
+    }
+    for (i = 0; i < obj->pending_ack_count; i++) {
+        if (obj->pending_ack_cnas[i] == cna) {
+            obj->pending_ack_cnas[i] =
+                obj->pending_ack_cnas[obj->pending_ack_count - 1];
+            obj->pending_ack_cnas[obj->pending_ack_count - 1] = 0;
+            obj->pending_ack_count--;
+            break;
+        }
+    }
+    gsva_coh_clear_bitmap_bit(&obj->pending_ack_bitmap, cna);
+}
+
 static bool gsva_coh_object_maybe_timeout(GsvaCohObject *obj,
                                            uint64_t now_ms,
                                            uint64_t timeout_ms)
@@ -67,7 +180,7 @@ static bool gsva_coh_object_maybe_timeout(GsvaCohObject *obj,
              obj->pending_ack_bitmap);
     obj->state = GSVA_COH_TIMEOUT;
     obj->pending = false;
-    obj->pending_ack_bitmap = 0;
+    gsva_coh_pending_clear(obj);
     obj->pending_start_ms = 0;
     return true;
 }
@@ -114,12 +227,14 @@ int gsva_coh_object_create(GsvaCohTable *tbl, const GsvaKeyV1 *key,
     obj->home_cna = home_cna;
     obj->owner_cna = 0;
     obj->sharer_bitmap = 0;
+    obj->sharer_count = 0;
     obj->epoch = key->epoch;
     obj->pending = false;
     obj->pending_seq = 0;
     obj->pending_op = 0;
     obj->pending_target = 0;
     obj->pending_ack_bitmap = 0;
+    obj->pending_ack_count = 0;
     obj->pending_start_ms = 0;
     obj->map_id = map_id;
     obj->create_time_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
@@ -237,14 +352,14 @@ int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
     switch (obj->state) {
     case GSVA_COH_I:
         obj->state = GSVA_COH_S;
-        obj->sharer_bitmap |= (1ULL << requester_cna);
+        gsva_coh_sharer_add(obj, requester_cna);
         qemu_log("GSVA_COH: ReadAcquire I->S cna=%" PRIu32
                  " segment_id=%#" PRIx64 "\n",
                  requester_cna, key->segment_id);
         break;
 
     case GSVA_COH_S:
-        obj->sharer_bitmap |= (1ULL << requester_cna);
+        gsva_coh_sharer_add(obj, requester_cna);
         qemu_log("GSVA_COH: ReadAcquire S->S cna=%" PRIu32
                  " segment_id=%#" PRIx64 "\n",
                  requester_cna, key->segment_id);
@@ -252,8 +367,8 @@ int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
 
     case GSVA_COH_E:
         /* Owner becomes sharer, requester becomes sharer */
-        obj->sharer_bitmap |= (1ULL << obj->owner_cna);
-        obj->sharer_bitmap |= (1ULL << requester_cna);
+        gsva_coh_sharer_add(obj, obj->owner_cna);
+        gsva_coh_sharer_add(obj, requester_cna);
         obj->owner_cna = 0;
         obj->state = GSVA_COH_S;
         qemu_log("GSVA_COH: ReadAcquire E->S cna=%" PRIu32
@@ -263,8 +378,8 @@ int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
 
     case GSVA_COH_M:
         /* Owner must writeback or data-forward, then S */
-        obj->sharer_bitmap |= (1ULL << obj->owner_cna);
-        obj->sharer_bitmap |= (1ULL << requester_cna);
+        gsva_coh_sharer_add(obj, obj->owner_cna);
+        gsva_coh_sharer_add(obj, requester_cna);
         obj->owner_cna = 0;
         obj->state = GSVA_COH_S;
         qemu_log("GSVA_COH: ReadAcquire M->S cna=%" PRIu32
@@ -279,9 +394,10 @@ int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
     return GSVA_OK;
 }
 
-int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
-                           const GsvaKeyV1 *key, uint32_t requester_cna,
-                           uint32_t token_id, uint32_t token_value)
+int gsva_coh_write_acquire_tx(GsvaCohTable *tbl, const GsvaRouteTable *routes,
+                              BusControllerDev *ubc_dev,
+                              const GsvaKeyV1 *key, uint32_t requester_cna,
+                              uint32_t token_id, uint32_t token_value)
 {
     GsvaCohObject *obj;
 
@@ -344,7 +460,7 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
     case GSVA_COH_I:
         obj->state = GSVA_COH_M;
         obj->owner_cna = requester_cna;
-        obj->sharer_bitmap = 0;
+        gsva_coh_sharers_clear(obj);
         qemu_log("GSVA_COH: WriteAcquire I->M cna=%" PRIu32
                  " segment_id=%#" PRIx64 "\n",
                  requester_cna, key->segment_id);
@@ -352,19 +468,77 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
 
     case GSVA_COH_S: {
         /* Invalidate other sharers before granting M.
-         * V1 sim: synchronous — record pending, immediately complete. */
-        uint64_t other_sharers = obj->sharer_bitmap & ~(1ULL << requester_cna);
-        if (other_sharers) {
+         * V1 keeps bitmap diagnostics, and also tracks full-width CNAs for
+         * UB Link targets because simulator CNAs are not restricted to 0..63.
+         */
+        uint32_t target_count = 0;
+        uint32_t targets[GSVA_COH_MAX_HOLDERS] = {0};
+        uint64_t other_sharers = obj->sharer_bitmap;
+        uint32_t i;
+
+        gsva_coh_clear_bitmap_bit(&other_sharers, requester_cna);
+        for (i = 0; i < obj->sharer_count; i++) {
+            uint32_t cna = obj->sharer_cnas[i];
+
+            if (cna == requester_cna) {
+                continue;
+            }
+            if (target_count < GSVA_COH_MAX_HOLDERS) {
+                targets[target_count++] = cna;
+            }
+        }
+
+        if (target_count == 0 && other_sharers != 0) {
+            for (i = 0; i < 64 && target_count < GSVA_COH_MAX_HOLDERS; i++) {
+                if (other_sharers & (1ULL << i)) {
+                    targets[target_count++] = i;
+                }
+            }
+        }
+
+        if (target_count > 0) {
             obj->pending = true;
             obj->pending_seq = ++tbl->next_seq;
             obj->pending_op = 1; /* invalidate */
             obj->pending_target = requester_cna;
-            obj->pending_ack_bitmap = other_sharers;
+            gsva_coh_pending_clear(obj);
+            for (i = 0; i < target_count; i++) {
+                gsva_coh_pending_add(obj, targets[i]);
+            }
             obj->pending_start_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
             qemu_log("GSVA_COH: WriteAcquire S->M pending inv"
                      " cna=%" PRIu32 " waiting_for=%#" PRIx64
-                     " seq=%" PRIu64 "\n",
-                     requester_cna, other_sharers, obj->pending_seq);
+                     " seq=%" PRIu64 " targets=%" PRIu32 "\n",
+                     requester_cna, obj->pending_ack_bitmap,
+                     obj->pending_seq, target_count);
+
+            if (ubc_dev && gsva_coh_ub_link_tx_enabled()) {
+                for (i = 0; i < target_count; i++) {
+                    GsvaCohMsgV1 inv = {0};
+                    int tx_rc;
+
+                    if (targets[i] == ubc_dev->parent.cna) {
+                        continue;
+                    }
+                    inv.version = 1;
+                    inv.op = GSVA_COH_MSG_INVALIDATE;
+                    inv.seq = obj->pending_seq;
+                    inv.source_cna = requester_cna;
+                    inv.target_cna = targets[i];
+                    inv.key = *key;
+                    inv.access_va = key->home_va;
+                    inv.access_len = key->size;
+                    inv.access_flags = 2;
+                    tx_rc = gsva_coh_send_ub_link_msg(
+                            ubc_dev, targets[i], UBC_MSG_SUB_GSVA_COH,
+                            &inv);
+                    qemu_log("GSVA_COH: tx INV target=%" PRIu32
+                             " seq=%" PRIu64 " segment_id=%#" PRIx64
+                             " rc=%d\n",
+                             targets[i], obj->pending_seq, key->segment_id,
+                             tx_rc);
+                }
+            }
 
             if (gsva_coh_hold_pending_enabled()) {
                 qemu_log("GSVA_COH: pending held seq=%" PRIu64
@@ -376,13 +550,13 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
             }
 
             /* V1 sim: immediately acknowledge all invalidations */
-            obj->pending_ack_bitmap = 0;
+            gsva_coh_pending_clear(obj);
             obj->pending = false;
             obj->pending_start_ms = 0;
         }
         obj->state = GSVA_COH_M;
         obj->owner_cna = requester_cna;
-        obj->sharer_bitmap = 0;
+        gsva_coh_sharers_clear(obj);
         qemu_log("GSVA_COH: WriteAcquire S->M cna=%" PRIu32
                  " segment_id=%#" PRIx64 "\n",
                  requester_cna, key->segment_id);
@@ -398,7 +572,7 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
         } else {
             obj->state = GSVA_COH_M;
             obj->owner_cna = requester_cna;
-            obj->sharer_bitmap = 0;
+            gsva_coh_sharers_clear(obj);
             qemu_log("GSVA_COH: WriteAcquire E->M (other) cna=%" PRIu32
                      " segment_id=%#" PRIx64 "\n",
                      requester_cna, key->segment_id);
@@ -426,6 +600,14 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
     }
 
     return GSVA_OK;
+}
+
+int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
+                           const GsvaKeyV1 *key, uint32_t requester_cna,
+                           uint32_t token_id, uint32_t token_value)
+{
+    return gsva_coh_write_acquire_tx(tbl, routes, NULL, key, requester_cna,
+                                     token_id, token_value);
 }
 
 int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
@@ -463,8 +645,9 @@ int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
      * Also allow retiring from TIMEOUT state for cleanup. */
     obj->state = GSVA_COH_RETIRED;
     obj->owner_cna = 0;
-    obj->sharer_bitmap = 0;
+    gsva_coh_sharers_clear(obj);
     obj->pending = false;
+    gsva_coh_pending_clear(obj);
 
     qemu_log("GSVA_RETIRE: segment_id=%#" PRIx64 " home_va=%#" PRIx64
              " epoch=%" PRIu64 " RETIRED\n",
@@ -491,18 +674,19 @@ int gsva_coh_inv_ack(GsvaCohTable *tbl, const GsvaKeyV1 *key,
         return GSVA_ERR_COH_PENDING;
     }
 
-    obj->pending_ack_bitmap &= ~(1ULL << ack_cna);
+    gsva_coh_pending_remove(obj, ack_cna);
     qemu_log("GSVA_COH: InvAck cna=%" PRIu32 " seq=%" PRIu64
-             " remaining=%#" PRIx64 "\n",
-             ack_cna, seq, obj->pending_ack_bitmap);
+             " remaining=%#" PRIx64 " remaining_count=%" PRIu32 "\n",
+             ack_cna, seq, obj->pending_ack_bitmap,
+             obj->pending_ack_count);
 
-    if (obj->pending_ack_bitmap == 0) {
+    if (obj->pending_ack_count == 0) {
         obj->pending = false;
         obj->pending_start_ms = 0;
         if (obj->pending_op == 1) {
             obj->state = GSVA_COH_M;
             obj->owner_cna = obj->pending_target;
-            obj->sharer_bitmap = 0;
+            gsva_coh_sharers_clear(obj);
             qemu_log("GSVA_COH: InvAck recovery grant M cna=%" PRIu32
                      " seq=%" PRIu64 " segment_id=%#" PRIx64 "\n",
                      obj->pending_target, seq, obj->key.segment_id);
@@ -552,7 +736,7 @@ int gsva_coh_retry(GsvaCohTable *tbl, const GsvaKeyV1 *key, uint64_t seq)
     }
 
     /* V1 sim: synchronous — if still pending, treat as timeout check */
-    if (obj->pending_ack_bitmap == 0) {
+    if (obj->pending_ack_count == 0) {
         obj->pending = false;
         obj->pending_start_ms = 0;
         return GSVA_OK;
@@ -619,6 +803,28 @@ static void gsva_coh_send_ack(BusControllerDev *ubc_dev,
     ack.source_cna = req->target_cna;
     ack.target_cna = req->source_cna;
     ack.error = error;
+    switch (req->op) {
+    case GSVA_COH_MSG_INVALIDATE:
+        ack.op = GSVA_COH_MSG_INVALIDATE_ACK;
+        break;
+    case GSVA_COH_MSG_DOWNGRADE:
+        ack.op = GSVA_COH_MSG_DOWNGRADE_ACK;
+        break;
+    case GSVA_COH_MSG_WRITEBACK:
+        ack.op = GSVA_COH_MSG_WRITEBACK_ACK;
+        break;
+    case GSVA_COH_MSG_FENCE:
+        ack.op = GSVA_COH_MSG_FENCE_ACK;
+        break;
+    case GSVA_COH_MSG_RETIRE:
+        ack.op = GSVA_COH_MSG_RETIRE_ACK;
+        break;
+    case GSVA_COH_MSG_TOKEN_REVOKE:
+        ack.op = GSVA_COH_MSG_TOKEN_ACK;
+        break;
+    default:
+        break;
+    }
     gsva_coh_send_ub_link_msg(ubc_dev, req->source_cna, ack_subcode, &ack);
 }
 
@@ -628,14 +834,24 @@ void gsva_coh_handle_rx_inv(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
              " seq=%" PRIu64 "\n", msg->source_cna,
              msg->key.segment_id, msg->seq);
     /* Drop local GSVA state for the range — V1 sim: log and ACK */
-    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_INV_ACK, GSVA_OK);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, GSVA_OK);
 }
 
 void gsva_coh_handle_rx_inv_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
 {
+    int rc = GSVA_ERR_ROUTE_MISSING;
+
     qemu_log("GSVA_COH: rx INV_ACK from cna=%" PRIu32 " segment_id=%#" PRIx64
              " seq=%" PRIu64 "\n", msg->source_cna,
              msg->key.segment_id, msg->seq);
+    if (g_gsva_coh_default_table) {
+        rc = gsva_coh_inv_ack(g_gsva_coh_default_table, &msg->key,
+                              msg->source_cna, msg->seq);
+    }
+    qemu_log("GSVA_COH: rx INV_ACK applied from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " seq=%" PRIu64 " rc=%d\n",
+             msg->source_cna, msg->key.segment_id, msg->seq, rc);
+    (void)ubc_dev;
 }
 
 void gsva_coh_handle_rx_downgrade(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
@@ -643,7 +859,7 @@ void gsva_coh_handle_rx_downgrade(BusControllerDev *ubc_dev, const GsvaCohMsgV1 
     qemu_log("GSVA_COH: rx DOWNGRADE from cna=%" PRIu32 " segment_id=%#" PRIx64
              " seq=%" PRIu64 "\n", msg->source_cna,
              msg->key.segment_id, msg->seq);
-    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_DOWNGRADE_ACK, GSVA_OK);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, GSVA_OK);
 }
 
 void gsva_coh_handle_rx_downgrade_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
@@ -658,7 +874,7 @@ void gsva_coh_handle_rx_wb(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
     qemu_log("GSVA_COH: rx WRITEBACK from cna=%" PRIu32 " segment_id=%#" PRIx64
              " seq=%" PRIu64 "\n", msg->source_cna,
              msg->key.segment_id, msg->seq);
-    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_RETIRE_ACK, GSVA_OK);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, GSVA_OK);
 }
 
 void gsva_coh_handle_rx_wb_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
@@ -673,7 +889,7 @@ void gsva_coh_handle_rx_fence(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg
     qemu_log("GSVA_COH: rx FENCE from cna=%" PRIu32 " segment_id=%#" PRIx64
              " seq=%" PRIu64 "\n", msg->source_cna,
              msg->key.segment_id, msg->seq);
-    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_FENCE_ACK, GSVA_OK);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, GSVA_OK);
 }
 
 void gsva_coh_handle_rx_fence_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
@@ -688,7 +904,7 @@ void gsva_coh_handle_rx_retire(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *ms
     qemu_log("GSVA_COH: rx RETIRE from cna=%" PRIu32 " segment_id=%#" PRIx64
              " seq=%" PRIu64 "\n", msg->source_cna,
              msg->key.segment_id, msg->seq);
-    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_RETIRE_ACK, GSVA_OK);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, GSVA_OK);
 }
 
 void gsva_coh_handle_rx_retire_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
@@ -703,7 +919,7 @@ void gsva_coh_handle_rx_token_revoke(BusControllerDev *ubc_dev, const GsvaCohMsg
     qemu_log("GSVA_COH: rx TOKEN_REVOKE from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
              msg->source_cna, msg->key.segment_id, msg->seq);
-    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_TOKEN_ACK, GSVA_OK);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, GSVA_OK);
 }
 
 void gsva_coh_handle_rx_token_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
@@ -724,6 +940,46 @@ void gsva_coh_dispatch_rx(BusControllerDev *ubc_dev, uint8_t sub_msg_code,
         return;
     }
     msg = (const GsvaCohMsgV1 *)payload;
+
+    if (sub_msg_code == UBC_MSG_SUB_GSVA_COH) {
+        switch (msg->op) {
+        case GSVA_COH_MSG_INVALIDATE:
+            gsva_coh_handle_rx_inv(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_INVALIDATE_ACK:
+            gsva_coh_handle_rx_inv_ack(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_DOWNGRADE:
+            gsva_coh_handle_rx_downgrade(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_DOWNGRADE_ACK:
+            gsva_coh_handle_rx_downgrade_ack(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_RETIRE:
+            gsva_coh_handle_rx_retire(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_RETIRE_ACK:
+            gsva_coh_handle_rx_retire_ack(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_FENCE:
+            gsva_coh_handle_rx_fence(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_FENCE_ACK:
+            gsva_coh_handle_rx_fence_ack(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_TOKEN_REVOKE:
+            gsva_coh_handle_rx_token_revoke(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_TOKEN_ACK:
+            gsva_coh_handle_rx_token_ack(ubc_dev, msg);
+            break;
+        default:
+            qemu_log("GSVA_COH: unhandled op=%u subcode=%u\n",
+                     msg->op, sub_msg_code);
+            break;
+        }
+        return;
+    }
 
     switch (sub_msg_code) {
     case UBC_MSG_SUB_GSVA_COH_INV:
