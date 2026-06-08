@@ -1277,6 +1277,8 @@ void obmm_coh_handle_rx_fence(BusControllerDev *ubc_dev,
     ObmmCohFenceAckPld ack = { 0 };
     int drain_ret;
 
+    obmm_coh_init_once();
+
     qemu_log("OBMM_COH_FENCE req_id=%u from=%#x"
              " range=%#" PRIx64 "+%" PRIu64 "\n",
              pld->hdr.req_id, src_cna,
@@ -1303,6 +1305,8 @@ void obmm_coh_handle_rx_fence_ack(BusControllerDev *ubc_dev,
                                   const ObmmCohFenceAckPld *pld,
                                   uint32_t src_cna)
 {
+    obmm_coh_init_once();
+
     qemu_log("OBMM_COH_FENCE_ACK req_id=%u from=%#x status=%u\n",
              pld->hdr.req_id, src_cna, pld->status);
 
@@ -1506,6 +1510,8 @@ send_data:
 void obmm_coh_handle_rx_data(BusControllerDev *ubc_dev,
                              const ObmmCohDataPld *pld, uint32_t src_cna)
 {
+    obmm_coh_init_once();
+
     if (obmm_coh_log_sample(pld->hdr.req_id, pld->status)) {
         qemu_log("OBMM_COH_DATA req_id=%u from=%#x line=%#" PRIx64
                  " status=%u len=%u grant=%u\n",
@@ -1707,6 +1713,8 @@ send_ack:
 void obmm_coh_handle_rx_inv_ack(BusControllerDev *ubc_dev,
                                 const ObmmCohInvAckPld *pld, uint32_t src_cna)
 {
+    obmm_coh_init_once();
+
     if (obmm_coh_log_sample(pld->hdr.req_id, pld->status)) {
         qemu_log("OBMM_COH_INV_ACK_RX req_id=%u from=%#x line=%#" PRIx64
                  " status=%u\n",
@@ -1722,6 +1730,8 @@ void obmm_coh_handle_rx_downgrade(BusControllerDev *ubc_dev,
                                   uint32_t src_cna)
 {
     ObmmCohDowngradeAckPld ack = { 0 };
+
+    obmm_coh_init_once();
 
     ack.hdr = pld->hdr;
     ack.hdr.msg_type = UBC_MSG_SUB_COH_DOWNGRADE_ACK;
@@ -1746,6 +1756,8 @@ void obmm_coh_handle_rx_downgrade_ack(BusControllerDev *ubc_dev,
                                       const ObmmCohDowngradeAckPld *pld,
                                       uint32_t src_cna)
 {
+    obmm_coh_init_once();
+
     if (obmm_coh_log_sample(pld->hdr.req_id, pld->status)) {
         qemu_log("OBMM_COH_DOWNGRADE_ACK_RX req_id=%u from=%#x line=%#" PRIx64
                  " status=%u\n",
@@ -1871,6 +1883,8 @@ void obmm_coh_handle_rx_wb(BusControllerDev *ubc_dev,
 void obmm_coh_handle_rx_wb_ack(BusControllerDev *ubc_dev,
                                const ObmmCohWbAckPld *pld, uint32_t src_cna)
 {
+    obmm_coh_init_once();
+
     if (obmm_coh_log_sample(pld->hdr.req_id, pld->status)) {
         qemu_log("OBMM_COH_WB_ACK_RX req_id=%u from=%#x line=%#" PRIx64
                  " status=%u\n",
