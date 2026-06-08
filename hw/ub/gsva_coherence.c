@@ -8,6 +8,7 @@
 #include "qemu/osdep.h"
 #include "hw/ub/gsva_coherence.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 
 void gsva_coh_table_init(GsvaCohTable *tbl)
 {
@@ -65,6 +66,7 @@ int gsva_coh_object_create(GsvaCohTable *tbl, const GsvaKeyV1 *key,
     obj->pending_target = 0;
     obj->pending_ack_bitmap = 0;
     obj->map_id = map_id;
+    obj->create_time_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
 
     QTAILQ_INSERT_TAIL(&tbl->objects, obj, next);
     tbl->object_count++;
@@ -140,6 +142,10 @@ int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
         return GSVA_ERR_SEGMENT_RETIRED;
     }
 
+    if (obj->state == GSVA_COH_TIMEOUT) {
+        return GSVA_ERR_COH_PENDING;
+    }
+
     if (obj->pending) {
         return GSVA_ERR_COH_PENDING;
     }
@@ -212,6 +218,10 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
 
     if (obj->state == GSVA_COH_RETIRED) {
         return GSVA_ERR_SEGMENT_RETIRED;
+    }
+
+    if (obj->state == GSVA_COH_TIMEOUT) {
+        return GSVA_ERR_COH_PENDING;
     }
 
     if (obj->pending) {
@@ -304,7 +314,8 @@ int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
         return GSVA_ERR_SEGMENT_RETIRED;
     }
 
-    /* V1 sim: directly retire, no pending revoke in sim mode */
+    /* V1 sim: directly retire, no pending revoke in sim mode.
+     * Also allow retiring from TIMEOUT state for cleanup. */
     obj->state = GSVA_COH_RETIRED;
     obj->owner_cna = 0;
     obj->sharer_bitmap = 0;
@@ -325,6 +336,34 @@ const char *gsva_coh_state_name(GsvaCohState state)
     case GSVA_COH_E:        return "E";
     case GSVA_COH_M:        return "M";
     case GSVA_COH_RETIRED:  return "RETIRED";
+    case GSVA_COH_TIMEOUT:  return "TIMEOUT";
     default:                return "UNKNOWN";
     }
+}
+
+int gsva_coh_check_timeouts(GsvaCohTable *tbl, uint64_t now_ms,
+                            uint64_t timeout_ms)
+{
+    GsvaCohObject *obj;
+    int count = 0;
+
+    if (!tbl) {
+        return 0;
+    }
+
+    QTAILQ_FOREACH(obj, &tbl->objects, next) {
+        if (obj->pending && obj->state != GSVA_COH_RETIRED &&
+            obj->state != GSVA_COH_TIMEOUT) {
+            uint64_t elapsed = now_ms - obj->create_time_ms;
+            if (elapsed > timeout_ms) {
+                obj->state = GSVA_COH_TIMEOUT;
+                obj->pending = false;
+                count++;
+                qemu_log("GSVA_COH: TIMEOUT segment_id=%#" PRIx64
+                         " elapsed=%" PRIu64 "ms\n",
+                         obj->key.segment_id, elapsed);
+            }
+        }
+    }
+    return count;
 }

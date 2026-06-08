@@ -22,6 +22,7 @@ typedef enum GsvaCohState {
     GSVA_COH_E = 2,
     GSVA_COH_M = 3,
     GSVA_COH_RETIRED = 4,
+    GSVA_COH_TIMEOUT = 5,
 } GsvaCohState;
 
 /* GSVA coherence object state */
@@ -38,6 +39,7 @@ typedef struct GsvaCohObject {
     uint32_t pending_target;
     uint64_t pending_ack_bitmap;
     uint64_t map_id;
+    uint64_t create_time_ms;
     QTAILQ_ENTRY(GsvaCohObject) next;
 } GsvaCohObject;
 
@@ -75,6 +77,10 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
 /* Retire: start retire transaction. Returns GSVA_OK or error. */
 int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
                     uint32_t requester_cna);
+
+/* Check and set timeout on pending objects. Returns count of timed-out objects. */
+int gsva_coh_check_timeouts(GsvaCohTable *tbl, uint64_t now_ms,
+                            uint64_t timeout_ms);
 
 /* Get object state as string */
 const char *gsva_coh_state_name(GsvaCohState state);
