@@ -32,6 +32,8 @@
 #include "hw/ub/ub_ubc.h"
 #include "hw/ub/gsva_key.h"
 #include "hw/ub/gsva_route.h"
+#include "hw/ub/gsva_coherence.h"
+#include "hw/ub/gsva_stats.h"
 #include "hw/ub/obmm_coherence.h"
 #include "hw/ub/ub_ummu.h"
 #include "hw/ub/ub_config.h"
@@ -10122,6 +10124,22 @@ int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
     return 0;
 }
 
+/* Global GSVA route + coherence tables */
+static GsvaRouteTable g_gsva_routes;
+static GsvaCohTable g_gsva_coh;
+static GsvaStats g_gsva_stats;
+static bool g_gsva_initialized;
+
+static void gsva_tables_init(void)
+{
+    if (!g_gsva_initialized) {
+        gsva_route_table_init(&g_gsva_routes);
+        gsva_coh_table_init(&g_gsva_coh);
+        gsva_stats_init(&g_gsva_stats);
+        g_gsva_initialized = true;
+    }
+}
+
 /*
  * GSVA query handler - capability and object queries.
  */
@@ -10160,8 +10178,25 @@ static int sim_dec_handle_gsva_query(const SimDecGsvaQueryReq *req,
         resp->error = GSVA_OK;
         break;
     }
+    case GSVA_QUERY_COHERENCE: {
+        /* Return stats: maps, unmaps, coh objects, read/write acquires */
+        if (!g_gsva_initialized) {
+            resp->error = GSVA_OK;
+            break;
+        }
+        gsva_stats_set_objects(&g_gsva_stats,
+                               (uint64_t)g_gsva_routes.route_count,
+                               (uint64_t)g_gsva_coh.object_count);
+        memcpy(resp->data, &g_gsva_stats, sizeof(g_gsva_stats));
+        resp->error = GSVA_OK;
+        qemu_log("GSVA_QUERY_COHERENCE: maps=%" PRIu64 " coh_objects=%"
+                 PRIu64 " rd_acq=%" PRIu64 " wr_acq=%" PRIu64 "\n",
+                 g_gsva_stats.map_total, g_gsva_stats.coh_objects,
+                 g_gsva_stats.read_acquire_total,
+                 g_gsva_stats.write_acquire_total);
+        break;
+    }
     case GSVA_QUERY_ROUTE:
-    case GSVA_QUERY_COHERENCE:
     case GSVA_QUERY_SEGMENT:
         qemu_log("GSVA_KEY: query type %d not yet implemented\n",
                  req->query_type);
@@ -10175,18 +10210,6 @@ static int sim_dec_handle_gsva_query(const SimDecGsvaQueryReq *req,
     }
 
     return resp->error == GSVA_OK ? 0 : -1;
-}
-
-/* Global GSVA route table */
-static GsvaRouteTable g_gsva_routes;
-static bool g_gsva_routes_initialized;
-
-static void gsva_routes_init(void)
-{
-    if (!g_gsva_routes_initialized) {
-        gsva_route_table_init(&g_gsva_routes);
-        g_gsva_routes_initialized = true;
-    }
 }
 
 /* GSVA MAP handler */
@@ -10206,7 +10229,7 @@ static int sim_dec_handle_gsva_map(const SimDecGsvaMapReq *req,
         return -1;
     }
 
-    gsva_routes_init();
+    gsva_tables_init();
 
     resp->error = gsva_route_map(&g_gsva_routes,
                                   &req->key,
@@ -10223,8 +10246,23 @@ static int sim_dec_handle_gsva_map(const SimDecGsvaMapReq *req,
 
     if (resp->error != GSVA_OK) {
         qemu_log("GSVA_MAP: failed: %s\n", gsva_error_name(resp->error));
+        gsva_stats_map(&g_gsva_stats, false);
         return -1;
     }
+
+    /* Create coherence object for this route */
+    int coh_rc = gsva_coh_object_create(&g_gsva_coh, &req->key,
+                                         0, resp->map_id);
+    if (coh_rc != GSVA_OK) {
+        qemu_log("GSVA_MAP: coh create failed: %s\n",
+                 gsva_error_name(coh_rc));
+        gsva_route_unmap(&g_gsva_routes, resp->map_id, true);
+        resp->error = coh_rc;
+        gsva_stats_map(&g_gsva_stats, false);
+        return -1;
+    }
+
+    gsva_stats_map(&g_gsva_stats, true);
     return 0;
 }
 
@@ -10245,15 +10283,33 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
         return -1;
     }
 
-    gsva_routes_init();
+    gsva_tables_init();
+
+    /* Retire coherence object first */
+    GsvaRouteEntry *route = NULL;
+    QTAILQ_FOREACH(route, &g_gsva_routes.routes, next) {
+        if (route->map_id == req->map_id) {
+            break;
+        }
+    }
+    if (route) {
+        int coh_rc = gsva_coh_retire(&g_gsva_coh, &route->key,
+                                      0 /* requester_cna */);
+        if (coh_rc != GSVA_OK) {
+            qemu_log("GSVA_UNMAP: coh retire failed: %s\n",
+                     gsva_error_name(coh_rc));
+        }
+    }
 
     /* Always keep tombstone for GSVA unmap (epoch tracking) */
     resp->error = gsva_route_unmap(&g_gsva_routes, req->map_id, true);
 
     if (resp->error != GSVA_OK) {
         qemu_log("GSVA_UNMAP: failed: %s\n", gsva_error_name(resp->error));
+        gsva_stats_unmap(&g_gsva_stats, false);
         return -1;
     }
+    gsva_stats_unmap(&g_gsva_stats, true);
     return 0;
 }
 
@@ -10456,15 +10512,45 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         }
         break;
 
-    case SIM_DEC_OP_GSVA_EVENT_V1:
-        min_len = sizeof(*hdr) + 8;
+    case SIM_DEC_OP_GSVA_EVENT_V1: {
+        min_len = sizeof(*hdr) + sizeof(uint32_t) * 3;
         if (len < min_len) {
             resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
             break;
         }
-        qemu_log("GSVA_EVENT: not yet implemented\n");
-        resp_hdr->status = SIM_DEC_STATUS_NOT_SUPPORTED;
+        /* payload: [uint32_t sub_op] [uint32_t requester_cna] [GsvaKeyV1 key] */
+        const uint32_t *ev_payload = (const uint32_t *)(data + sizeof(*hdr));
+        uint32_t sub_op = ev_payload[0];
+        uint32_t requester_cna = ev_payload[1];
+        const GsvaKeyV1 *ev_key = (const GsvaKeyV1 *)(ev_payload + 2);
+
+        gsva_tables_init();
+
+        int ev_rc;
+        switch (sub_op) {
+        case 1: /* ReadAcquire */
+            ev_rc = gsva_coh_read_acquire(&g_gsva_coh, ev_key, requester_cna);
+            gsva_stats_read_acquire(&g_gsva_stats, ev_rc == GSVA_OK);
+            break;
+        case 2: /* WriteAcquire */
+            ev_rc = gsva_coh_write_acquire(&g_gsva_coh, ev_key, requester_cna);
+            gsva_stats_write_acquire(&g_gsva_stats, ev_rc == GSVA_OK);
+            break;
+        case 3: /* Retire */
+            ev_rc = gsva_coh_retire(&g_gsva_coh, ev_key, requester_cna);
+            gsva_stats_retire(&g_gsva_stats, ev_rc == GSVA_OK);
+            break;
+        default:
+            ev_rc = GSVA_ERR_BAD_VERSION;
+            break;
+        }
+
+        resp_hdr->status = (ev_rc == GSVA_OK) ? 0 : 1;
+        resp_hdr->payload_len = sizeof(uint32_t);
+        uint32_t *resp_payload32 = (uint32_t *)(resp + sizeof(*resp_hdr));
+        resp_payload32[0] = (uint32_t)ev_rc;
         break;
+    }
 
     default:
         qemu_log("SIM_DEC: unknown opcode %u\n", hdr->opcode);

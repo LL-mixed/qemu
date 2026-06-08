@@ -1009,6 +1009,18 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
                 g_free(buf);
                 continue;
             }
+            case UBC_MSG_SUB_GSVA_COH_READ_ACQ:
+            case UBC_MSG_SUB_GSVA_COH_READ_ACK:
+            case UBC_MSG_SUB_GSVA_COH_WRITE_ACQ:
+            case UBC_MSG_SUB_GSVA_COH_WRITE_ACK:
+            case UBC_MSG_SUB_GSVA_COH_INV:
+            case UBC_MSG_SUB_GSVA_COH_INV_ACK:
+            case UBC_MSG_SUB_GSVA_COH_RETIRE_REQ:
+            case UBC_MSG_SUB_GSVA_COH_RETIRE_ACK:
+                qemu_log("ubc_msgq: GSVA_COH subcode=%u len=%u\n",
+                         header->msgetah.sub_msg_code, payload_len);
+                g_free(buf);
+                continue;
             default:
                 break;
             }

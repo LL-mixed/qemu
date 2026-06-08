@@ -395,6 +395,16 @@ void ubc_handle_read_response(BusControllerDev *ubc_dev, const UBCReadRespPld *r
 #define UBC_MSG_SUB_COH_DOWNGRADE    14
 #define UBC_MSG_SUB_COH_DOWNGRADE_ACK 15
 
+/* GSVA coherence subcodes (16-23) */
+#define UBC_MSG_SUB_GSVA_COH_READ_ACQ    16
+#define UBC_MSG_SUB_GSVA_COH_READ_ACK    17
+#define UBC_MSG_SUB_GSVA_COH_WRITE_ACQ   18
+#define UBC_MSG_SUB_GSVA_COH_WRITE_ACK   19
+#define UBC_MSG_SUB_GSVA_COH_INV         20
+#define UBC_MSG_SUB_GSVA_COH_INV_ACK     21
+#define UBC_MSG_SUB_GSVA_COH_RETIRE_REQ  22
+#define UBC_MSG_SUB_GSVA_COH_RETIRE_ACK  23
+
 /* SIM_DEC batched write payload */
 typedef struct QEMU_PACKED SimDecBatchHdr {
     uint8_t version;       /* 1 */
