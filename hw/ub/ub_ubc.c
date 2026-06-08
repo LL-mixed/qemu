@@ -10303,6 +10303,7 @@ static void gsva_tables_init(void)
         gsva_route_table_init(&g_gsva_routes);
         gsva_coh_table_init(&g_gsva_coh);
         gsva_coh_set_default_table(&g_gsva_coh);
+        gsva_coh_set_default_route_table(&g_gsva_routes);
         gsva_stats_init(&g_gsva_stats);
         memset(g_gsva_tlb_stable, 0, sizeof(g_gsva_tlb_stable));
         g_gsva_initialized = true;
@@ -11113,6 +11114,12 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
                                             token_id, token_value);
             if (ev_rc == GSVA_OK) {
                 gsva_tlb_stable_flush_key(ev_key, "token_revoke_pending");
+                (void)gsva_coh_token_revoke_tx(&g_gsva_coh,
+                                               g_sim_decoder &&
+                                               g_sim_decoder->bcs ?
+                                               g_sim_decoder->bcs->ubc_dev : NULL,
+                                               ev_key, requester_cna,
+                                               token_id, token_value);
             }
             break;
         default:

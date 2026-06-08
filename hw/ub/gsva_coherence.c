@@ -13,10 +13,16 @@
 #include "qemu/timer.h"
 
 static GsvaCohTable *g_gsva_coh_default_table;
+static GsvaRouteTable *g_gsva_route_default_table;
 
 void gsva_coh_set_default_table(GsvaCohTable *tbl)
 {
     g_gsva_coh_default_table = tbl;
+}
+
+void gsva_coh_set_default_route_table(GsvaRouteTable *tbl)
+{
+    g_gsva_route_default_table = tbl;
 }
 
 void gsva_coh_table_init(GsvaCohTable *tbl)
@@ -898,6 +904,80 @@ int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
     return gsva_coh_retire_tx(tbl, NULL, key, requester_cna);
 }
 
+int gsva_coh_token_revoke_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
+                             const GsvaKeyV1 *key, uint32_t requester_cna,
+                             uint32_t token_id, uint32_t new_token_value)
+{
+    GsvaCohObject *obj;
+    uint32_t targets[GSVA_COH_MAX_HOLDERS] = {0};
+    uint32_t target_count = 0;
+    uint32_t i;
+
+    if (!tbl || !key) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+    if (token_id == 0 || new_token_value == 0) {
+        return GSVA_ERR_TOKEN_DENIED;
+    }
+
+    obj = gsva_coh_lookup(tbl, key);
+    if (!obj) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    if (obj->state == GSVA_COH_E || obj->state == GSVA_COH_M) {
+        if (obj->owner_cna != 0 && obj->owner_cna != requester_cna) {
+            targets[target_count++] = obj->owner_cna;
+        }
+    } else if (obj->state == GSVA_COH_S) {
+        for (i = 0; i < obj->sharer_count; i++) {
+            uint32_t cna = obj->sharer_cnas[i];
+
+            if (cna == requester_cna) {
+                continue;
+            }
+            if (target_count < GSVA_COH_MAX_HOLDERS) {
+                targets[target_count++] = cna;
+            }
+        }
+    }
+
+    qemu_log("GSVA_COH: TokenRevoke holders segment_id=%#" PRIx64
+             " requester=%" PRIu32 " targets=%" PRIu32
+             " token_id=%" PRIu32 "\n",
+             key->segment_id, requester_cna, target_count, token_id);
+
+    if (!ubc_dev || !gsva_coh_ub_link_tx_enabled()) {
+        return GSVA_OK;
+    }
+
+    for (i = 0; i < target_count; i++) {
+        GsvaCohMsgV1 revoke = {0};
+        int tx_rc;
+
+        if (targets[i] == ubc_dev->parent.cna) {
+            continue;
+        }
+        revoke.version = 1;
+        revoke.op = GSVA_COH_MSG_TOKEN_REVOKE;
+        revoke.seq = 0;
+        revoke.source_cna = requester_cna;
+        revoke.target_cna = targets[i];
+        revoke.key = *key;
+        revoke.access_va = key->home_va;
+        revoke.access_len = new_token_value;
+        revoke.access_flags = token_id;
+        tx_rc = gsva_coh_send_ub_link_msg(
+                ubc_dev, targets[i], UBC_MSG_SUB_GSVA_COH, &revoke);
+        qemu_log("GSVA_COH: tx TOKEN_REVOKE target=%" PRIu32
+                 " segment_id=%#" PRIx64 " token_id=%" PRIu32
+                 " rc=%d\n",
+                 targets[i], key->segment_id, token_id, tx_rc);
+    }
+
+    return GSVA_OK;
+}
+
 int gsva_coh_inv_ack(GsvaCohTable *tbl, const GsvaKeyV1 *key,
                      uint32_t ack_cna, uint64_t seq)
 {
@@ -1248,9 +1328,23 @@ void gsva_coh_handle_rx_token_revoke(BusControllerDev *ubc_dev, const GsvaCohMsg
 
 void gsva_coh_handle_rx_token_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
 {
+    int rc = GSVA_ERR_ROUTE_MISSING;
+    uint32_t token_id = msg->access_flags;
+    uint32_t new_token_value = (uint32_t)msg->access_len;
+
     qemu_log("GSVA_COH: rx TOKEN_ACK from cna=%" PRIu32
-             " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
-             msg->source_cna, msg->key.segment_id, msg->seq);
+             " segment_id=%#" PRIx64 " seq=%" PRIu64
+             " token_id=%" PRIu32 "\n",
+             msg->source_cna, msg->key.segment_id, msg->seq, token_id);
+    if (g_gsva_route_default_table) {
+        rc = gsva_route_ack_token_revoke(g_gsva_route_default_table,
+                                         &msg->key, token_id,
+                                         new_token_value, msg->source_cna);
+    }
+    qemu_log("GSVA_COH: rx TOKEN_ACK applied from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " token_id=%" PRIu32 " rc=%d\n",
+             msg->source_cna, msg->key.segment_id, token_id, rc);
+    (void)ubc_dev;
 }
 
 void gsva_coh_dispatch_rx(BusControllerDev *ubc_dev, uint8_t sub_msg_code,

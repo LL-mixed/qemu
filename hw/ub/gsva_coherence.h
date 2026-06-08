@@ -149,6 +149,14 @@ int gsva_coh_retry(GsvaCohTable *tbl, const GsvaKeyV1 *key, uint64_t seq);
 /* Register process-local default table used by UB Link RX ACK handlers. */
 void gsva_coh_set_default_table(GsvaCohTable *tbl);
 
+/* Register process-local default route table used by token ACK RX handler. */
+void gsva_coh_set_default_route_table(GsvaRouteTable *tbl);
+
+/* Send token revoke to remote coherence holders, if any. */
+int gsva_coh_token_revoke_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
+                             const GsvaKeyV1 *key, uint32_t requester_cna,
+                             uint32_t token_id, uint32_t new_token_value);
+
 /* Get object state as string */
 const char *gsva_coh_state_name(GsvaCohState state);
 
