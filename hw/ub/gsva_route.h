@@ -34,6 +34,7 @@ typedef enum GsvaTokenStateV1 {
 typedef struct GsvaTokenLease {
     uint32_t token_id;
     uint32_t token_value;
+    uint32_t pending_token_value;
     uint32_t access_flags;
     uint32_t flags;
     uint64_t lease_epoch;
@@ -106,9 +107,15 @@ int gsva_route_validate_token(const GsvaRouteEntry *route,
                               uint32_t token_id, uint32_t token_value,
                               uint32_t access_type);
 
-/* Rotate token: set new token_value and increment lease_epoch. */
+/* Rotate token: start revoke/ACK flow and increment lease_epoch. */
 int gsva_route_rotate_token(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
                             uint32_t token_id, uint32_t new_token_value);
+
+/* ACK a pending token revoke and commit the pending token value. */
+int gsva_route_ack_token_revoke(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
+                                uint32_t token_id,
+                                uint32_t new_token_value,
+                                uint32_t requester_cna);
 
 /* Get GSVA route stats */
 void gsva_route_get_stats(GsvaRouteTable *tbl,

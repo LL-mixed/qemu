@@ -249,8 +249,8 @@ int gsva_route_validate_token(const GsvaRouteEntry *route,
         return GSVA_ERR_ROUTE_MISSING;
     }
 
-    /* No token required for this route (INVALID state = no token enforced) */
-    if (route->token.state == GSVA_TOKEN_INVALID || !route->token.active) {
+    /* No token required for this route (INVALID state = no token enforced). */
+    if (route->token.state == GSVA_TOKEN_INVALID) {
         return GSVA_OK;
     }
 
@@ -317,14 +317,54 @@ int gsva_route_rotate_token(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
             }
             entry->token.state = GSVA_TOKEN_REVOKING;
             entry->token.lease_epoch++;
-            entry->token.token_value = new_token_value;
-            entry->token.state = GSVA_TOKEN_ACTIVE;
-            qemu_log("GSVA_ROUTE: token rotated segment_id=%#" PRIx64
+            entry->token.pending_token_value = new_token_value;
+            entry->token.active = false;
+            qemu_log("GSVA_ROUTE: token revoke pending segment_id=%#" PRIx64
                      " token_id=%" PRIu32 " lease_epoch=%" PRIu64 "\n",
                      key->segment_id, token_id, entry->token.lease_epoch);
             return GSVA_OK;
         }
     }
+    return GSVA_ERR_ROUTE_MISSING;
+}
+
+int gsva_route_ack_token_revoke(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
+                                uint32_t token_id,
+                                uint32_t new_token_value,
+                                uint32_t requester_cna)
+{
+    GsvaRouteEntry *entry;
+
+    if (!tbl || !key) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+    if (token_id == 0 || new_token_value == 0) {
+        return GSVA_ERR_TOKEN_DENIED;
+    }
+
+    QTAILQ_FOREACH(entry, &tbl->routes, next) {
+        if (entry->state != GSVA_ROUTE_ACTIVE) {
+            continue;
+        }
+        if (gsva_key_base_equal(&entry->key, key)) {
+            if (entry->token.state != GSVA_TOKEN_REVOKING ||
+                entry->token.token_id != token_id ||
+                entry->token.pending_token_value != new_token_value) {
+                return GSVA_ERR_TOKEN_DENIED;
+            }
+            entry->token.token_value = new_token_value;
+            entry->token.pending_token_value = 0;
+            entry->token.state = GSVA_TOKEN_ACTIVE;
+            entry->token.active = true;
+            qemu_log("GSVA_ROUTE: token revoke ack segment_id=%#" PRIx64
+                     " token_id=%" PRIu32 " cna=%" PRIu32
+                     " lease_epoch=%" PRIu64 "\n",
+                     key->segment_id, token_id, requester_cna,
+                     entry->token.lease_epoch);
+            return GSVA_OK;
+        }
+    }
+
     return GSVA_ERR_ROUTE_MISSING;
 }
 

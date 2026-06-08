@@ -10847,8 +10847,14 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             break;
         }
         case 4: /* InvAck */
-            ev_rc = gsva_coh_inv_ack(&g_gsva_coh, ev_key, requester_cna,
-                                     token_id /* reuse as seq */);
+            if (token_value != 0) {
+                ev_rc = gsva_route_ack_token_revoke(&g_gsva_routes, ev_key,
+                                                    token_id, token_value,
+                                                    requester_cna);
+            } else {
+                ev_rc = gsva_coh_inv_ack(&g_gsva_coh, ev_key, requester_cna,
+                                         token_id /* reuse as seq */);
+            }
             break;
         case 5: /* Retry */
             ev_rc = gsva_coh_retry(&g_gsva_coh, ev_key,
