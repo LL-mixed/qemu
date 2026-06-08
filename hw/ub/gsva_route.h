@@ -108,7 +108,7 @@ int gsva_route_validate_token(const GsvaRouteEntry *route,
 
 /* Rotate token: set new token_value and increment lease_epoch. */
 int gsva_route_rotate_token(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
-                            uint32_t new_token_value);
+                            uint32_t token_id, uint32_t new_token_value);
 
 /* Get GSVA route stats */
 void gsva_route_get_stats(GsvaRouteTable *tbl,

@@ -10839,6 +10839,10 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             ev_rc = gsva_coh_retry(&g_gsva_coh, ev_key,
                                     token_id /* reuse as seq */);
             break;
+        case 6: /* TokenChange */
+            ev_rc = gsva_route_rotate_token(&g_gsva_routes, ev_key,
+                                            token_id, token_value);
+            break;
         default:
             ev_rc = GSVA_ERR_BAD_VERSION;
             break;
