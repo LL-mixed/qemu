@@ -10130,14 +10130,53 @@ static GsvaCohTable g_gsva_coh;
 static GsvaStats g_gsva_stats;
 static bool g_gsva_initialized;
 
+/* TLB side table: VA -> epoch for stale detection */
+#define GSVA_TLB_STABLE_SIZE 256
+typedef struct GsvaTlbSideEntry {
+    uint64_t va;
+    uint64_t epoch;
+    uint64_t segment_id;
+    bool valid;
+} GsvaTlbSideEntry;
+static GsvaTlbSideEntry g_gsva_tlb_stable[GSVA_TLB_STABLE_SIZE];
+
 static void gsva_tables_init(void)
 {
     if (!g_gsva_initialized) {
         gsva_route_table_init(&g_gsva_routes);
         gsva_coh_table_init(&g_gsva_coh);
         gsva_stats_init(&g_gsva_stats);
+        memset(g_gsva_tlb_stable, 0, sizeof(g_gsva_tlb_stable));
         g_gsva_initialized = true;
     }
+}
+
+static unsigned gsva_tlb_stable_index(uint64_t va)
+{
+    return (unsigned)((va >> 12) % GSVA_TLB_STABLE_SIZE);
+}
+
+static void gsva_tlb_stable_set(uint64_t va, uint64_t epoch,
+                                 uint64_t segment_id)
+{
+    unsigned idx = gsva_tlb_stable_index(va);
+    g_gsva_tlb_stable[idx].va = va;
+    g_gsva_tlb_stable[idx].epoch = epoch;
+    g_gsva_tlb_stable[idx].segment_id = segment_id;
+    g_gsva_tlb_stable[idx].valid = true;
+}
+
+static int gsva_tlb_stale_check(uint64_t va, uint64_t current_epoch)
+{
+    unsigned idx = gsva_tlb_stable_index(va);
+    GsvaTlbSideEntry *e = &g_gsva_tlb_stable[idx];
+    if (!e->valid || e->va != va) {
+        return 0; /* no entry, not stale */
+    }
+    if (e->epoch != current_epoch) {
+        return GSVA_ERR_TLB_STALE;
+    }
+    return 0;
 }
 
 /*
@@ -10190,6 +10229,26 @@ int gsva_arm_mmu_translate(uint64_t va, bool is_write, uint32_t cpu_index)
                  va, gsva_coh_state_name(coh_obj->state));
         return GSVA_ERR_COH_PENDING;
     }
+
+    /* TLB stale detection */
+    int stale_rc = gsva_tlb_stale_check(va, coh_obj->epoch);
+    if (stale_rc == GSVA_ERR_TLB_STALE) {
+        qemu_log("GSVA_TLB: STALE va=%#" PRIx64 " tlb_epoch=%" PRIu64
+                 " current_epoch=%" PRIu64 " segment_id=%#" PRIx64 "\n",
+                 va, g_gsva_tlb_stable[gsva_tlb_stable_index(va)].epoch,
+                 coh_obj->epoch, coh_obj->key.segment_id);
+        return GSVA_ERR_TLB_STALE;
+    }
+
+    /* Update TLB side table */
+    gsva_tlb_stable_set(va, coh_obj->epoch, coh_obj->key.segment_id);
+
+    qemu_log("GSVA_TLB: lookup va=%#" PRIx64 " state=%s"
+             " is_write=%u cpu=%" PRIu32 " segment_id=%#" PRIx64
+             " epoch=%" PRIu64 "\n",
+             va, gsva_coh_state_name(coh_obj->state),
+             is_write, cpu_index, coh_obj->key.segment_id,
+             coh_obj->epoch);
 
     return 0;
 }
