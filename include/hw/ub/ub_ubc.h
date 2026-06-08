@@ -518,7 +518,24 @@ int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
 bool sim_dec_gva_tcg_translate(uint64_t va, bool is_write,
                                uint64_t *local_pa, uint64_t *page_size);
 
-/* GSVA ARM MMU hook: check coherence permissions on TLB fill */
+/* GSVA ARM MMU mode helpers */
+bool gsva_arm_mmu_enabled(void);
+
+/*
+ * GSVA ARM MMU hook: lookup GSVA route, return backend PA and acquire
+ * coherence permission for TLB fill.
+ *
+ * Return values:
+ *   1  = GSVA route hit and permission acquired
+ *   0  = no GSVA route, keep normal ARM translation
+ *  <0  = GSVA route hit but semantic validation failed
+ */
+int gsva_arm_mmu_translate_full(uint64_t va, bool is_write,
+                                uint32_t cpu_index,
+                                uint64_t *local_pa,
+                                uint64_t *page_size);
+
+/* Compatibility helper kept for existing callers. */
 int gsva_arm_mmu_translate(uint64_t va, bool is_write, uint32_t cpu_index);
 
 #endif

@@ -306,6 +306,7 @@ bool arm_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     ARMCPU *cpu = ARM_CPU(cs);
     GetPhysAddrResult res = {};
     ARMMMUFaultInfo local_fi, *fi;
+    vaddr orig_address = address;
     int ret;
 
     /*
@@ -341,29 +342,32 @@ bool arm_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             address &= TARGET_PAGE_MASK;
         }
 
-        if (access_type != MMU_INST_FETCH &&
-            sim_dec_gva_tcg_translate(address,
-                                      access_type == MMU_DATA_STORE,
-                                      &gva_local_pa, &gva_page_size)) {
-            res.f.phys_addr = gva_local_pa & TARGET_PAGE_MASK;
-            res.f.lg_page_size = ctz64(gva_page_size);
+        if (access_type != MMU_INST_FETCH && gsva_arm_mmu_enabled()) {
+            int gsva_rc = gsva_arm_mmu_translate_full(
+                orig_address, access_type == MMU_DATA_STORE, cs->cpu_index,
+                &gva_local_pa, &gva_page_size);
 
-            /* GSVA coherence permission check */
-            int gsva_rc = gsva_arm_mmu_translate(address,
-                                                  access_type == MMU_DATA_STORE,
-                                                  cs->cpu_index);
-            if (gsva_rc < 0) {
+            if (gsva_rc > 0) {
+                res.f.phys_addr = gva_local_pa & TARGET_PAGE_MASK;
+                res.f.lg_page_size = ctz64(gva_page_size);
+            } else if (gsva_rc < 0) {
                 qemu_log_mask(CPU_LOG_MMU,
                     "GSVA MMU: denying access va=%#" PRIx64
                     " is_write=%d rc=%d\n",
                     address, access_type == MMU_DATA_STORE, gsva_rc);
-                /* Treat as permission fault */
                 fi->type = ARMFault_Permission;
                 fi->level = 1;
                 cpu_restore_state(cs, retaddr);
                 arm_deliver_fault(cpu, address, access_type, mmu_idx, fi);
                 return false;
             }
+        } else if (access_type != MMU_INST_FETCH &&
+                   sim_dec_gva_tcg_translate(address,
+                                             access_type == MMU_DATA_STORE,
+                                             &gva_local_pa,
+                                             &gva_page_size)) {
+            res.f.phys_addr = gva_local_pa & TARGET_PAGE_MASK;
+            res.f.lg_page_size = ctz64(gva_page_size);
         }
 
         res.f.extra.arm.pte_attrs = res.cacheattrs.attrs;

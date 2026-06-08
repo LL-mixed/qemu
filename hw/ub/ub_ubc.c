@@ -553,6 +553,7 @@ static int sim_dec_lookup_result_by_pa(uint64_t pa,
                                        SimDecLookupResult *result);
 static bool sim_dec_gva_tcg_enabled(void);
 static void sim_dec_flush_gva_tlbs(const char *reason);
+static void gsva_tlb_stable_flush_all(const char *reason);
 static int sim_dec_gva_ownership_register_req(const SimDecGvaMapReq *req,
                                               uint64_t map_id);
 static void sim_dec_gva_ownership_unregister_entry(
@@ -561,20 +562,26 @@ static void sim_dec_gva_ownership_unregister_entry(
 static void sim_dec_flush_gva_tlbs(const char *reason)
 {
     CPUState *src = current_cpu ? current_cpu : first_cpu;
+    bool arm_mmu = gsva_arm_mmu_enabled();
 
-    if (!sim_dec_gva_tcg_enabled()) {
+    if (!sim_dec_gva_tcg_enabled() && !arm_mmu) {
         return;
     }
 
     if (!src) {
-        qemu_log("GVA_TCG_TLB_FLUSH skipped reason=%s no_cpu=1\n",
+        qemu_log("%s skipped reason=%s no_cpu=1\n",
+                 arm_mmu ? "GSVA_TLB: flush" : "GVA_TCG_TLB_FLUSH",
                  reason ? reason : "unspecified");
         return;
     }
 
     tlb_flush_all_cpus_synced(src);
-    qemu_log("GVA_TCG_TLB_FLUSH reason=%s\n",
-             reason ? reason : "unspecified");
+    if (arm_mmu) {
+        gsva_tlb_stable_flush_all(reason);
+    } else {
+        qemu_log("GVA_TCG_TLB_FLUSH reason=%s\n",
+                 reason ? reason : "unspecified");
+    }
 }
 
 /* SIM_DEC stats helpers */
@@ -8476,16 +8483,39 @@ static SimDecMapEntry *sim_dec_find_gva_route_by_va_locked(uint64_t va,
 static bool sim_dec_gva_tcg_enabled(void)
 {
     static int cached = -1;
-    const char *env;
 
     if (cached >= 0) {
         return cached != 0;
     }
 
-    env = g_getenv("SIM_GVA_TCG");
-    cached = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    if (gsva_arm_mmu_enabled()) {
+        cached = 0;
+        return false;
+    }
+
+    const char *mode = g_getenv("GSVA_MODE");
+    const char *env = g_getenv("SIM_GVA_TCG");
+    cached = ((mode && strcmp(mode, "sim_gva_tcg") == 0) ||
+              (env && env[0] && strcmp(env, "0") != 0)) ? 1 : 0;
     if (cached) {
         qemu_log("GVA_TCG enabled: ARM tlb_fill will probe GVA S3 routes\n");
+    }
+    return cached != 0;
+}
+
+bool gsva_arm_mmu_enabled(void)
+{
+    static int cached = -1;
+    const char *mode;
+
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    mode = g_getenv("GSVA_MODE");
+    cached = (mode && strcmp(mode, "arm_mmu") == 0) ? 1 : 0;
+    if (cached) {
+        qemu_log("GSVA_MODE arm_mmu: ARM tlb_fill will use GSVA route/coherence\n");
     }
     return cached != 0;
 }
@@ -10280,6 +10310,13 @@ static void gsva_tlb_stable_set(uint64_t va, uint64_t epoch,
     g_gsva_tlb_stable[idx].valid = true;
 }
 
+static void gsva_tlb_stable_flush_all(const char *reason)
+{
+    memset(g_gsva_tlb_stable, 0, sizeof(g_gsva_tlb_stable));
+    qemu_log("GSVA_TLB: flush reason=%s\n",
+             reason ? reason : "unspecified");
+}
+
 static int gsva_tlb_stale_check(uint64_t va, uint64_t current_epoch)
 {
     unsigned idx = gsva_tlb_stable_index(va);
@@ -10300,25 +10337,79 @@ static int gsva_tlb_stale_check(uint64_t va, uint64_t current_epoch)
  * Checks GSVA coherence permissions for the VA access.
  * Returns: 0 = GSVA permission OK, negative = access denied.
  */
-int gsva_arm_mmu_translate(uint64_t va, bool is_write, uint32_t cpu_index)
+int gsva_arm_mmu_translate_full(uint64_t va, bool is_write,
+                                uint32_t cpu_index,
+                                uint64_t *local_pa,
+                                uint64_t *page_size)
 {
     GsvaRouteEntry *route;
     GsvaCohObject *coh_obj;
-    GsvaKeyV1 search_key;
+    uint64_t page_va = va & ~(uint64_t)(SIM_DEC_PAGE_SIZE - 1);
+    uint64_t offset;
+    uint32_t requester_cna = cpu_index;
+    bool identity_route;
+    int acq_rc;
+
+    if (!gsva_arm_mmu_enabled() || !local_pa || !page_size) {
+        return 0;
+    }
 
     if (!g_gsva_initialized) {
         return 0;
     }
 
-    route = gsva_route_lookup_va(&g_gsva_routes, 0, 0, va);
+    route = gsva_route_lookup_va(&g_gsva_routes, 0, 0, page_va);
     if (!route) {
         return 0;
     }
 
-    search_key = route->key;
-    coh_obj = gsva_coh_lookup(&g_gsva_coh, &search_key);
+    identity_route =
+        route->source == SIM_DEC_MAP_SOURCE_GVA_MANAGER &&
+        route->local_va == route->key.home_va &&
+        route->remote_uba == route->key.home_va &&
+        (route->address_profile == SIM_DEC_ADDRESS_PROFILE_GSVA_IDENTITY ||
+         route->address_profile == SIM_DEC_ADDRESS_PROFILE_GENERIC_GVA);
+
+    if (!identity_route || route->local_va == 0 || route->local_pa == 0 ||
+        page_va < route->local_va ||
+        page_va >= route->local_va + route->key.size) {
+        qemu_log("GSVA_MMU: unsupported route va=%#" PRIx64
+                 " local_va=%#" PRIx64 " home_va=%#" PRIx64
+                 " remote_uba=%#" PRIx64 " source=%" PRIu32
+                 " profile=%" PRIu32 "\n",
+                 page_va, route->local_va, route->key.home_va,
+                 route->remote_uba, route->source, route->address_profile);
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    offset = page_va - route->local_va;
+    *local_pa = route->local_pa + offset;
+    *page_size = SIM_DEC_PAGE_SIZE;
+    if (g_sim_decoder && g_sim_decoder->bcs && g_sim_decoder->bcs->ubc_dev) {
+        requester_cna = g_sim_decoder->bcs->ubc_dev->parent.cna;
+    }
+
+    if (is_write) {
+        acq_rc = gsva_coh_write_acquire(&g_gsva_coh, &g_gsva_routes,
+                                        &route->key, requester_cna,
+                                        route->token.token_id,
+                                        route->token.token_value);
+    } else {
+        acq_rc = gsva_coh_read_acquire(&g_gsva_coh, &g_gsva_routes,
+                                       &route->key, requester_cna,
+                                       route->token.token_id,
+                                       route->token.token_value);
+    }
+    if (acq_rc != GSVA_OK) {
+        qemu_log("GSVA_MMU: acquire failed va=%#" PRIx64
+                 " segment_id=%#" PRIx64 " is_write=%u rc=%d\n",
+                 page_va, route->key.segment_id, is_write, acq_rc);
+        return acq_rc;
+    }
+
+    coh_obj = gsva_coh_lookup(&g_gsva_coh, &route->key);
     if (!coh_obj) {
-        return 0;
+        return GSVA_ERR_ROUTE_MISSING;
     }
 
     if (coh_obj->state == GSVA_COH_RETIRED) {
@@ -10359,12 +10450,22 @@ int gsva_arm_mmu_translate(uint64_t va, bool is_write, uint32_t cpu_index)
 
     qemu_log("GSVA_TLB: lookup va=%#" PRIx64 " state=%s"
              " is_write=%u cpu=%" PRIu32 " segment_id=%#" PRIx64
-             " epoch=%" PRIu64 "\n",
+             " epoch=%" PRIu64 " local_pa=%#" PRIx64 "\n",
              va, gsva_coh_state_name(coh_obj->state),
              is_write, cpu_index, coh_obj->key.segment_id,
-             coh_obj->epoch);
+             coh_obj->epoch, *local_pa);
 
-    return 0;
+    return 1;
+}
+
+int gsva_arm_mmu_translate(uint64_t va, bool is_write, uint32_t cpu_index)
+{
+    uint64_t local_pa = 0;
+    uint64_t page_size = 0;
+    int rc = gsva_arm_mmu_translate_full(va, is_write, cpu_index,
+                                         &local_pa, &page_size);
+
+    return rc > 0 ? 0 : rc;
 }
 
 /*
@@ -10513,6 +10614,7 @@ static int sim_dec_handle_gsva_map(const SimDecGsvaMapReq *req,
     }
 
     gsva_stats_map(&g_gsva_stats, true);
+    sim_dec_flush_gva_tlbs("gsva_map");
     return 0;
 }
 
@@ -10593,6 +10695,7 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
         return -1;
     }
     gsva_stats_unmap(&g_gsva_stats, true);
+    sim_dec_flush_gva_tlbs("gsva_unmap");
     return 0;
 }
 
