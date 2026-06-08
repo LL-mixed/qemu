@@ -30,6 +30,7 @@
 #include "hw/ub/ub.h"
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_ubc.h"
+#include "hw/ub/gsva_key.h"
 #include "hw/ub/obmm_coherence.h"
 #include "hw/ub/ub_ummu.h"
 #include "hw/ub/ub_config.h"
@@ -148,6 +149,10 @@ int linqu_ub_bridge_poll_completion(LinquUbBridge *bridge,
 #define SIM_DEC_OP_OBMM_BOOTSTRAP_LOOKUP  0x06
 #define SIM_DEC_OP_GVA_MAP          0x07
 #define SIM_DEC_OP_COH_FENCE        0x08
+#define SIM_DEC_OP_GSVA_MAP_V1      0x09
+#define SIM_DEC_OP_GSVA_UNMAP_V1    0x0a
+#define SIM_DEC_OP_GSVA_EVENT_V1    0x0b
+#define SIM_DEC_OP_GSVA_QUERY_V1    0x0c
 
 /* SIM_DEC status codes */
 #define SIM_DEC_STATUS_SUCCESS          0x00
@@ -252,6 +257,43 @@ typedef struct QEMU_PACKED SimDecQueryResp {
 #define SIM_DEC_GVA_ACCESS_EXPLICIT_SYNC BIT(1)
 #define SIM_DEC_GVA_ACCESS_FAULT_UPI_MISMATCH BIT(31)
 #define SIM_DEC_GVA_MP_UNRESOLVED UINT32_MAX
+
+/* GSVA query types */
+#define GSVA_QUERY_CAPS       1
+#define GSVA_QUERY_ROUTE      2
+#define GSVA_QUERY_COHERENCE  3
+#define GSVA_QUERY_SEGMENT    4
+
+/* GSVA capability flags */
+#define GSVA_CAP_STRICT_ADDRESS_IDENTITY  (1u << 0)
+#define GSVA_CAP_ROUTE_LAYER              (1u << 1)
+#define GSVA_CAP_COHERENCE_LAYER          (1u << 2)
+#define GSVA_CAP_ARM_MMU_MODE             (1u << 3)
+#define GSVA_CAP_RETIRE_REUSE_TXN         (1u << 4)
+
+/* GSVA query request */
+typedef struct QEMU_PACKED SimDecGsvaQueryReq {
+    uint32_t version;
+    uint32_t query_type;
+    GsvaKeyV1 key;
+} SimDecGsvaQueryReq;
+
+/* GSVA capability response */
+typedef struct QEMU_PACKED SimDecGsvaCapsResp {
+    uint32_t version;
+    uint32_t flags;
+    uint32_t max_nodes;
+    uint32_t supported_cache_policies;
+    uint32_t supported_modes;
+    uint32_t reserved;
+} SimDecGsvaCapsResp;
+
+/* GSVA generic query response (route/coherence/segment) */
+typedef struct QEMU_PACKED SimDecGsvaQueryResp {
+    uint32_t version;
+    int32_t  error;
+    uint8_t  data[240];
+} SimDecGsvaQueryResp;
 
 #define SIM_DEC_OBMM_BOOTSTRAP_MAX_NODES 8
 
@@ -10045,6 +10087,61 @@ int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
 }
 
 /*
+ * GSVA query handler - capability and object queries.
+ */
+static int sim_dec_handle_gsva_query(const SimDecGsvaQueryReq *req,
+                                     SimDecGsvaQueryResp *resp)
+{
+    memset(resp, 0, sizeof(*resp));
+    resp->version = 1;
+
+    if (!req) {
+        resp->error = GSVA_ERR_BAD_VERSION;
+        return -1;
+    }
+
+    qemu_log("GSVA_KEY: query type=%" PRIu32 "\n", req->query_type);
+
+    switch (req->query_type) {
+    case GSVA_QUERY_CAPS: {
+        SimDecGsvaCapsResp caps;
+        memset(&caps, 0, sizeof(caps));
+        caps.version = 1;
+        caps.max_nodes = 8;
+        caps.supported_cache_policies = (1u << SIM_DEC_CACHE_POLICY_DIRECTORY_MESI);
+        caps.supported_modes = 0
+            | (1u << 0)  /* legacy_sim_dec */
+            | (1u << 1)  /* sim_gva_tcg */
+            | (1u << 2); /* arm_mmu (future) */
+        caps.flags = 0
+            | GSVA_CAP_STRICT_ADDRESS_IDENTITY
+            | GSVA_CAP_ROUTE_LAYER;
+        qemu_log("GSVA_QUERY_CAPS: flags=%" PRIx32 " max_nodes=%" PRIu32
+                 " cache_policies=%" PRIx32 " modes=%" PRIx32 "\n",
+                 caps.flags, caps.max_nodes,
+                 caps.supported_cache_policies, caps.supported_modes);
+        memcpy(resp->data, &caps, sizeof(caps));
+        resp->error = GSVA_OK;
+        break;
+    }
+    case GSVA_QUERY_ROUTE:
+    case GSVA_QUERY_COHERENCE:
+    case GSVA_QUERY_SEGMENT:
+        qemu_log("GSVA_KEY: query type %d not yet implemented\n",
+                 req->query_type);
+        resp->error = GSVA_ERR_FEATURE_MISSING;
+        break;
+    default:
+        qemu_log("GSVA_KEY: unknown query type %" PRIu32 "\n",
+                 req->query_type);
+        resp->error = GSVA_ERR_BAD_VERSION;
+        break;
+    }
+
+    return resp->error == GSVA_OK ? 0 : -1;
+}
+
+/*
  * ubc_handle_sim_dec_message - Handle incoming SIM_DEC control message
  * This is called from the control channel/message handler
  */
@@ -10186,6 +10283,24 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
                 &lookup_resp);
             resp_hdr->payload_len = sizeof(lookup_resp);
             memcpy(resp + sizeof(*resp_hdr), &lookup_resp, sizeof(lookup_resp));
+        }
+        break;
+
+    case SIM_DEC_OP_GSVA_QUERY_V1:
+        min_len = sizeof(*hdr) + sizeof(SimDecGsvaQueryReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        {
+            SimDecGsvaQueryResp gsva_resp = {0};
+            int gerr = sim_dec_handle_gsva_query(
+                (const SimDecGsvaQueryReq *)(data + sizeof(*hdr)),
+                &gsva_resp);
+            resp_hdr->payload_len = sizeof(gsva_resp);
+            memcpy(resp + sizeof(*resp_hdr), &gsva_resp, sizeof(gsva_resp));
+            resp_hdr->status = (gerr == 0) ? SIM_DEC_STATUS_SUCCESS
+                                           : SIM_DEC_STATUS_BACKEND_ERROR;
         }
         break;
 
