@@ -118,12 +118,14 @@ int gsva_route_map(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
 
     /* Token lease */
     entry->token.token_id = token_id;
-    entry->token.token_value = token_value;
+    entry->token.token_value = token_value ? token_value : token_id;
     entry->token.access_flags = access_flags;
     entry->token.lease_epoch = 1;
     entry->token.allowed_cna_bitmap = 0;
-    entry->token.state = (token_id != 0) ? GSVA_TOKEN_ACTIVE : GSVA_TOKEN_INVALID;
-    entry->token.active = (token_id != 0);
+    entry->token.state = (entry->token.token_id != 0 &&
+                          entry->token.token_value != 0) ?
+                         GSVA_TOKEN_ACTIVE : GSVA_TOKEN_INVALID;
+    entry->token.active = (entry->token.state == GSVA_TOKEN_ACTIVE);
 
     QTAILQ_INSERT_TAIL(&tbl->routes, entry, next);
     tbl->route_count++;
@@ -257,17 +259,10 @@ int gsva_route_validate_token(const GsvaRouteEntry *route,
         return GSVA_ERR_TOKEN_DENIED;
     }
 
-    /* token_id must be non-zero for a protected route */
-    if (route->token.token_id == 0) {
+    /* token_id/value must be non-zero for a protected route */
+    if (route->token.token_id == 0 || route->token.token_value == 0 ||
+        token_id == 0 || token_value == 0) {
         return GSVA_ERR_TOKEN_DENIED;
-    }
-    /* token_value == 0 is allowed for routes that don't enforce value checking */
-    if (route->token.token_value == 0) {
-        /* Skip value check, allow access if token_id matches */
-        if (route->token.token_id != token_id) {
-            return GSVA_ERR_TOKEN_DENIED;
-        }
-        goto check_cna;
     }
 
     /* Exact token match */
@@ -278,7 +273,6 @@ int gsva_route_validate_token(const GsvaRouteEntry *route,
         return GSVA_ERR_TOKEN_DENIED;
     }
 
-check_cna:
     /* allowed_cna_bitmap: 0 = any CNA allowed */
     if (route->token.allowed_cna_bitmap != 0) {
         if (!(route->token.allowed_cna_bitmap & (1ULL << requester_cna))) {

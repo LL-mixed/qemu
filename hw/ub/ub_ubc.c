@@ -10844,7 +10844,7 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             break;
         }
 
-        resp_hdr->status = (ev_rc == GSVA_OK) ? 0 : 1;
+        resp_hdr->status = SIM_DEC_STATUS_SUCCESS;
         resp_hdr->payload_len = sizeof(uint32_t);
         uint32_t *resp_payload32 = (uint32_t *)(resp + sizeof(*resp_hdr));
         resp_payload32[0] = (uint32_t)ev_rc;
