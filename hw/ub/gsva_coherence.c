@@ -586,8 +586,58 @@ int gsva_coh_write_acquire_tx(GsvaCohTable *tbl, const GsvaRouteTable *routes,
                      " segment_id=%#" PRIx64 "\n",
                      requester_cna, key->segment_id);
         } else {
-            /* In full impl: need writeback from old owner.
-             * For V1 sim: directly transfer ownership. */
+            uint32_t old_owner = obj->owner_cna;
+
+            obj->pending = true;
+            obj->pending_seq = ++tbl->next_seq;
+            obj->pending_op = 2; /* writeback */
+            obj->pending_target = requester_cna;
+            gsva_coh_pending_clear(obj);
+            gsva_coh_pending_add(obj, old_owner);
+            obj->pending_start_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+            qemu_log("GSVA_COH: WriteAcquire M->M pending wb"
+                     " cna=%" PRIu32 " owner=%" PRIu32
+                     " waiting_for=%#" PRIx64 " seq=%" PRIu64 "\n",
+                     requester_cna, old_owner, obj->pending_ack_bitmap,
+                     obj->pending_seq);
+
+            if (ubc_dev && gsva_coh_ub_link_tx_enabled() &&
+                old_owner != ubc_dev->parent.cna) {
+                GsvaCohMsgV1 wb = {0};
+                int tx_rc;
+
+                wb.version = 1;
+                wb.op = GSVA_COH_MSG_WRITEBACK;
+                wb.seq = obj->pending_seq;
+                wb.source_cna = requester_cna;
+                wb.target_cna = old_owner;
+                wb.key = *key;
+                wb.access_va = key->home_va;
+                wb.access_len = key->size;
+                wb.access_flags = 2;
+                tx_rc = gsva_coh_send_ub_link_msg(
+                        ubc_dev, old_owner, UBC_MSG_SUB_GSVA_COH, &wb);
+                qemu_log("GSVA_COH: tx WRITEBACK target=%" PRIu32
+                         " seq=%" PRIu64 " segment_id=%#" PRIx64
+                         " rc=%d\n",
+                         old_owner, obj->pending_seq, key->segment_id,
+                         tx_rc);
+            }
+
+            if (gsva_coh_hold_pending_enabled()) {
+                qemu_log("GSVA_COH: pending held seq=%" PRIu64
+                         " segment_id=%#" PRIx64
+                         " timeout_ms=%" PRIu64 "\n",
+                         obj->pending_seq, key->segment_id,
+                         gsva_coh_timeout_ms());
+                return GSVA_ERR_COH_PENDING;
+            }
+
+            gsva_coh_pending_clear(obj);
+            obj->pending = false;
+            obj->pending_start_ms = 0;
+            obj->pending_op = 0;
+            obj->pending_target = 0;
             obj->owner_cna = requester_cna;
             qemu_log("GSVA_COH: WriteAcquire M->M (transfer) cna=%" PRIu32
                      " segment_id=%#" PRIx64 "\n",
@@ -683,12 +733,13 @@ int gsva_coh_inv_ack(GsvaCohTable *tbl, const GsvaKeyV1 *key,
     if (obj->pending_ack_count == 0) {
         obj->pending = false;
         obj->pending_start_ms = 0;
-        if (obj->pending_op == 1) {
+        if (obj->pending_op == 1 || obj->pending_op == 2) {
             obj->state = GSVA_COH_M;
             obj->owner_cna = obj->pending_target;
             gsva_coh_sharers_clear(obj);
-            qemu_log("GSVA_COH: InvAck recovery grant M cna=%" PRIu32
+            qemu_log("GSVA_COH: %s recovery grant M cna=%" PRIu32
                      " seq=%" PRIu64 " segment_id=%#" PRIx64 "\n",
+                     obj->pending_op == 1 ? "InvAck" : "WbAck",
                      obj->pending_target, seq, obj->key.segment_id);
         }
         obj->pending_op = 0;
@@ -879,9 +930,19 @@ void gsva_coh_handle_rx_wb(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
 
 void gsva_coh_handle_rx_wb_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
 {
+    int rc = GSVA_ERR_ROUTE_MISSING;
+
     qemu_log("GSVA_COH: rx WRITEBACK_ACK from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
              msg->source_cna, msg->key.segment_id, msg->seq);
+    if (g_gsva_coh_default_table) {
+        rc = gsva_coh_inv_ack(g_gsva_coh_default_table, &msg->key,
+                              msg->source_cna, msg->seq);
+    }
+    qemu_log("GSVA_COH: rx WRITEBACK_ACK applied from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " seq=%" PRIu64 " rc=%d\n",
+             msg->source_cna, msg->key.segment_id, msg->seq, rc);
+    (void)ubc_dev;
 }
 
 void gsva_coh_handle_rx_fence(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
@@ -954,6 +1015,12 @@ void gsva_coh_dispatch_rx(BusControllerDev *ubc_dev, uint8_t sub_msg_code,
             break;
         case GSVA_COH_MSG_DOWNGRADE_ACK:
             gsva_coh_handle_rx_downgrade_ack(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_WRITEBACK:
+            gsva_coh_handle_rx_wb(ubc_dev, msg);
+            break;
+        case GSVA_COH_MSG_WRITEBACK_ACK:
+            gsva_coh_handle_rx_wb_ack(ubc_dev, msg);
             break;
         case GSVA_COH_MSG_RETIRE:
             gsva_coh_handle_rx_retire(ubc_dev, msg);
