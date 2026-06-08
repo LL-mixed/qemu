@@ -7,6 +7,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/ub/gsva_coherence.h"
+#include "hw/ub/gsva_route.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
 
@@ -117,8 +118,9 @@ GsvaCohObject *gsva_coh_lookup(GsvaCohTable *tbl, const GsvaKeyV1 *key)
     return NULL;
 }
 
-int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
-                          uint32_t requester_cna)
+int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
+                          const GsvaKeyV1 *key, uint32_t requester_cna,
+                          uint32_t token_id, uint32_t token_value)
 {
     GsvaCohObject *obj;
 
@@ -148,6 +150,21 @@ int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
 
     if (obj->pending) {
         return GSVA_ERR_COH_PENDING;
+    }
+
+    /* Token validation before state change */
+    if (routes) {
+        GsvaRouteEntry *route = gsva_route_lookup_base((GsvaRouteTable *)routes, key);
+        if (route) {
+            int tok_rc = gsva_route_validate_token(route, requester_cna,
+                                                    token_id, token_value, 1);
+            if (tok_rc != GSVA_OK) {
+                qemu_log("GSVA_COH: ReadAcquire token denied: cna=%" PRIu32
+                         " token_id=%" PRIu32 " rc=%d\n",
+                         requester_cna, token_id, tok_rc);
+                return GSVA_ERR_TOKEN_DENIED;
+            }
+        }
     }
 
     switch (obj->state) {
@@ -195,8 +212,9 @@ int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
     return GSVA_OK;
 }
 
-int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
-                           uint32_t requester_cna)
+int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
+                           const GsvaKeyV1 *key, uint32_t requester_cna,
+                           uint32_t token_id, uint32_t token_value)
 {
     GsvaCohObject *obj;
 
@@ -226,6 +244,21 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
 
     if (obj->pending) {
         return GSVA_ERR_COH_PENDING;
+    }
+
+    /* Token validation before state change */
+    if (routes) {
+        GsvaRouteEntry *route = gsva_route_lookup_base((GsvaRouteTable *)routes, key);
+        if (route) {
+            int tok_rc = gsva_route_validate_token(route, requester_cna,
+                                                    token_id, token_value, 2);
+            if (tok_rc != GSVA_OK) {
+                qemu_log("GSVA_COH: WriteAcquire token denied: cna=%" PRIu32
+                         " token_id=%" PRIu32 " rc=%d\n",
+                         requester_cna, token_id, tok_rc);
+                return GSVA_ERR_TOKEN_DENIED;
+            }
+        }
     }
 
     switch (obj->state) {

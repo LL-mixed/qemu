@@ -10569,27 +10569,35 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         break;
 
     case SIM_DEC_OP_GSVA_EVENT_V1: {
-        min_len = sizeof(*hdr) + sizeof(uint32_t) * 3;
+        min_len = sizeof(*hdr) + sizeof(uint32_t) * 4 + sizeof(GsvaKeyV1);
         if (len < min_len) {
             resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
             break;
         }
-        /* payload: [uint32_t sub_op] [uint32_t requester_cna] [GsvaKeyV1 key] */
+        /* payload: [uint32_t sub_op] [uint32_t requester_cna]
+         *          [uint32_t token_id] [uint32_t token_value]
+         *          [GsvaKeyV1 key] */
         const uint32_t *ev_payload = (const uint32_t *)(data + sizeof(*hdr));
         uint32_t sub_op = ev_payload[0];
         uint32_t requester_cna = ev_payload[1];
-        const GsvaKeyV1 *ev_key = (const GsvaKeyV1 *)(ev_payload + 2);
+        uint32_t token_id = ev_payload[2];
+        uint32_t token_value = ev_payload[3];
+        const GsvaKeyV1 *ev_key = (const GsvaKeyV1 *)(ev_payload + 4);
 
         gsva_tables_init();
 
         int ev_rc;
         switch (sub_op) {
         case 1: /* ReadAcquire */
-            ev_rc = gsva_coh_read_acquire(&g_gsva_coh, ev_key, requester_cna);
+            ev_rc = gsva_coh_read_acquire(&g_gsva_coh, &g_gsva_routes,
+                                          ev_key, requester_cna,
+                                          token_id, token_value);
             gsva_stats_read_acquire(&g_gsva_stats, ev_rc == GSVA_OK);
             break;
         case 2: /* WriteAcquire */
-            ev_rc = gsva_coh_write_acquire(&g_gsva_coh, ev_key, requester_cna);
+            ev_rc = gsva_coh_write_acquire(&g_gsva_coh, &g_gsva_routes,
+                                           ev_key, requester_cna,
+                                           token_id, token_value);
             gsva_stats_write_acquire(&g_gsva_stats, ev_rc == GSVA_OK);
             break;
         case 3: /* Retire */

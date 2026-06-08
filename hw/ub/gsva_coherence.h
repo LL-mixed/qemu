@@ -66,13 +66,15 @@ int gsva_coh_object_remove(GsvaCohTable *tbl, const GsvaKeyV1 *key);
 /* Lookup coherence object by key. Returns object or NULL. */
 GsvaCohObject *gsva_coh_lookup(GsvaCohTable *tbl, const GsvaKeyV1 *key);
 
-/* ReadAcquire: acquire shared access. Returns GSVA_OK or error. */
-int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
-                          uint32_t requester_cna);
+/* ReadAcquire: acquire shared access. Token validated before state change. */
+int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
+                          const GsvaKeyV1 *key, uint32_t requester_cna,
+                          uint32_t token_id, uint32_t token_value);
 
-/* WriteAcquire: acquire exclusive/modified access. Returns GSVA_OK or error. */
-int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
-                           uint32_t requester_cna);
+/* WriteAcquire: acquire exclusive/modified access. Token validated before state change. */
+int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
+                           const GsvaKeyV1 *key, uint32_t requester_cna,
+                           uint32_t token_id, uint32_t token_value);
 
 /* Retire: start retire transaction. Returns GSVA_OK or error. */
 int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
