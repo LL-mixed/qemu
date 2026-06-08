@@ -8527,7 +8527,7 @@ bool gsva_arm_mmu_enabled(void)
     }
 
     mode = g_getenv("GSVA_MODE");
-    cached = (mode && strcmp(mode, "arm_mmu") == 0) ? 1 : 0;
+    cached = (!mode || mode[0] == '\0' || strcmp(mode, "arm_mmu") == 0) ? 1 : 0;
     if (cached) {
         qemu_log("GSVA_MODE arm_mmu: ARM tlb_fill will use GSVA route/coherence\n");
     }
