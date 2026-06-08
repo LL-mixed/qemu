@@ -10355,6 +10355,30 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
             qemu_log("GSVA_UNMAP: coh retire failed: %s\n",
                      gsva_error_name(coh_rc));
         }
+
+        /* PA-MESI fence before route removal (V1 sim: best-effort) */
+        if (coh_rc == GSVA_OK && g_sim_decoder && g_sim_decoder->bcs &&
+            g_sim_decoder->bcs->ubc_dev) {
+            int fence_rc = obmm_coh_send_fence(
+                g_sim_decoder->bcs->ubc_dev,
+                route->home_cna,
+                route->key.home_va,
+                route->key.size,
+                route->token.token_id);
+            if (fence_rc != 0) {
+                qemu_log("GSVA_UNMAP: PA-MESI fence failed: %d\n", fence_rc);
+            } else {
+                obmm_coh_invalidate_local_range(
+                    g_sim_decoder->bcs->ubc_dev,
+                    route->home_cna,
+                    route->key.home_va,
+                    route->key.size,
+                    route->token.token_id);
+                qemu_log("GSVA_UNMAP: PA-MESI fence+invalidate done"
+                         " segment_id=%#" PRIx64 "\n",
+                         route->key.segment_id);
+            }
+        }
     }
 
     /* Always keep tombstone for GSVA unmap (epoch tracking) */
