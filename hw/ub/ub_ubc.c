@@ -31,6 +31,7 @@
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_ubc.h"
 #include "hw/ub/gsva_key.h"
+#include "hw/ub/gsva_route.h"
 #include "hw/ub/obmm_coherence.h"
 #include "hw/ub/ub_ummu.h"
 #include "hw/ub/ub_config.h"
@@ -277,6 +278,41 @@ typedef struct QEMU_PACKED SimDecGsvaQueryReq {
     uint32_t query_type;
     GsvaKeyV1 key;
 } SimDecGsvaQueryReq;
+
+/* GSVA map request */
+typedef struct QEMU_PACKED SimDecGsvaMapReq {
+    uint32_t version;
+    uint32_t flags;
+    GsvaKeyV1 key;
+    uint64_t local_pa;
+    uint64_t local_va;
+    uint64_t remote_uba;
+    uint64_t token_id;
+    uint64_t token_value;
+    uint32_t source;
+    uint32_t address_profile;
+} SimDecGsvaMapReq;
+
+/* GSVA map response */
+typedef struct QEMU_PACKED SimDecGsvaMapResp {
+    uint64_t map_id;
+    int32_t  error;
+    uint32_t reserved;
+} SimDecGsvaMapResp;
+
+/* GSVA unmap request */
+typedef struct QEMU_PACKED SimDecGsvaUnmapReq {
+    uint32_t version;
+    uint32_t flags;
+    GsvaKeyV1 key;
+    uint64_t map_id;
+} SimDecGsvaUnmapReq;
+
+/* GSVA unmap response */
+typedef struct QEMU_PACKED SimDecGsvaUnmapResp {
+    int32_t  error;
+    uint32_t reserved;
+} SimDecGsvaUnmapResp;
 
 /* GSVA capability response */
 typedef struct QEMU_PACKED SimDecGsvaCapsResp {
@@ -10141,6 +10177,86 @@ static int sim_dec_handle_gsva_query(const SimDecGsvaQueryReq *req,
     return resp->error == GSVA_OK ? 0 : -1;
 }
 
+/* Global GSVA route table */
+static GsvaRouteTable g_gsva_routes;
+static bool g_gsva_routes_initialized;
+
+static void gsva_routes_init(void)
+{
+    if (!g_gsva_routes_initialized) {
+        gsva_route_table_init(&g_gsva_routes);
+        g_gsva_routes_initialized = true;
+    }
+}
+
+/* GSVA MAP handler */
+static int sim_dec_handle_gsva_map(const SimDecGsvaMapReq *req,
+                                   SimDecGsvaMapResp *resp)
+{
+    memset(resp, 0, sizeof(*resp));
+
+    if (!req) {
+        resp->error = GSVA_ERR_BAD_VERSION;
+        return -1;
+    }
+
+    if (req->version != 1) {
+        qemu_log("GSVA_MAP: bad version %" PRIu32 "\n", req->version);
+        resp->error = GSVA_ERR_BAD_VERSION;
+        return -1;
+    }
+
+    gsva_routes_init();
+
+    resp->error = gsva_route_map(&g_gsva_routes,
+                                  &req->key,
+                                  req->local_pa,
+                                  req->local_va,
+                                  req->remote_uba,
+                                  req->source,
+                                  req->address_profile,
+                                  0, /* home_cna from key context */
+                                  (uint32_t)req->token_id,
+                                  (uint32_t)req->token_value,
+                                  0, /* access_flags from key context */
+                                  &resp->map_id);
+
+    if (resp->error != GSVA_OK) {
+        qemu_log("GSVA_MAP: failed: %s\n", gsva_error_name(resp->error));
+        return -1;
+    }
+    return 0;
+}
+
+/* GSVA UNMAP handler */
+static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
+                                     SimDecGsvaUnmapResp *resp)
+{
+    memset(resp, 0, sizeof(*resp));
+
+    if (!req) {
+        resp->error = GSVA_ERR_BAD_VERSION;
+        return -1;
+    }
+
+    if (req->version != 1) {
+        qemu_log("GSVA_UNMAP: bad version %" PRIu32 "\n", req->version);
+        resp->error = GSVA_ERR_BAD_VERSION;
+        return -1;
+    }
+
+    gsva_routes_init();
+
+    /* Always keep tombstone for GSVA unmap (epoch tracking) */
+    resp->error = gsva_route_unmap(&g_gsva_routes, req->map_id, true);
+
+    if (resp->error != GSVA_OK) {
+        qemu_log("GSVA_UNMAP: failed: %s\n", gsva_error_name(resp->error));
+        return -1;
+    }
+    return 0;
+}
+
 /*
  * ubc_handle_sim_dec_message - Handle incoming SIM_DEC control message
  * This is called from the control channel/message handler
@@ -10302,6 +10418,52 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             resp_hdr->status = (gerr == 0) ? SIM_DEC_STATUS_SUCCESS
                                            : SIM_DEC_STATUS_BACKEND_ERROR;
         }
+        break;
+
+    case SIM_DEC_OP_GSVA_MAP_V1:
+        min_len = sizeof(*hdr) + sizeof(SimDecGsvaMapReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        {
+            SimDecGsvaMapResp gsva_resp = {0};
+            int gerr = sim_dec_handle_gsva_map(
+                (const SimDecGsvaMapReq *)(data + sizeof(*hdr)),
+                &gsva_resp);
+            resp_hdr->payload_len = sizeof(gsva_resp);
+            memcpy(resp + sizeof(*resp_hdr), &gsva_resp, sizeof(gsva_resp));
+            resp_hdr->status = (gerr == 0) ? SIM_DEC_STATUS_SUCCESS
+                                           : SIM_DEC_STATUS_BACKEND_ERROR;
+        }
+        break;
+
+    case SIM_DEC_OP_GSVA_UNMAP_V1:
+        min_len = sizeof(*hdr) + sizeof(SimDecGsvaUnmapReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        {
+            SimDecGsvaUnmapResp gsva_resp = {0};
+            int gerr = sim_dec_handle_gsva_unmap(
+                (const SimDecGsvaUnmapReq *)(data + sizeof(*hdr)),
+                &gsva_resp);
+            resp_hdr->payload_len = sizeof(gsva_resp);
+            memcpy(resp + sizeof(*resp_hdr), &gsva_resp, sizeof(gsva_resp));
+            resp_hdr->status = (gerr == 0) ? SIM_DEC_STATUS_SUCCESS
+                                           : SIM_DEC_STATUS_BACKEND_ERROR;
+        }
+        break;
+
+    case SIM_DEC_OP_GSVA_EVENT_V1:
+        min_len = sizeof(*hdr) + 8;
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        qemu_log("GSVA_EVENT: not yet implemented\n");
+        resp_hdr->status = SIM_DEC_STATUS_NOT_SUPPORTED;
         break;
 
     default:
