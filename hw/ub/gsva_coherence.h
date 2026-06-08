@@ -110,6 +110,12 @@ int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
                           const GsvaKeyV1 *key, uint32_t requester_cna,
                           uint32_t token_id, uint32_t token_value);
 
+/* ReadAcquire with optional UB Link transport for remote downgrade. */
+int gsva_coh_read_acquire_tx(GsvaCohTable *tbl, const GsvaRouteTable *routes,
+                             BusControllerDev *ubc_dev,
+                             const GsvaKeyV1 *key, uint32_t requester_cna,
+                             uint32_t token_id, uint32_t token_value);
+
 /* WriteAcquire: acquire exclusive/modified access. Token validated before state change. */
 int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
                            const GsvaKeyV1 *key, uint32_t requester_cna,

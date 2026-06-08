@@ -10448,10 +10448,13 @@ int gsva_arm_mmu_translate_full(uint64_t va, bool is_write,
                                            route->token.token_id,
                                            route->token.token_value);
     } else {
-        acq_rc = gsva_coh_read_acquire(&g_gsva_coh, &g_gsva_routes,
-                                       &route->key, requester_cna,
-                                       route->token.token_id,
-                                       route->token.token_value);
+        acq_rc = gsva_coh_read_acquire_tx(&g_gsva_coh, &g_gsva_routes,
+                                          g_sim_decoder &&
+                                          g_sim_decoder->bcs ?
+                                          g_sim_decoder->bcs->ubc_dev : NULL,
+                                          &route->key, requester_cna,
+                                          route->token.token_id,
+                                          route->token.token_value);
     }
     if (acq_rc != GSVA_OK) {
         if (acq_rc == GSVA_ERR_COH_TIMEOUT) {
@@ -11030,9 +11033,12 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         int ev_rc;
         switch (sub_op) {
         case 1: /* ReadAcquire */
-            ev_rc = gsva_coh_read_acquire(&g_gsva_coh, &g_gsva_routes,
-                                          ev_key, requester_cna,
-                                          token_id, token_value);
+            ev_rc = gsva_coh_read_acquire_tx(&g_gsva_coh, &g_gsva_routes,
+                                             g_sim_decoder &&
+                                             g_sim_decoder->bcs ?
+                                             g_sim_decoder->bcs->ubc_dev : NULL,
+                                             ev_key, requester_cna,
+                                             token_id, token_value);
             gsva_stats_read_acquire(&g_gsva_stats, ev_rc == GSVA_OK);
             break;
         case 2: /* WriteAcquire */
