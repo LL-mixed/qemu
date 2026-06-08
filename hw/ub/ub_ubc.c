@@ -10550,6 +10550,44 @@ static int sim_dec_handle_gsva_query(const SimDecGsvaQueryReq *req,
         break;
     }
     case GSVA_QUERY_COHERENCE: {
+        if (req->key.segment_id || req->key.home_va) {
+            GsvaCohObject *obj = NULL;
+
+            if (g_gsva_initialized) {
+                QTAILQ_FOREACH(obj, &g_gsva_coh.objects, next) {
+                    if (req->key.segment_id &&
+                        obj->key.segment_id != req->key.segment_id) {
+                        continue;
+                    }
+                    if (req->key.home_va &&
+                        obj->key.home_va != req->key.home_va) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+
+            if (!g_gsva_initialized || !obj) {
+                resp->error = GSVA_ERR_ROUTE_MISSING;
+            } else if (obj->state == GSVA_COH_TIMEOUT) {
+                resp->error = GSVA_ERR_COH_TIMEOUT;
+            } else if (obj->state == GSVA_COH_RETIRED) {
+                resp->error = GSVA_ERR_SEGMENT_RETIRED;
+            } else {
+                resp->error = GSVA_OK;
+            }
+            {
+                uint32_t state_code = obj ? (uint32_t)obj->state : UINT32_MAX;
+                memcpy(resp->data, &state_code, sizeof(state_code));
+            }
+            qemu_log("GSVA_QUERY_COHERENCE: segment_id=%#" PRIx64
+                     " home_va=%#" PRIx64 " state=%s error=%d\n",
+                     req->key.segment_id, req->key.home_va,
+                     obj ? gsva_coh_state_name(obj->state) : "MISSING",
+                     resp->error);
+            break;
+        }
+
         /* Return stats: maps, unmaps, coh objects, read/write acquires */
         if (!g_gsva_initialized) {
             resp->error = GSVA_OK;
@@ -10893,13 +10931,12 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         }
         {
             SimDecGsvaQueryResp gsva_resp = {0};
-            int gerr = sim_dec_handle_gsva_query(
+            (void)sim_dec_handle_gsva_query(
                 (const SimDecGsvaQueryReq *)(data + sizeof(*hdr)),
                 &gsva_resp);
             resp_hdr->payload_len = sizeof(gsva_resp);
             memcpy(resp + sizeof(*resp_hdr), &gsva_resp, sizeof(gsva_resp));
-            resp_hdr->status = (gerr == 0) ? SIM_DEC_STATUS_SUCCESS
-                                           : SIM_DEC_STATUS_BACKEND_ERROR;
+            resp_hdr->status = SIM_DEC_STATUS_SUCCESS;
         }
         break;
 
