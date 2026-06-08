@@ -512,4 +512,7 @@ int sim_dec_lookup_by_pa(uint64_t pa, uint64_t *remote_uba,
 bool sim_dec_gva_tcg_translate(uint64_t va, bool is_write,
                                uint64_t *local_pa, uint64_t *page_size);
 
+/* GSVA ARM MMU hook: check coherence permissions on TLB fill */
+int gsva_arm_mmu_translate(uint64_t va, bool is_write, uint32_t cpu_index);
+
 #endif

@@ -13,6 +13,7 @@
 #include "exec/helper-proto.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "hw/ub/ub_ubc.h"
+#include "qemu/log.h"
 #endif
 
 
@@ -346,6 +347,23 @@ bool arm_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                                       &gva_local_pa, &gva_page_size)) {
             res.f.phys_addr = gva_local_pa & TARGET_PAGE_MASK;
             res.f.lg_page_size = ctz64(gva_page_size);
+
+            /* GSVA coherence permission check */
+            int gsva_rc = gsva_arm_mmu_translate(address,
+                                                  access_type == MMU_DATA_STORE,
+                                                  cs->cpu_index);
+            if (gsva_rc < 0) {
+                qemu_log_mask(CPU_LOG_MMU,
+                    "GSVA MMU: denying access va=%#" PRIx64
+                    " is_write=%d rc=%d\n",
+                    address, access_type == MMU_DATA_STORE, gsva_rc);
+                /* Treat as permission fault */
+                fi->type = ARMFault_Permission;
+                fi->level = 1;
+                cpu_restore_state(cs, retaddr);
+                arm_deliver_fault(cpu, address, access_type, mmu_idx, fi);
+                return false;
+            }
         }
 
         res.f.extra.arm.pte_attrs = res.cacheattrs.attrs;

@@ -10141,6 +10141,60 @@ static void gsva_tables_init(void)
 }
 
 /*
+ * GSVA ARM MMU translate hook.
+ *
+ * Called from arm_cpu_tlb_fill after GVA route lookup succeeds.
+ * Checks GSVA coherence permissions for the VA access.
+ * Returns: 0 = GSVA permission OK, negative = access denied.
+ */
+int gsva_arm_mmu_translate(uint64_t va, bool is_write, uint32_t cpu_index)
+{
+    GsvaRouteEntry *route;
+    GsvaCohObject *coh_obj;
+    GsvaKeyV1 search_key;
+
+    if (!g_gsva_initialized) {
+        return 0;
+    }
+
+    route = gsva_route_lookup_va(&g_gsva_routes, 0, 0, va);
+    if (!route) {
+        return 0;
+    }
+
+    search_key = route->key;
+    coh_obj = gsva_coh_lookup(&g_gsva_coh, &search_key);
+    if (!coh_obj) {
+        return 0;
+    }
+
+    if (coh_obj->state == GSVA_COH_RETIRED) {
+        qemu_log("GSVA_MMU: access to RETIRED segment va=%#" PRIx64
+                 " segment_id=%#" PRIx64 "\n",
+                 va, coh_obj->key.segment_id);
+        return GSVA_ERR_SEGMENT_RETIRED;
+    }
+
+    if (coh_obj->state == GSVA_COH_TIMEOUT || coh_obj->state == GSVA_COH_I) {
+        qemu_log("GSVA_MMU: access to %s segment va=%#" PRIx64
+                 " segment_id=%#" PRIx64 "\n",
+                 gsva_coh_state_name(coh_obj->state),
+                 va, coh_obj->key.segment_id);
+        return GSVA_ERR_COH_PENDING;
+    }
+
+    if (is_write && coh_obj->state != GSVA_COH_M &&
+        coh_obj->state != GSVA_COH_E) {
+        qemu_log("GSVA_MMU: write to non-exclusive segment va=%#" PRIx64
+                 " state=%s\n",
+                 va, gsva_coh_state_name(coh_obj->state));
+        return GSVA_ERR_COH_PENDING;
+    }
+
+    return 0;
+}
+
+/*
  * GSVA query handler - capability and object queries.
  */
 static int sim_dec_handle_gsva_query(const SimDecGsvaQueryReq *req,
