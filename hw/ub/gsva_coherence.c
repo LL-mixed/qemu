@@ -498,6 +498,17 @@ int gsva_coh_inv_ack(GsvaCohTable *tbl, const GsvaKeyV1 *key,
 
     if (obj->pending_ack_bitmap == 0) {
         obj->pending = false;
+        obj->pending_start_ms = 0;
+        if (obj->pending_op == 1) {
+            obj->state = GSVA_COH_M;
+            obj->owner_cna = obj->pending_target;
+            obj->sharer_bitmap = 0;
+            qemu_log("GSVA_COH: InvAck recovery grant M cna=%" PRIu32
+                     " seq=%" PRIu64 " segment_id=%#" PRIx64 "\n",
+                     obj->pending_target, seq, obj->key.segment_id);
+        }
+        obj->pending_op = 0;
+        obj->pending_target = 0;
         qemu_log("GSVA_COH: pending op complete seq=%" PRIu64
                  " segment_id=%#" PRIx64 "\n",
                  seq, obj->key.segment_id);

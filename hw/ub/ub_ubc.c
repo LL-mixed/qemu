@@ -10578,13 +10578,23 @@ static int sim_dec_handle_gsva_query(const SimDecGsvaQueryReq *req,
             }
             {
                 uint32_t state_code = obj ? (uint32_t)obj->state : UINT32_MAX;
+                uint64_t pending_seq = obj ? obj->pending_seq : 0;
+                uint64_t pending_ack_bitmap = obj ? obj->pending_ack_bitmap : 0;
+
                 memcpy(resp->data, &state_code, sizeof(state_code));
+                memcpy(resp->data + sizeof(state_code), &pending_seq,
+                       sizeof(pending_seq));
+                memcpy(resp->data + sizeof(state_code) + sizeof(pending_seq),
+                       &pending_ack_bitmap, sizeof(pending_ack_bitmap));
             }
             qemu_log("GSVA_QUERY_COHERENCE: segment_id=%#" PRIx64
-                     " home_va=%#" PRIx64 " state=%s error=%d\n",
+                     " home_va=%#" PRIx64 " state=%s error=%d"
+                     " pending=%u seq=%" PRIu64 " waiting_for=%#" PRIx64 "\n",
                      req->key.segment_id, req->key.home_va,
                      obj ? gsva_coh_state_name(obj->state) : "MISSING",
-                     resp->error);
+                     resp->error, obj ? obj->pending : 0,
+                     obj ? obj->pending_seq : 0,
+                     obj ? obj->pending_ack_bitmap : 0);
             break;
         }
 
@@ -11038,6 +11048,9 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             } else {
                 ev_rc = gsva_coh_inv_ack(&g_gsva_coh, ev_key, requester_cna,
                                          token_id /* reuse as seq */);
+                if (ev_rc == GSVA_OK) {
+                    gsva_tlb_stable_flush_key(ev_key, "coh_inv_ack");
+                }
             }
             break;
         case 5: /* Retry */
