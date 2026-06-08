@@ -10628,6 +10628,14 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             ev_rc = gsva_coh_retire(&g_gsva_coh, ev_key, requester_cna);
             gsva_stats_retire(&g_gsva_stats, ev_rc == GSVA_OK);
             break;
+        case 4: /* InvAck */
+            ev_rc = gsva_coh_inv_ack(&g_gsva_coh, ev_key, requester_cna,
+                                     token_id /* reuse as seq */);
+            break;
+        case 5: /* Retry */
+            ev_rc = gsva_coh_retry(&g_gsva_coh, ev_key,
+                                    token_id /* reuse as seq */);
+            break;
         default:
             ev_rc = GSVA_ERR_BAD_VERSION;
             break;

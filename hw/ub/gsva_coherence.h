@@ -84,6 +84,13 @@ int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
 int gsva_coh_check_timeouts(GsvaCohTable *tbl, uint64_t now_ms,
                             uint64_t timeout_ms);
 
+/* Process invalidate ACK from a sharer. Completes pending op when all ACKs received. */
+int gsva_coh_inv_ack(GsvaCohTable *tbl, const GsvaKeyV1 *key,
+                     uint32_t ack_cna, uint64_t seq);
+
+/* Retry a pending acquire (idempotent). Returns GSVA_OK if op completed. */
+int gsva_coh_retry(GsvaCohTable *tbl, const GsvaKeyV1 *key, uint64_t seq);
+
 /* Get object state as string */
 const char *gsva_coh_state_name(GsvaCohState state);
 

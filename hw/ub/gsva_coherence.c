@@ -271,9 +271,25 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
                  requester_cna, key->segment_id);
         break;
 
-    case GSVA_COH_S:
-        /* In full impl: need to invalidate other sharers.
-         * For V1 sim: directly grant M to requester. */
+    case GSVA_COH_S: {
+        /* Invalidate other sharers before granting M.
+         * V1 sim: synchronous — record pending, immediately complete. */
+        uint64_t other_sharers = obj->sharer_bitmap & ~(1ULL << requester_cna);
+        if (other_sharers) {
+            obj->pending = true;
+            obj->pending_seq = ++tbl->next_seq;
+            obj->pending_op = 1; /* invalidate */
+            obj->pending_target = requester_cna;
+            obj->pending_ack_bitmap = other_sharers;
+            qemu_log("GSVA_COH: WriteAcquire S->M pending inv"
+                     " cna=%" PRIu32 " waiting_for=%#" PRIx64
+                     " seq=%" PRIu64 "\n",
+                     requester_cna, other_sharers, obj->pending_seq);
+
+            /* V1 sim: immediately acknowledge all invalidations */
+            obj->pending_ack_bitmap = 0;
+            obj->pending = false;
+        }
         obj->state = GSVA_COH_M;
         obj->owner_cna = requester_cna;
         obj->sharer_bitmap = 0;
@@ -281,6 +297,7 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
                  " segment_id=%#" PRIx64 "\n",
                  requester_cna, key->segment_id);
         break;
+    }
 
     case GSVA_COH_E:
         if (obj->owner_cna == requester_cna) {
@@ -359,6 +376,69 @@ int gsva_coh_retire(GsvaCohTable *tbl, const GsvaKeyV1 *key,
              key->segment_id, key->home_va, key->epoch);
 
     return GSVA_OK;
+}
+
+int gsva_coh_inv_ack(GsvaCohTable *tbl, const GsvaKeyV1 *key,
+                     uint32_t ack_cna, uint64_t seq)
+{
+    GsvaCohObject *obj;
+
+    if (!tbl || !key) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+
+    obj = gsva_coh_lookup(tbl, key);
+    if (!obj) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    if (!obj->pending || obj->pending_seq != seq) {
+        return GSVA_ERR_COH_PENDING;
+    }
+
+    obj->pending_ack_bitmap &= ~(1ULL << ack_cna);
+    qemu_log("GSVA_COH: InvAck cna=%" PRIu32 " seq=%" PRIu64
+             " remaining=%#" PRIx64 "\n",
+             ack_cna, seq, obj->pending_ack_bitmap);
+
+    if (obj->pending_ack_bitmap == 0) {
+        obj->pending = false;
+        qemu_log("GSVA_COH: pending op complete seq=%" PRIu64
+                 " segment_id=%#" PRIx64 "\n",
+                 seq, obj->key.segment_id);
+    }
+
+    return GSVA_OK;
+}
+
+int gsva_coh_retry(GsvaCohTable *tbl, const GsvaKeyV1 *key, uint64_t seq)
+{
+    GsvaCohObject *obj;
+
+    if (!tbl || !key) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+
+    obj = gsva_coh_lookup(tbl, key);
+    if (!obj) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    if (!obj->pending) {
+        return GSVA_OK; /* already complete */
+    }
+
+    if (obj->pending_seq != seq) {
+        return GSVA_ERR_COH_PENDING;
+    }
+
+    /* V1 sim: synchronous — if still pending, treat as timeout check */
+    if (obj->pending_ack_bitmap == 0) {
+        obj->pending = false;
+        return GSVA_OK;
+    }
+
+    return GSVA_ERR_COH_PENDING;
 }
 
 const char *gsva_coh_state_name(GsvaCohState state)
