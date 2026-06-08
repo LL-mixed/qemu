@@ -10438,6 +10438,9 @@ int gsva_arm_mmu_translate_full(uint64_t va, bool is_write,
                                        route->token.token_value);
     }
     if (acq_rc != GSVA_OK) {
+        if (acq_rc == GSVA_ERR_COH_TIMEOUT) {
+            gsva_tlb_stable_flush_key(&route->key, "coh_timeout");
+        }
         qemu_log("GSVA_MMU: acquire failed va=%#" PRIx64
                  " segment_id=%#" PRIx64 " is_write=%u rc=%d\n",
                  page_va, route->key.segment_id, is_write, acq_rc);
@@ -11014,6 +11017,10 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         default:
             ev_rc = GSVA_ERR_BAD_VERSION;
             break;
+        }
+
+        if (ev_rc == GSVA_ERR_COH_TIMEOUT) {
+            gsva_tlb_stable_flush_key(ev_key, "coh_timeout");
         }
 
         resp_hdr->status = SIM_DEC_STATUS_SUCCESS;
