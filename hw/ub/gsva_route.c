@@ -55,7 +55,7 @@ int gsva_route_map(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
     }
 
     /* Strict GSVA: local_va == home_va == remote_uba */
-    if (address_profile == 1 /* GSVA_ADDRESS_PROFILE_STRICT_GSVA */) {
+    if (address_profile == GSVA_ADDRESS_PROFILE_STRICT_GSVA) {
         if (local_va != key->home_va) {
             qemu_log("GSVA_ROUTE: strict address violation: "
                      "local_va=%" PRIx64 " != home_va=%" PRIx64 "\n",

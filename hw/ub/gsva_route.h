@@ -22,6 +22,11 @@ typedef enum GsvaRouteState {
     GSVA_ROUTE_RETIRED = 3,
 } GsvaRouteState;
 
+/* address_profile values for SIM_DEC_OP_GSVA_MAP_V1 */
+#define GSVA_ADDRESS_PROFILE_LEGACY_RELOCATABLE 0
+#define GSVA_ADDRESS_PROFILE_STRICT_GSVA 1
+#define GSVA_ADDRESS_PROFILE_COMPAT_GSVA 2
+
 /* Token v1 state machine */
 typedef enum GsvaTokenStateV1 {
     GSVA_TOKEN_INVALID  = 0,

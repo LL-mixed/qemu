@@ -10367,8 +10367,8 @@ int gsva_arm_mmu_translate_full(uint64_t va, bool is_write,
         route->source == SIM_DEC_MAP_SOURCE_GVA_MANAGER &&
         route->local_va == route->key.home_va &&
         route->remote_uba == route->key.home_va &&
-        (route->address_profile == SIM_DEC_ADDRESS_PROFILE_GSVA_IDENTITY ||
-         route->address_profile == SIM_DEC_ADDRESS_PROFILE_GENERIC_GVA);
+        (route->address_profile == GSVA_ADDRESS_PROFILE_STRICT_GSVA ||
+         route->address_profile == GSVA_ADDRESS_PROFILE_COMPAT_GSVA);
 
     if (!identity_route || route->local_va == 0 || route->local_pa == 0 ||
         page_va < route->local_va ||
