@@ -10220,10 +10220,12 @@ static int sim_dec_handle_gsva_query(const SimDecGsvaQueryReq *req,
         caps.supported_modes = 0
             | (1u << 0)  /* legacy_sim_dec */
             | (1u << 1)  /* sim_gva_tcg */
-            | (1u << 2); /* arm_mmu (future) */
+            | (1u << 2); /* arm_mmu */
         caps.flags = 0
             | GSVA_CAP_STRICT_ADDRESS_IDENTITY
-            | GSVA_CAP_ROUTE_LAYER;
+            | GSVA_CAP_ROUTE_LAYER
+            | GSVA_CAP_COHERENCE_LAYER
+            | GSVA_CAP_ARM_MMU_MODE;
         qemu_log("GSVA_QUERY_CAPS: flags=%" PRIx32 " max_nodes=%" PRIu32
                  " cache_policies=%" PRIx32 " modes=%" PRIx32 "\n",
                  caps.flags, caps.max_nodes,
