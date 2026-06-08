@@ -157,6 +157,10 @@ int gsva_coh_token_revoke_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
                              const GsvaKeyV1 *key, uint32_t requester_cna,
                              uint32_t token_id, uint32_t new_token_value);
 
+/* Send fence to remote coherence holders and wait for ACKs. */
+int gsva_coh_fence_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
+                      const GsvaKeyV1 *key, uint32_t requester_cna);
+
 /* Get object state as string */
 const char *gsva_coh_state_name(GsvaCohState state);
 

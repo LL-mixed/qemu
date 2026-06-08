@@ -11122,6 +11122,13 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
                                                token_id, token_value);
             }
             break;
+        case 7: /* Fence */
+            ev_rc = gsva_coh_fence_tx(&g_gsva_coh,
+                                      g_sim_decoder &&
+                                      g_sim_decoder->bcs ?
+                                      g_sim_decoder->bcs->ubc_dev : NULL,
+                                      ev_key, requester_cna);
+            break;
         default:
             ev_rc = GSVA_ERR_BAD_VERSION;
             break;

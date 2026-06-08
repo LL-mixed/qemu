@@ -978,6 +978,115 @@ int gsva_coh_token_revoke_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
     return GSVA_OK;
 }
 
+int gsva_coh_fence_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
+                      const GsvaKeyV1 *key, uint32_t requester_cna)
+{
+    GsvaCohObject *obj;
+    uint32_t targets[GSVA_COH_MAX_HOLDERS] = {0};
+    uint32_t target_count = 0;
+    uint32_t i;
+
+    if (!tbl || !key) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+
+    obj = gsva_coh_lookup(tbl, key);
+    if (!obj) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    if (obj->pending) {
+        return GSVA_ERR_COH_PENDING;
+    }
+    if (obj->state == GSVA_COH_RETIRED) {
+        return GSVA_ERR_SEGMENT_RETIRED;
+    }
+    if (obj->state == GSVA_COH_TIMEOUT) {
+        return GSVA_ERR_COH_TIMEOUT;
+    }
+
+    if (obj->state == GSVA_COH_E || obj->state == GSVA_COH_M) {
+        if (obj->owner_cna != 0 && obj->owner_cna != requester_cna) {
+            targets[target_count++] = obj->owner_cna;
+        }
+    } else if (obj->state == GSVA_COH_S) {
+        for (i = 0; i < obj->sharer_count; i++) {
+            uint32_t cna = obj->sharer_cnas[i];
+
+            if (cna == requester_cna) {
+                continue;
+            }
+            if (target_count < GSVA_COH_MAX_HOLDERS) {
+                targets[target_count++] = cna;
+            }
+        }
+    }
+
+    qemu_log("GSVA_COH: Fence holders segment_id=%#" PRIx64
+             " requester=%" PRIu32 " targets=%" PRIu32 "\n",
+             key->segment_id, requester_cna, target_count);
+
+    if (target_count == 0) {
+        return GSVA_OK;
+    }
+
+    obj->pending = true;
+    obj->pending_seq = ++tbl->next_seq;
+    obj->pending_op = 5; /* fence */
+    obj->pending_target = requester_cna;
+    gsva_coh_pending_clear(obj);
+    for (i = 0; i < target_count; i++) {
+        gsva_coh_pending_add(obj, targets[i]);
+    }
+    obj->pending_start_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    qemu_log("GSVA_COH: Fence pending requester=%" PRIu32
+             " waiting_for=%#" PRIx64 " seq=%" PRIu64
+             " targets=%" PRIu32 "\n",
+             requester_cna, obj->pending_ack_bitmap, obj->pending_seq,
+             target_count);
+
+    if (ubc_dev && gsva_coh_ub_link_tx_enabled()) {
+        for (i = 0; i < target_count; i++) {
+            GsvaCohMsgV1 fence = {0};
+            int tx_rc;
+
+            if (targets[i] == ubc_dev->parent.cna) {
+                continue;
+            }
+            fence.version = 1;
+            fence.op = GSVA_COH_MSG_FENCE;
+            fence.seq = obj->pending_seq;
+            fence.source_cna = requester_cna;
+            fence.target_cna = targets[i];
+            fence.key = *key;
+            fence.access_va = key->home_va;
+            fence.access_len = key->size;
+            fence.access_flags = 0;
+            tx_rc = gsva_coh_send_ub_link_msg(
+                    ubc_dev, targets[i], UBC_MSG_SUB_GSVA_COH, &fence);
+            qemu_log("GSVA_COH: tx FENCE target=%" PRIu32
+                     " seq=%" PRIu64 " segment_id=%#" PRIx64
+                     " rc=%d\n",
+                     targets[i], obj->pending_seq, key->segment_id, tx_rc);
+        }
+    }
+
+    if (gsva_coh_hold_pending_enabled()) {
+        qemu_log("GSVA_COH: pending held seq=%" PRIu64
+                 " segment_id=%#" PRIx64
+                 " timeout_ms=%" PRIu64 "\n",
+                 obj->pending_seq, key->segment_id, gsva_coh_timeout_ms());
+        return GSVA_ERR_COH_PENDING;
+    }
+
+    gsva_coh_pending_clear(obj);
+    obj->pending = false;
+    obj->pending_start_ms = 0;
+    obj->pending_op = 0;
+    obj->pending_target = 0;
+    return GSVA_OK;
+}
+
 int gsva_coh_inv_ack(GsvaCohTable *tbl, const GsvaKeyV1 *key,
                      uint32_t ack_cna, uint64_t seq)
 {
@@ -1033,6 +1142,11 @@ int gsva_coh_inv_ack(GsvaCohTable *tbl, const GsvaKeyV1 *key,
                      " requester=%" PRIu32 " owner=%" PRIu32
                      " seq=%" PRIu64 " segment_id=%#" PRIx64 "\n",
                      requester, ack_cna, seq, obj->key.segment_id);
+        } else if (obj->pending_op == 5) {
+            qemu_log("GSVA_COH: FenceAck recovery complete"
+                     " requester=%" PRIu32 " seq=%" PRIu64
+                     " segment_id=%#" PRIx64 "\n",
+                     obj->pending_target, seq, obj->key.segment_id);
         }
         obj->pending_op = 0;
         obj->pending_target = 0;
@@ -1272,9 +1386,19 @@ void gsva_coh_handle_rx_fence(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg
 
 void gsva_coh_handle_rx_fence_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
 {
+    int rc = GSVA_ERR_ROUTE_MISSING;
+
     qemu_log("GSVA_COH: rx FENCE_ACK from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
              msg->source_cna, msg->key.segment_id, msg->seq);
+    if (g_gsva_coh_default_table) {
+        rc = gsva_coh_inv_ack(g_gsva_coh_default_table, &msg->key,
+                              msg->source_cna, msg->seq);
+    }
+    qemu_log("GSVA_COH: rx FENCE_ACK applied from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " seq=%" PRIu64 " rc=%d\n",
+             msg->source_cna, msg->key.segment_id, msg->seq, rc);
+    (void)ubc_dev;
 }
 
 void gsva_coh_handle_rx_retire(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
