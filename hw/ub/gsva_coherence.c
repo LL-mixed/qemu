@@ -142,6 +142,9 @@ int gsva_coh_read_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
     }
 
     if (obj->state == GSVA_COH_RETIRED) {
+        qemu_log("GSVA_COH: ReadAcquire retired segment_id=%#" PRIx64
+                 " cna=%" PRIu32 "\n",
+                 key->segment_id, requester_cna);
         return GSVA_ERR_SEGMENT_RETIRED;
     }
 
@@ -236,6 +239,9 @@ int gsva_coh_write_acquire(GsvaCohTable *tbl, const GsvaRouteTable *routes,
     }
 
     if (obj->state == GSVA_COH_RETIRED) {
+        qemu_log("GSVA_COH: WriteAcquire retired segment_id=%#" PRIx64
+                 " cna=%" PRIu32 "\n",
+                 key->segment_id, requester_cna);
         return GSVA_ERR_SEGMENT_RETIRED;
     }
 

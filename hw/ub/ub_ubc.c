@@ -10828,9 +10828,24 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             gsva_stats_write_acquire(&g_gsva_stats, ev_rc == GSVA_OK);
             break;
         case 3: /* Retire */
-            ev_rc = gsva_coh_retire(&g_gsva_coh, ev_key, requester_cna);
+        {
+            GsvaRouteEntry *route =
+                gsva_route_lookup_base(&g_gsva_routes, ev_key);
+            if (!route) {
+                ev_rc = gsva_route_lookup_tombstone(&g_gsva_routes, ev_key) ?
+                        GSVA_ERR_SEGMENT_RETIRED : GSVA_ERR_ROUTE_MISSING;
+            } else {
+                SimDecGsvaUnmapReq unmap_req = {0};
+                SimDecGsvaUnmapResp unmap_resp = {0};
+                unmap_req.version = 1;
+                unmap_req.key = *ev_key;
+                unmap_req.map_id = route->map_id;
+                (void)sim_dec_handle_gsva_unmap(&unmap_req, &unmap_resp);
+                ev_rc = unmap_resp.error;
+            }
             gsva_stats_retire(&g_gsva_stats, ev_rc == GSVA_OK);
             break;
+        }
         case 4: /* InvAck */
             ev_rc = gsva_coh_inv_ack(&g_gsva_coh, ev_key, requester_cna,
                                      token_id /* reuse as seq */);
