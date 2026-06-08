@@ -121,6 +121,8 @@ int gsva_route_map(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
     entry->token.token_value = token_value;
     entry->token.access_flags = access_flags;
     entry->token.lease_epoch = 1;
+    entry->token.allowed_cna_bitmap = 0;
+    entry->token.state = (token_id != 0) ? GSVA_TOKEN_ACTIVE : GSVA_TOKEN_INVALID;
     entry->token.active = (token_id != 0);
 
     QTAILQ_INSERT_TAIL(&tbl->routes, entry, next);
@@ -244,26 +246,84 @@ int gsva_route_validate_token(const GsvaRouteEntry *route,
     if (route->state != GSVA_ROUTE_ACTIVE) {
         return GSVA_ERR_ROUTE_MISSING;
     }
-    if (!route->token.active) {
-        /* No token required for this route */
+
+    /* No token required for this route (INVALID state = no token enforced) */
+    if (route->token.state == GSVA_TOKEN_INVALID || !route->token.active) {
         return GSVA_OK;
     }
+
+    /* Token must be ACTIVE */
+    if (route->token.state != GSVA_TOKEN_ACTIVE) {
+        return GSVA_ERR_TOKEN_DENIED;
+    }
+
+    /* token_id must be non-zero for a protected route */
+    if (route->token.token_id == 0) {
+        return GSVA_ERR_TOKEN_DENIED;
+    }
+    /* token_value == 0 is allowed for routes that don't enforce value checking */
+    if (route->token.token_value == 0) {
+        /* Skip value check, allow access if token_id matches */
+        if (route->token.token_id != token_id) {
+            return GSVA_ERR_TOKEN_DENIED;
+        }
+        goto check_cna;
+    }
+
+    /* Exact token match */
     if (route->token.token_id != token_id) {
         return GSVA_ERR_TOKEN_DENIED;
     }
     if (route->token.token_value != token_value) {
         return GSVA_ERR_TOKEN_DENIED;
     }
-    /* Check access permissions */
-    if ((access_type & 1) && !(route->token.access_flags & 1)) {
-        /* Read requested but not permitted */
-        return GSVA_ERR_TOKEN_DENIED;
+
+check_cna:
+    /* allowed_cna_bitmap: 0 = any CNA allowed */
+    if (route->token.allowed_cna_bitmap != 0) {
+        if (!(route->token.allowed_cna_bitmap & (1ULL << requester_cna))) {
+            return GSVA_ERR_TOKEN_DENIED;
+        }
     }
-    if ((access_type & 2) && !(route->token.access_flags & 2)) {
-        /* Write requested but not permitted */
-        return GSVA_ERR_TOKEN_DENIED;
+
+    /* access_flags: bit 0 = read, bit 1 = write. 0 = full access (default open) */
+    if (route->token.access_flags != 0) {
+        if ((access_type & 1) && !(route->token.access_flags & 1)) {
+            return GSVA_ERR_TOKEN_DENIED;
+        }
+        if ((access_type & 2) && !(route->token.access_flags & 2)) {
+            return GSVA_ERR_TOKEN_DENIED;
+        }
     }
+
     return GSVA_OK;
+}
+
+int gsva_route_rotate_token(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
+                            uint32_t new_token_value)
+{
+    GsvaRouteEntry *entry;
+
+    if (!tbl || !key) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+
+    QTAILQ_FOREACH(entry, &tbl->routes, next) {
+        if (entry->state != GSVA_ROUTE_ACTIVE) {
+            continue;
+        }
+        if (gsva_key_base_equal(&entry->key, key)) {
+            entry->token.state = GSVA_TOKEN_REVOKING;
+            entry->token.lease_epoch++;
+            entry->token.token_value = new_token_value;
+            entry->token.state = GSVA_TOKEN_ACTIVE;
+            qemu_log("GSVA_ROUTE: token rotated segment_id=%#" PRIx64
+                     " lease_epoch=%" PRIu64 "\n",
+                     key->segment_id, entry->token.lease_epoch);
+            return GSVA_OK;
+        }
+    }
+    return GSVA_ERR_ROUTE_MISSING;
 }
 
 void gsva_route_get_stats(GsvaRouteTable *tbl,

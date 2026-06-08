@@ -22,6 +22,14 @@ typedef enum GsvaRouteState {
     GSVA_ROUTE_RETIRED = 3,
 } GsvaRouteState;
 
+/* Token v1 state machine */
+typedef enum GsvaTokenStateV1 {
+    GSVA_TOKEN_INVALID  = 0,
+    GSVA_TOKEN_ACTIVE   = 1,
+    GSVA_TOKEN_REVOKING = 2,
+    GSVA_TOKEN_REVOKED  = 3,
+} GsvaTokenStateV1;
+
 /* Token lease state in route */
 typedef struct GsvaTokenLease {
     uint32_t token_id;
@@ -29,7 +37,9 @@ typedef struct GsvaTokenLease {
     uint32_t access_flags;
     uint32_t flags;
     uint64_t lease_epoch;
-    bool active;
+    uint64_t allowed_cna_bitmap;   /* 0 = any CNA allowed */
+    GsvaTokenStateV1 state;
+    bool active;                   /* kept for backward compat */
 } GsvaTokenLease;
 
 /* GSVA route entry */
@@ -95,6 +105,10 @@ int gsva_route_validate_token(const GsvaRouteEntry *route,
                               uint32_t requester_cna,
                               uint32_t token_id, uint32_t token_value,
                               uint32_t access_type);
+
+/* Rotate token: set new token_value and increment lease_epoch. */
+int gsva_route_rotate_token(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
+                            uint32_t new_token_value);
 
 /* Get GSVA route stats */
 void gsva_route_get_stats(GsvaRouteTable *tbl,

@@ -8,6 +8,7 @@
 #include "qemu/osdep.h"
 #include "hw/ub/gsva_coherence.h"
 #include "hw/ub/gsva_route.h"
+#include "hw/ub/ub_ubc.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
 
@@ -479,4 +480,171 @@ int gsva_coh_check_timeouts(GsvaCohTable *tbl, uint64_t now_ms,
         }
     }
     return count;
+}
+
+/*
+ * GSVA coherence transport: send/receive over UB Link.
+ * Reuses the same obmm_coh_send_ub_link_msg() transport helper.
+ */
+
+int gsva_coh_send_ub_link_msg(BusControllerDev *ubc_dev, uint32_t dcna,
+                               uint8_t sub_msg_code,
+                               const GsvaCohMsgV1 *msg)
+{
+    if (!ubc_dev || !msg) {
+        return -1;
+    }
+    return obmm_coh_send_ub_link_msg(ubc_dev, dcna, sub_msg_code,
+                                     msg, sizeof(*msg));
+}
+
+static void gsva_coh_send_ack(BusControllerDev *ubc_dev,
+                               const GsvaCohMsgV1 *req,
+                               uint8_t ack_subcode, uint32_t error)
+{
+    GsvaCohMsgV1 ack = *req;
+    ack.source_cna = req->target_cna;
+    ack.target_cna = req->source_cna;
+    ack.error = error;
+    gsva_coh_send_ub_link_msg(ubc_dev, req->source_cna, ack_subcode, &ack);
+}
+
+void gsva_coh_handle_rx_inv(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx INV from cna=%" PRIu32 " segment_id=%#" PRIx64
+             " seq=%" PRIu64 "\n", msg->source_cna,
+             msg->key.segment_id, msg->seq);
+    /* Drop local GSVA state for the range — V1 sim: log and ACK */
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_INV_ACK, GSVA_OK);
+}
+
+void gsva_coh_handle_rx_inv_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx INV_ACK from cna=%" PRIu32 " segment_id=%#" PRIx64
+             " seq=%" PRIu64 "\n", msg->source_cna,
+             msg->key.segment_id, msg->seq);
+}
+
+void gsva_coh_handle_rx_downgrade(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx DOWNGRADE from cna=%" PRIu32 " segment_id=%#" PRIx64
+             " seq=%" PRIu64 "\n", msg->source_cna,
+             msg->key.segment_id, msg->seq);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_DOWNGRADE_ACK, GSVA_OK);
+}
+
+void gsva_coh_handle_rx_downgrade_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx DOWNGRADE_ACK from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
+             msg->source_cna, msg->key.segment_id, msg->seq);
+}
+
+void gsva_coh_handle_rx_wb(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx WRITEBACK from cna=%" PRIu32 " segment_id=%#" PRIx64
+             " seq=%" PRIu64 "\n", msg->source_cna,
+             msg->key.segment_id, msg->seq);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_RETIRE_ACK, GSVA_OK);
+}
+
+void gsva_coh_handle_rx_wb_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx WRITEBACK_ACK from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
+             msg->source_cna, msg->key.segment_id, msg->seq);
+}
+
+void gsva_coh_handle_rx_fence(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx FENCE from cna=%" PRIu32 " segment_id=%#" PRIx64
+             " seq=%" PRIu64 "\n", msg->source_cna,
+             msg->key.segment_id, msg->seq);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_FENCE_ACK, GSVA_OK);
+}
+
+void gsva_coh_handle_rx_fence_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx FENCE_ACK from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
+             msg->source_cna, msg->key.segment_id, msg->seq);
+}
+
+void gsva_coh_handle_rx_retire(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx RETIRE from cna=%" PRIu32 " segment_id=%#" PRIx64
+             " seq=%" PRIu64 "\n", msg->source_cna,
+             msg->key.segment_id, msg->seq);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_RETIRE_ACK, GSVA_OK);
+}
+
+void gsva_coh_handle_rx_retire_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx RETIRE_ACK from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
+             msg->source_cna, msg->key.segment_id, msg->seq);
+}
+
+void gsva_coh_handle_rx_token_revoke(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx TOKEN_REVOKE from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
+             msg->source_cna, msg->key.segment_id, msg->seq);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH_TOKEN_ACK, GSVA_OK);
+}
+
+void gsva_coh_handle_rx_token_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
+{
+    qemu_log("GSVA_COH: rx TOKEN_ACK from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
+             msg->source_cna, msg->key.segment_id, msg->seq);
+}
+
+void gsva_coh_dispatch_rx(BusControllerDev *ubc_dev, uint8_t sub_msg_code,
+                           const void *payload, uint32_t payload_len)
+{
+    const GsvaCohMsgV1 *msg;
+
+    if (payload_len < sizeof(GsvaCohMsgV1)) {
+        qemu_log("GSVA_COH: short payload %u < %zu subcode=%u\n",
+                 payload_len, sizeof(GsvaCohMsgV1), sub_msg_code);
+        return;
+    }
+    msg = (const GsvaCohMsgV1 *)payload;
+
+    switch (sub_msg_code) {
+    case UBC_MSG_SUB_GSVA_COH_INV:
+        gsva_coh_handle_rx_inv(ubc_dev, msg);
+        break;
+    case UBC_MSG_SUB_GSVA_COH_INV_ACK:
+        gsva_coh_handle_rx_inv_ack(ubc_dev, msg);
+        break;
+    case UBC_MSG_SUB_GSVA_COH_DOWNGRADE:
+        gsva_coh_handle_rx_downgrade(ubc_dev, msg);
+        break;
+    case UBC_MSG_SUB_GSVA_COH_DOWNGRADE_ACK:
+        gsva_coh_handle_rx_downgrade_ack(ubc_dev, msg);
+        break;
+    case UBC_MSG_SUB_GSVA_COH_RETIRE_REQ:
+        gsva_coh_handle_rx_retire(ubc_dev, msg);
+        break;
+    case UBC_MSG_SUB_GSVA_COH_RETIRE_ACK:
+        gsva_coh_handle_rx_retire_ack(ubc_dev, msg);
+        break;
+    case UBC_MSG_SUB_GSVA_COH_FENCE:
+        gsva_coh_handle_rx_fence(ubc_dev, msg);
+        break;
+    case UBC_MSG_SUB_GSVA_COH_FENCE_ACK:
+        gsva_coh_handle_rx_fence_ack(ubc_dev, msg);
+        break;
+    case UBC_MSG_SUB_GSVA_COH_TOKEN_REVOKE:
+        gsva_coh_handle_rx_token_revoke(ubc_dev, msg);
+        break;
+    case UBC_MSG_SUB_GSVA_COH_TOKEN_ACK:
+        gsva_coh_handle_rx_token_ack(ubc_dev, msg);
+        break;
+    default:
+        qemu_log("GSVA_COH: unhandled subcode=%u\n", sub_msg_code);
+        break;
+    }
 }

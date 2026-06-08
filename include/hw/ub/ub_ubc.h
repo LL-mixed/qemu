@@ -404,6 +404,12 @@ void ubc_handle_read_response(BusControllerDev *ubc_dev, const UBCReadRespPld *r
 #define UBC_MSG_SUB_GSVA_COH_INV_ACK     21
 #define UBC_MSG_SUB_GSVA_COH_RETIRE_REQ  22
 #define UBC_MSG_SUB_GSVA_COH_RETIRE_ACK  23
+#define UBC_MSG_SUB_GSVA_COH_DOWNGRADE   24
+#define UBC_MSG_SUB_GSVA_COH_DOWNGRADE_ACK 25
+#define UBC_MSG_SUB_GSVA_COH_FENCE       26
+#define UBC_MSG_SUB_GSVA_COH_FENCE_ACK   27
+#define UBC_MSG_SUB_GSVA_COH_TOKEN_REVOKE 30
+#define UBC_MSG_SUB_GSVA_COH_TOKEN_ACK   31
 
 /* SIM_DEC batched write payload */
 typedef struct QEMU_PACKED SimDecBatchHdr {

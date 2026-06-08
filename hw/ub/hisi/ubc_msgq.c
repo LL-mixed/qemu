@@ -22,6 +22,7 @@
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_ubc.h"
 #include "hw/ub/obmm_coherence.h"
+#include "hw/ub/gsva_coherence.h"
 #include "hw/ub/ub_config.h"
 #include "hw/ub/ub_msg.h"
 #include "hw/ub/ub_sec.h"
@@ -1017,8 +1018,17 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
             case UBC_MSG_SUB_GSVA_COH_INV_ACK:
             case UBC_MSG_SUB_GSVA_COH_RETIRE_REQ:
             case UBC_MSG_SUB_GSVA_COH_RETIRE_ACK:
-                qemu_log("ubc_msgq: GSVA_COH subcode=%u len=%u\n",
-                         header->msgetah.sub_msg_code, payload_len);
+            case UBC_MSG_SUB_GSVA_COH_DOWNGRADE:
+            case UBC_MSG_SUB_GSVA_COH_DOWNGRADE_ACK:
+            case UBC_MSG_SUB_GSVA_COH_FENCE:
+            case UBC_MSG_SUB_GSVA_COH_FENCE_ACK:
+            case UBC_MSG_SUB_GSVA_COH_TOKEN_REVOKE:
+            case UBC_MSG_SUB_GSVA_COH_TOKEN_ACK:
+                if (s->ubc_dev) {
+                    gsva_coh_dispatch_rx(s->ubc_dev,
+                                         header->msgetah.sub_msg_code,
+                                         payload, payload_len);
+                }
                 g_free(buf);
                 continue;
             default:

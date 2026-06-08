@@ -294,6 +294,8 @@ typedef struct QEMU_PACKED SimDecGsvaMapReq {
     uint32_t source;
     uint32_t address_profile;
     uint32_t access_flags;
+    uint32_t scna;
+    uint32_t dcna;
 } SimDecGsvaMapReq;
 
 /* GSVA map response */
@@ -1272,6 +1274,116 @@ static void sim_dec_cpu_window_write(void *opaque, hwaddr addr,
 static const MemoryRegionOps sim_dec_cpu_window_ops = {
     .read = sim_dec_cpu_window_read,
     .write = sim_dec_cpu_window_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
+/*
+ * GSVA-specific CPU window IO ops.
+ * opaque is GsvaRouteEntry*, which has a different layout than SimDecMapEntry.
+ * These ops perform remote read/write through the PA-MESI coherence layer.
+ */
+static uint64_t sim_dec_gsva_cpu_window_read(void *opaque, hwaddr addr,
+                                              unsigned size)
+{
+    GsvaRouteEntry *route = opaque;
+    uint8_t buf[8] = { 0 };
+    uint64_t remote_uba;
+    MemTxResult ret;
+    int tok_rc;
+
+    if (!route || size > sizeof(buf) || addr + size > route->key.size) {
+        qemu_log("GSVA_CPU: read invalid addr=%#" PRIx64 " size=%u map_id=%"
+                 PRIx64 "\n", (uint64_t)addr, size, route ? route->map_id : 0);
+        return 0;
+    }
+
+    /* Token validation before PA-MESI access */
+    tok_rc = gsva_route_validate_token(route, route->home_cna,
+                                       route->token.token_id,
+                                       route->token.token_value, 1);
+    if (tok_rc != GSVA_OK) {
+        qemu_log("GSVA_CPU: read token denied map_id=%" PRIx64
+                 " addr=%#" PRIx64 " rc=%d\n",
+                 route->map_id, (uint64_t)addr, tok_rc);
+        return 0;
+    }
+
+    remote_uba = route->remote_uba + addr;
+    ret = ubc_sim_dec_remote_read(g_sim_decoder->bcs->ubc_dev, remote_uba,
+                                  route->token.token_id, route->home_cna,
+                                  buf, size);
+    if (ret != MEMTX_OK) {
+        qemu_log("GSVA_CPU: read failed map_id=%" PRIx64
+                 " remote_uba=%#" PRIx64 " size=%u ret=%d\n",
+                 route->map_id, remote_uba, size, ret);
+        return 0;
+    }
+
+    switch (size) {
+    case 1: return buf[0];
+    case 2: return lduw_le_p(buf);
+    case 4: return ldl_le_p(buf);
+    case 8: return ldq_le_p(buf);
+    default: return 0;
+    }
+}
+
+static void sim_dec_gsva_cpu_window_write(void *opaque, hwaddr addr,
+                                          uint64_t value, unsigned size)
+{
+    GsvaRouteEntry *route = opaque;
+    uint8_t buf[8] = { 0 };
+    uint64_t remote_uba;
+    MemTxResult ret;
+    int tok_rc;
+
+    if (!route || size > sizeof(buf) || addr + size > route->key.size) {
+        qemu_log("GSVA_CPU: write invalid addr=%#" PRIx64 " size=%u map_id=%"
+                 PRIx64 "\n", (uint64_t)addr, size, route ? route->map_id : 0);
+        return;
+    }
+
+    /* Token validation before PA-MESI access */
+    tok_rc = gsva_route_validate_token(route, route->home_cna,
+                                       route->token.token_id,
+                                       route->token.token_value, 2);
+    if (tok_rc != GSVA_OK) {
+        qemu_log("GSVA_CPU: write token denied map_id=%" PRIx64
+                 " addr=%#" PRIx64 " rc=%d\n",
+                 route->map_id, (uint64_t)addr, tok_rc);
+        return;
+    }
+
+    switch (size) {
+    case 1: buf[0] = (uint8_t)value; break;
+    case 2: stw_le_p(buf, (uint16_t)value); break;
+    case 4: stl_le_p(buf, (uint32_t)value); break;
+    case 8: stq_le_p(buf, value); break;
+    default: return;
+    }
+
+    remote_uba = route->remote_uba + addr;
+    ret = ubc_sim_dec_remote_write(g_sim_decoder->bcs->ubc_dev, remote_uba,
+                                   route->token.token_id, route->home_cna,
+                                   buf, size);
+    if (ret != MEMTX_OK) {
+        qemu_log("GSVA_CPU: write failed map_id=%" PRIx64
+                 " remote_uba=%#" PRIx64 " size=%u ret=%d\n",
+                 route->map_id, remote_uba, size, ret);
+    }
+}
+
+static const MemoryRegionOps sim_dec_gsva_cpu_window_ops = {
+    .read = sim_dec_gsva_cpu_window_read,
+    .write = sim_dec_gsva_cpu_window_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -8378,9 +8490,6 @@ static bool sim_dec_gva_tcg_enabled(void)
     return cached != 0;
 }
 
-static bool sim_dec_gsva_route_translate(uint64_t page_va, bool is_write,
-                                    uint64_t *local_pa, uint64_t *page_size);
-
 bool sim_dec_gva_tcg_translate(uint64_t va, bool is_write,
                                uint64_t *local_pa, uint64_t *page_size)
 {
@@ -8397,10 +8506,6 @@ bool sim_dec_gva_tcg_translate(uint64_t va, bool is_write,
     entry = sim_dec_find_gva_route_by_va_locked(page_va, is_write);
     if (!entry) {
         qemu_mutex_unlock(&g_sim_decoder->lock);
-        /* Try GSVA route table as fallback */
-        if (sim_dec_gsva_route_translate(page_va, is_write, local_pa, page_size)) {
-            return true;
-        }
         return false;
     }
 
@@ -10160,25 +10265,6 @@ static void gsva_tables_init(void)
 }
 /* Helper for sim_dec_gva_tcg_translate to look up GSVA routes.
  * Defined here after g_gsva_routes/g_gsva_initialized are declared. */
-bool sim_dec_gsva_route_translate(uint64_t page_va, bool is_write,
-                                  uint64_t *local_pa, uint64_t *page_size)
-{
-    GsvaRouteEntry *gsva_entry;
-    if (!g_gsva_initialized) {
-        return false;
-    }
-    gsva_entry = gsva_route_lookup_va(&g_gsva_routes, 0, 0, page_va);
-    if (gsva_entry && gsva_entry->local_pa) {
-        *local_pa = gsva_entry->local_pa + (page_va - gsva_entry->local_va);
-        *page_size = SIM_DEC_PAGE_SIZE;
-        qemu_log("GSVA_TCG va=0x%" PRIx64 " -> pa=0x%" PRIx64
-                 " map_id=0x%" PRIx64 "\n",
-                 page_va, *local_pa, gsva_entry->map_id);
-        return true;
-    }
-    return false;
-}
-
 static unsigned gsva_tlb_stable_index(uint64_t va)
 {
     return (unsigned)((va >> 12) % GSVA_TLB_STABLE_SIZE);
@@ -10381,7 +10467,7 @@ static int sim_dec_handle_gsva_map(const SimDecGsvaMapReq *req,
                                   req->remote_uba,
                                   req->source,
                                   req->address_profile,
-                                  0, /* home_cna from key context */
+                                  req->dcna,
                                   (uint32_t)req->token_id,
                                   (uint32_t)req->token_value,
                                   req->access_flags,
@@ -10415,7 +10501,7 @@ static int sim_dec_handle_gsva_map(const SimDecGsvaMapReq *req,
         if (route && route->local_pa && req->key.size) {
             memory_region_init_io(&route->cpu_window,
                                   OBJECT(DEVICE(g_sim_decoder->bcs->ubc_dev)),
-                                  &sim_dec_cpu_window_ops, route,
+                                  &sim_dec_gsva_cpu_window_ops, route,
                                   "gsva-cpu-window", req->key.size);
             memory_region_add_subregion_overlap(get_system_memory(),
                                                 route->local_pa,

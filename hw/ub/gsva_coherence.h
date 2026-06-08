@@ -16,6 +16,38 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Forward declaration */
+struct BusControllerDev;
+typedef struct BusControllerDev BusControllerDev;
+
+/* GSVA coherence message payload */
+typedef struct GsvaCohMsgV1 {
+    uint32_t version;
+    uint32_t op;
+    uint64_t seq;
+    uint32_t source_cna;
+    uint32_t target_cna;
+    GsvaKeyV1 key;
+    uint64_t access_va;
+    uint64_t access_len;
+    uint32_t access_flags;
+    uint32_t error;
+} GsvaCohMsgV1;
+
+/* GSVA coherence message op values */
+#define GSVA_COH_MSG_INVALIDATE      1
+#define GSVA_COH_MSG_INVALIDATE_ACK  2
+#define GSVA_COH_MSG_DOWNGRADE       3
+#define GSVA_COH_MSG_DOWNGRADE_ACK   4
+#define GSVA_COH_MSG_WRITEBACK       5
+#define GSVA_COH_MSG_WRITEBACK_ACK   6
+#define GSVA_COH_MSG_FENCE           7
+#define GSVA_COH_MSG_FENCE_ACK       8
+#define GSVA_COH_MSG_RETIRE          9
+#define GSVA_COH_MSG_RETIRE_ACK      10
+#define GSVA_COH_MSG_TOKEN_REVOKE    11
+#define GSVA_COH_MSG_TOKEN_ACK       12
+
 typedef enum GsvaCohState {
     GSVA_COH_I = 0,
     GSVA_COH_S = 1,
@@ -93,5 +125,28 @@ int gsva_coh_retry(GsvaCohTable *tbl, const GsvaKeyV1 *key, uint64_t seq);
 
 /* Get object state as string */
 const char *gsva_coh_state_name(GsvaCohState state);
+
+/* Send GSVA coherence message over UB Link */
+int gsva_coh_send_ub_link_msg(BusControllerDev *ubc_dev, uint32_t dcna,
+                               uint8_t sub_msg_code,
+                               const GsvaCohMsgV1 *msg);
+
+/* Receive handlers for GSVA coherence messages */
+void gsva_coh_handle_rx_inv(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_inv_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_downgrade(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_downgrade_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_wb(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_wb_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_fence(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_fence_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_retire(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_retire_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_token_revoke(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+void gsva_coh_handle_rx_token_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg);
+
+/* Dispatch a received GSVA coherence message by subcode */
+void gsva_coh_dispatch_rx(BusControllerDev *ubc_dev, uint8_t sub_msg_code,
+                           const void *payload, uint32_t payload_len);
 
 #endif /* GSVA_COHERENCE_H */
