@@ -23,6 +23,7 @@
 #include "hw/ub/hisi/ubc.h"
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_link.h"
+#include "hw/ub/gsva_key.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
 
@@ -544,5 +545,31 @@ int gsva_arm_mmu_translate_full(uint64_t va, bool is_write,
 
 /* Compatibility helper kept for existing callers. */
 int gsva_arm_mmu_translate(uint64_t va, bool is_write, uint32_t cpu_index);
+
+/* Device-side GSVA access wrappers (NPU, SSD, etc.) */
+int ubc_gsva_device_read_acquire(BusControllerDev *ubc,
+                                 const GsvaKeyV1 *key,
+                                 uint32_t requester_cna,
+                                 uint64_t access_va, uint64_t access_len,
+                                 uint32_t access_flags,
+                                 uint64_t *pending_seq);
+int ubc_gsva_device_write_acquire(BusControllerDev *ubc,
+                                  const GsvaKeyV1 *key,
+                                  uint32_t requester_cna,
+                                  uint64_t access_va, uint64_t access_len,
+                                  uint32_t access_flags,
+                                  uint64_t *pending_seq);
+int ubc_gsva_device_read(BusControllerDev *ubc,
+                         const GsvaKeyV1 *key,
+                         uint32_t requester_cna,
+                         uint64_t gsva, void *dst, uint64_t len);
+int ubc_gsva_device_write(BusControllerDev *ubc,
+                          const GsvaKeyV1 *key,
+                          uint32_t requester_cna,
+                          uint64_t gsva, const void *src, uint64_t len);
+int ubc_gsva_device_fence(BusControllerDev *ubc,
+                          const GsvaKeyV1 *key,
+                          uint32_t requester_cna,
+                          uint64_t gsva, uint64_t len);
 
 #endif

@@ -11155,6 +11155,223 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
     return ret;
 }
 
+/* ------------------------------------------------------------------ */
+/* Device-side GSVA access wrappers (used by NPU, SSD, and future     */
+/* UB-attached devices). These wrappers encapsulate route lookup,      */
+/* token validation, coherence acquire, PA computation, and            */
+/* address_space read/write.                                           */
+/* ------------------------------------------------------------------ */
+
+int ubc_gsva_device_read_acquire(BusControllerDev *ubc,
+                                 const GsvaKeyV1 *key,
+                                 uint32_t requester_cna,
+                                 uint64_t access_va,
+                                 uint64_t access_len,
+                                 uint32_t access_flags,
+                                 uint64_t *pending_seq)
+{
+    GsvaRouteEntry *route;
+    int rc;
+
+    if (!ubc || !key) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    gsva_tables_init();
+
+    route = gsva_route_lookup_base(&g_gsva_routes, key);
+    if (!route) {
+        if (gsva_route_lookup_tombstone(&g_gsva_routes, key)) {
+            return GSVA_ERR_SEGMENT_RETIRED;
+        }
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    rc = gsva_route_validate_token(route, requester_cna,
+                                   route->token.token_id,
+                                   route->token.token_value,
+                                   0 /* read */);
+    if (rc != GSVA_OK) {
+        return rc;
+    }
+
+    if (!gsva_key_contains(&route->key, access_va, access_len)) {
+        return GSVA_ERR_KEY_MISMATCH;
+    }
+
+    rc = gsva_coh_read_acquire_tx(&g_gsva_coh, &g_gsva_routes,
+                                  ubc, key, requester_cna,
+                                  route->token.token_id,
+                                  route->token.token_value);
+    if (rc == GSVA_ERR_COH_PENDING && pending_seq) {
+        GsvaCohObject *obj = gsva_coh_lookup(&g_gsva_coh, key);
+        *pending_seq = obj ? obj->pending_seq : 0;
+    }
+
+    if (rc == GSVA_OK) {
+        qemu_log("UB_DEV_GSVA: ReadAcquire ok key.segment=%#" PRIx64
+                 " cna=%#" PRIx32 " va=%#" PRIx64 " len=%#" PRIx64 "\n",
+                 key->segment_id, requester_cna, access_va, access_len);
+    }
+
+    return rc;
+}
+
+int ubc_gsva_device_write_acquire(BusControllerDev *ubc,
+                                  const GsvaKeyV1 *key,
+                                  uint32_t requester_cna,
+                                  uint64_t access_va,
+                                  uint64_t access_len,
+                                  uint32_t access_flags,
+                                  uint64_t *pending_seq)
+{
+    GsvaRouteEntry *route;
+    int rc;
+
+    if (!ubc || !key) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    gsva_tables_init();
+
+    route = gsva_route_lookup_base(&g_gsva_routes, key);
+    if (!route) {
+        if (gsva_route_lookup_tombstone(&g_gsva_routes, key)) {
+            return GSVA_ERR_SEGMENT_RETIRED;
+        }
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    rc = gsva_route_validate_token(route, requester_cna,
+                                   route->token.token_id,
+                                   route->token.token_value,
+                                   1 /* write */);
+    if (rc != GSVA_OK) {
+        return rc;
+    }
+
+    if (!gsva_key_contains(&route->key, access_va, access_len)) {
+        return GSVA_ERR_KEY_MISMATCH;
+    }
+
+    rc = gsva_coh_write_acquire_tx(&g_gsva_coh, &g_gsva_routes,
+                                   ubc, key, requester_cna,
+                                   route->token.token_id,
+                                   route->token.token_value);
+    if (rc == GSVA_ERR_COH_PENDING && pending_seq) {
+        GsvaCohObject *obj = gsva_coh_lookup(&g_gsva_coh, key);
+        *pending_seq = obj ? obj->pending_seq : 0;
+    }
+
+    if (rc == GSVA_OK) {
+        qemu_log("UB_DEV_GSVA: WriteAcquire ok key.segment=%#" PRIx64
+                 " cna=%#" PRIx32 " va=%#" PRIx64 " len=%#" PRIx64 "\n",
+                 key->segment_id, requester_cna, access_va, access_len);
+    }
+
+    return rc;
+}
+
+int ubc_gsva_device_read(BusControllerDev *ubc,
+                         const GsvaKeyV1 *key,
+                         uint32_t requester_cna,
+                         uint64_t gsva,
+                         void *dst,
+                         uint64_t len)
+{
+    GsvaRouteEntry *route;
+    uint64_t offset, pa;
+    MemTxResult ret;
+
+    if (!ubc || !key || !dst || len == 0) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    gsva_tables_init();
+
+    route = gsva_route_lookup_base(&g_gsva_routes, key);
+    if (!route || route->local_va == 0 || route->local_pa == 0) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    offset = gsva - route->local_va;
+    pa = route->local_pa + offset;
+
+    ret = address_space_read(&address_space_memory, pa,
+                             MEMTXATTRS_UNSPECIFIED, dst, len);
+    if (ret != MEMTX_OK) {
+        qemu_log("UB_DEV_GSVA: read failed pa=%#" PRIx64 " len=%#" PRIx64
+                 " ret=%d\n", pa, len, ret);
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    qemu_log("UB_DEV_GSVA: read ok pa=%#" PRIx64 " len=%#" PRIx64
+             " cna=%#" PRIx32 "\n", pa, len, requester_cna);
+    return GSVA_OK;
+}
+
+int ubc_gsva_device_write(BusControllerDev *ubc,
+                          const GsvaKeyV1 *key,
+                          uint32_t requester_cna,
+                          uint64_t gsva,
+                          const void *src,
+                          uint64_t len)
+{
+    GsvaRouteEntry *route;
+    uint64_t offset, pa;
+    MemTxResult ret;
+
+    if (!ubc || !key || !src || len == 0) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    gsva_tables_init();
+
+    route = gsva_route_lookup_base(&g_gsva_routes, key);
+    if (!route || route->local_va == 0 || route->local_pa == 0) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    offset = gsva - route->local_va;
+    pa = route->local_pa + offset;
+
+    ret = address_space_write(&address_space_memory, pa,
+                              MEMTXATTRS_UNSPECIFIED, src, len);
+    if (ret != MEMTX_OK) {
+        qemu_log("UB_DEV_GSVA: write failed pa=%#" PRIx64 " len=%#" PRIx64
+                 " ret=%d\n", pa, len, ret);
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    qemu_log("UB_DEV_GSVA: write ok pa=%#" PRIx64 " len=%#" PRIx64
+             " cna=%#" PRIx32 "\n", pa, len, requester_cna);
+    return GSVA_OK;
+}
+
+int ubc_gsva_device_fence(BusControllerDev *ubc,
+                          const GsvaKeyV1 *key,
+                          uint32_t requester_cna,
+                          uint64_t gsva,
+                          uint64_t len)
+{
+    if (!ubc || !key) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    gsva_tables_init();
+
+    int rc = gsva_coh_fence_tx(&g_gsva_coh, ubc, key, requester_cna);
+    if (rc != GSVA_OK) {
+        qemu_log("UB_DEV_GSVA: fence failed key.segment=%#" PRIx64
+                 " rc=%d\n", key->segment_id, rc);
+    } else {
+        qemu_log("UB_DEV_GSVA: fence ok key.segment=%#" PRIx64
+                 " cna=%#" PRIx32 "\n", key->segment_id, requester_cna);
+    }
+
+    return rc;
+}
+
 static void ub_bus_controller_register_types(void)
 {
     type_register_static(&ub_bus_controller_type_info);
