@@ -230,13 +230,321 @@ static void ub_npu_complete_command(UbNpuState *s, uint32_t status)
 }
 
 /* ------------------------------------------------------------------ */
-/* Command execution (V1: echo only, GSVA ops in Step 4)              */
+/* Descriptor validation helpers                                       */
+/* ------------------------------------------------------------------ */
+
+static int ub_npu_validate_desc(const UbNpuBufferDescV1 *desc, uint32_t access)
+{
+    int key_rc = gsva_key_validate(&desc->key);
+    if (key_rc != GSVA_OK) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    if (!gsva_key_contains(&desc->key, desc->gsva_base, desc->bytes)) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    if (desc->bytes == 0) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    if ((desc->access & access) == 0) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    return NPU_OK;
+}
+
+static int ub_npu_acquire_read(UbNpuState *s, const UbNpuBufferDescV1 *desc)
+{
+    int rc = ubc_gsva_device_read_acquire(s->ubc, &desc->key,
+                                           s->device_cna,
+                                           desc->gsva_base, desc->bytes,
+                                           0, &s->pending_seq);
+    if (rc == GSVA_ERR_TOKEN_DENIED) {
+        s->stats.token_denied++;
+        return NPU_ERR_TOKEN_DENIED;
+    }
+    if (rc == GSVA_ERR_STALE_EPOCH) {
+        s->stats.stale_epoch++;
+        return NPU_ERR_STALE_EPOCH;
+    }
+    if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        return NPU_ERR_SEGMENT_RETIRED;
+    }
+    if (rc == GSVA_ERR_COH_TIMEOUT) {
+        s->stats.coh_timeout++;
+        return NPU_ERR_COH_TIMEOUT;
+    }
+    if (rc == GSVA_ERR_COH_PENDING) {
+        return rc;
+    }
+    if (rc != GSVA_OK) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    return NPU_OK;
+}
+
+static int ub_npu_acquire_write(UbNpuState *s, const UbNpuBufferDescV1 *desc)
+{
+    int rc = ubc_gsva_device_write_acquire(s->ubc, &desc->key,
+                                            s->device_cna,
+                                            desc->gsva_base, desc->bytes,
+                                            0, &s->pending_seq);
+    if (rc == GSVA_ERR_TOKEN_DENIED) {
+        s->stats.token_denied++;
+        return NPU_ERR_TOKEN_DENIED;
+    }
+    if (rc == GSVA_ERR_STALE_EPOCH) {
+        s->stats.stale_epoch++;
+        return NPU_ERR_STALE_EPOCH;
+    }
+    if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        return NPU_ERR_SEGMENT_RETIRED;
+    }
+    if (rc == GSVA_ERR_COH_TIMEOUT) {
+        s->stats.coh_timeout++;
+        return NPU_ERR_COH_TIMEOUT;
+    }
+    if (rc == GSVA_ERR_COH_PENDING) {
+        return rc;
+    }
+    if (rc != GSVA_OK) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    return NPU_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Opcode implementations                                              */
+/* ------------------------------------------------------------------ */
+
+static int ub_npu_op_memcopy(UbNpuState *s, UbNpuCmdV1 *cmd)
+{
+    const UbNpuBufferDescV1 *input = &cmd->descs[0];
+    const UbNpuBufferDescV1 *output = &cmd->descs[1];
+    uint64_t copy_len;
+    void *tmp;
+    int rc;
+
+    if (cmd->desc_count < 2) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    if (input->role != NPU_BUF_INPUT || output->role != NPU_BUF_OUTPUT) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+
+    rc = ub_npu_validate_desc(input, NPU_ACCESS_READ);
+    if (rc != NPU_OK) return rc;
+    rc = ub_npu_validate_desc(output, NPU_ACCESS_WRITE);
+    if (rc != NPU_OK) return rc;
+
+    copy_len = MIN(input->bytes, output->bytes);
+
+    rc = ub_npu_acquire_read(s, input);
+    if (rc != NPU_OK) return rc;
+
+    tmp = g_malloc(copy_len);
+    rc = ubc_gsva_device_read(s->ubc, &input->key, s->device_cna,
+                               input->gsva_base, tmp, copy_len);
+    if (rc != GSVA_OK) {
+        g_free(tmp);
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    s->stats.bytes_read += copy_len;
+    s->cpl.bytes_read = copy_len;
+
+    rc = ub_npu_acquire_write(s, output);
+    if (rc != NPU_OK) {
+        g_free(tmp);
+        return rc;
+    }
+
+    rc = ubc_gsva_device_write(s->ubc, &output->key, s->device_cna,
+                                output->gsva_base, tmp, copy_len);
+    g_free(tmp);
+    if (rc != GSVA_OK) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    s->stats.bytes_written += copy_len;
+    s->cpl.bytes_written = copy_len;
+
+    ubc_gsva_device_fence(s->ubc, &output->key, s->device_cna,
+                          output->gsva_base, copy_len);
+
+    return NPU_OK;
+}
+
+static int ub_npu_op_fill(UbNpuState *s, UbNpuCmdV1 *cmd)
+{
+    const UbNpuBufferDescV1 *output = &cmd->descs[0];
+    uint64_t fill_val = cmd->scalar0;
+    uint64_t fill_bytes = output->bytes;
+    uint8_t *buf;
+    int rc;
+
+    if (cmd->desc_count < 1) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    if (output->role != NPU_BUF_OUTPUT) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+
+    rc = ub_npu_validate_desc(output, NPU_ACCESS_WRITE);
+    if (rc != NPU_OK) return rc;
+
+    rc = ub_npu_acquire_write(s, output);
+    if (rc != NPU_OK) return rc;
+
+    buf = g_malloc(fill_bytes);
+    for (uint64_t off = 0; off + 8 <= fill_bytes; off += 8) {
+        memcpy(buf + off, &fill_val, 8);
+    }
+    for (uint64_t off = fill_bytes & ~7ULL; off < fill_bytes; off++) {
+        buf[off] = (uint8_t)(fill_val & 0xFF);
+    }
+
+    rc = ubc_gsva_device_write(s->ubc, &output->key, s->device_cna,
+                                output->gsva_base, buf, fill_bytes);
+    g_free(buf);
+    if (rc != GSVA_OK) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    s->stats.bytes_written += fill_bytes;
+    s->cpl.bytes_written = fill_bytes;
+
+    ubc_gsva_device_fence(s->ubc, &output->key, s->device_cna,
+                          output->gsva_base, fill_bytes);
+
+    return NPU_OK;
+}
+
+static int ub_npu_op_vector_add_u32(UbNpuState *s, UbNpuCmdV1 *cmd)
+{
+    const UbNpuBufferDescV1 *input0 = &cmd->descs[0];
+    const UbNpuBufferDescV1 *input1 = &cmd->descs[1];
+    const UbNpuBufferDescV1 *output = &cmd->descs[2];
+    uint32_t element_count = (uint32_t)cmd->scalar0;
+    uint64_t byte_len = (uint64_t)element_count * 4;
+    uint32_t *a, *b, *c;
+    int rc;
+
+    if (cmd->desc_count < 3) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    if (input0->role != NPU_BUF_INPUT || input1->role != NPU_BUF_INPUT ||
+        output->role != NPU_BUF_OUTPUT) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    if (element_count == 0 || byte_len > input0->bytes ||
+        byte_len > input1->bytes || byte_len > output->bytes) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+
+    rc = ub_npu_validate_desc(input0, NPU_ACCESS_READ);
+    if (rc != NPU_OK) return rc;
+    rc = ub_npu_validate_desc(input1, NPU_ACCESS_READ);
+    if (rc != NPU_OK) return rc;
+    rc = ub_npu_validate_desc(output, NPU_ACCESS_WRITE);
+    if (rc != NPU_OK) return rc;
+
+    rc = ub_npu_acquire_read(s, input0);
+    if (rc != NPU_OK) return rc;
+    rc = ub_npu_acquire_read(s, input1);
+    if (rc != NPU_OK) return rc;
+
+    a = g_malloc(byte_len);
+    b = g_malloc(byte_len);
+    c = g_malloc(byte_len);
+
+    rc = ubc_gsva_device_read(s->ubc, &input0->key, s->device_cna,
+                               input0->gsva_base, a, byte_len);
+    if (rc != GSVA_OK) {
+        g_free(a); g_free(b); g_free(c);
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    rc = ubc_gsva_device_read(s->ubc, &input1->key, s->device_cna,
+                               input1->gsva_base, b, byte_len);
+    if (rc != GSVA_OK) {
+        g_free(a); g_free(b); g_free(c);
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    s->stats.bytes_read += byte_len * 2;
+    s->cpl.bytes_read = byte_len * 2;
+
+    for (uint32_t i = 0; i < element_count; i++) {
+        c[i] = a[i] + b[i];
+    }
+    g_free(a);
+    g_free(b);
+
+    rc = ub_npu_acquire_write(s, output);
+    if (rc != NPU_OK) {
+        g_free(c);
+        return rc;
+    }
+
+    rc = ubc_gsva_device_write(s->ubc, &output->key, s->device_cna,
+                                output->gsva_base, c, byte_len);
+    g_free(c);
+    if (rc != GSVA_OK) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    s->stats.bytes_written += byte_len;
+    s->cpl.bytes_written = byte_len;
+
+    ubc_gsva_device_fence(s->ubc, &output->key, s->device_cna,
+                          output->gsva_base, byte_len);
+
+    return NPU_OK;
+}
+
+static int ub_npu_op_checksum64(UbNpuState *s, UbNpuCmdV1 *cmd)
+{
+    const UbNpuBufferDescV1 *input = &cmd->descs[0];
+    uint64_t checksum = 0;
+    uint8_t *buf;
+    int rc;
+
+    if (cmd->desc_count < 1) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    if (input->role != NPU_BUF_INPUT) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+
+    rc = ub_npu_validate_desc(input, NPU_ACCESS_READ);
+    if (rc != NPU_OK) return rc;
+
+    rc = ub_npu_acquire_read(s, input);
+    if (rc != NPU_OK) return rc;
+
+    buf = g_malloc(input->bytes);
+    rc = ubc_gsva_device_read(s->ubc, &input->key, s->device_cna,
+                               input->gsva_base, buf, input->bytes);
+    if (rc != GSVA_OK) {
+        g_free(buf);
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
+    s->stats.bytes_read += input->bytes;
+    s->cpl.bytes_read = input->bytes;
+
+    for (uint64_t i = 0; i + 8 <= input->bytes; i += 8) {
+        uint64_t val;
+        memcpy(&val, buf + i, 8);
+        checksum += val;
+    }
+    g_free(buf);
+
+    s->cpl.checksum64 = checksum;
+    return NPU_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Command execution                                                   */
 /* ------------------------------------------------------------------ */
 
 static void ub_npu_execute_command(UbNpuState *s)
 {
     UbNpuCmdV1 *cmd = &s->cmd;
     uint32_t opcode = cmd->opcode;
+    int rc = NPU_OK;
 
     qemu_log("UB_NPU_CMD: req_id=%#" PRIx64 " opcode=%s(%" PRIu32 ")"
              " source_cna=%#" PRIx32 " desc_count=%" PRIu32 "\n",
@@ -252,16 +560,35 @@ static void ub_npu_execute_command(UbNpuState *s)
 
     switch (opcode) {
     case NPU_OP_MEMCOPY:
+        s->stats.opcode_memcopy++;
+        rc = ub_npu_op_memcopy(s, cmd);
+        break;
     case NPU_OP_FILL:
+        s->stats.opcode_fill++;
+        rc = ub_npu_op_fill(s, cmd);
+        break;
     case NPU_OP_VECTOR_ADD_U32:
+        s->stats.opcode_vector_add_u32++;
+        rc = ub_npu_op_vector_add_u32(s, cmd);
+        break;
     case NPU_OP_CHECKSUM64:
-        /* V1 echo: complete with OK, actual GSVA ops in Step 4 */
-        ub_npu_complete_command(s, NPU_OK);
+        s->stats.opcode_checksum64++;
+        rc = ub_npu_op_checksum64(s, cmd);
         break;
     default:
         ub_npu_complete_command(s, NPU_ERR_BAD_OPCODE);
-        break;
+        return;
     }
+
+    if (rc == GSVA_ERR_COH_PENDING) {
+        s->pending_acquire_rc = GSVA_ERR_COH_PENDING;
+        timer_mod(s->poll_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+        s->poll_timer_active = true;
+        return;
+    }
+
+    ub_npu_complete_command(s, rc);
 }
 
 /* ------------------------------------------------------------------ */
@@ -271,6 +598,12 @@ static void ub_npu_execute_command(UbNpuState *s)
 static void ub_npu_bh(void *opaque)
 {
     UbNpuState *s = UB_NPU(opaque);
+
+    if (s->pending_acquire_rc == GSVA_ERR_COH_PENDING && s->ubc) {
+        obmm_coh_poll_rx_links(s->ubc);
+        s->pending_acquire_rc = 0;
+    }
+
     ub_npu_execute_command(s);
 }
 
