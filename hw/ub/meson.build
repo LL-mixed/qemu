@@ -17,6 +17,8 @@ ub_ss.add(files(
   'gsva_route.c',
   'gsva_coherence.c',
   'gsva_stats.c',
+  'ub_npu.c',
+  'ub_ssd.c',
 ))
 system_ss.add_all(when: 'CONFIG_HW_UB', if_true: ub_ss)
 subdir('hisi')
