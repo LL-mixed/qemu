@@ -63,6 +63,13 @@
 #define SSD_ERR_BACKEND_IO        (-14)
 #define SSD_ERR_BAD_SNAPSHOT      (-15)
 
+/*
+ * Internal-only status between op helpers and the executor.
+ * SSD ABI status values intentionally overlap with GSVA internal error
+ * numbers, so pending must use a private code before MMIO completion.
+ */
+#define SSD_INTERNAL_COH_PENDING  (-1006)
+
 /* ------------------------------------------------------------------ */
 /* Durable state for block records                                     */
 /* ------------------------------------------------------------------ */
@@ -779,7 +786,7 @@ static int ub_ssd_load_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV1
         return SSD_ERR_SEGMENT_RETIRED;
     }
     if (rc == GSVA_ERR_COH_PENDING) {
-        return rc;
+        return SSD_INTERNAL_COH_PENDING;
     }
     if (rc != GSVA_OK) {
         return SSD_ERR_BAD_DESCRIPTOR;
@@ -814,7 +821,7 @@ static int ub_ssd_store_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV
         return SSD_ERR_SEGMENT_RETIRED;
     }
     if (rc == GSVA_ERR_COH_PENDING) {
-        return rc;
+        return SSD_INTERNAL_COH_PENDING;
     }
     if (rc != GSVA_OK) {
         return SSD_ERR_BAD_DESCRIPTOR;
@@ -1248,8 +1255,8 @@ static void ub_ssd_execute_command(UbSsdState *s)
         return;
     }
 
-    if (rc == GSVA_ERR_COH_PENDING) {
-        s->pending_acquire_rc = GSVA_ERR_COH_PENDING;
+    if (rc == SSD_INTERNAL_COH_PENDING) {
+        s->pending_acquire_rc = SSD_INTERNAL_COH_PENDING;
         s->exec_phase = SSD_PHASE_PENDING_RETRY;
         timer_mod(s->poll_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
@@ -1269,7 +1276,7 @@ static void ub_ssd_bh(void *opaque)
 {
     UbSsdState *s = UB_SSD(opaque);
 
-    if (s->pending_acquire_rc == GSVA_ERR_COH_PENDING && s->ubc) {
+    if (s->pending_acquire_rc == SSD_INTERNAL_COH_PENDING && s->ubc) {
         obmm_coh_poll_rx_links(s->ubc);
         s->pending_acquire_rc = 0;
     }

@@ -48,6 +48,13 @@
 #define NPU_ERR_COH_TIMEOUT       (-7)
 #define NPU_ERR_DEVICE_BUSY       (-8)
 
+/*
+ * Internal-only status between op helpers and the executor.
+ * This must not be exposed in MMIO completions because NPU ABI status
+ * values intentionally overlap with GSVA internal error numbers.
+ */
+#define NPU_INTERNAL_COH_PENDING  (-1006)
+
 /* ------------------------------------------------------------------ */
 /* NPU buffer descriptor roles and access                              */
 /* ------------------------------------------------------------------ */
@@ -256,18 +263,36 @@ static int ub_npu_validate_desc(const UbNpuBufferDescV1 *desc, uint32_t access)
 {
     int key_rc = gsva_key_validate(&desc->key);
     if (key_rc != GSVA_OK) {
+        qemu_log("UB_NPU_DESC: invalid key rc=%d segment_id=%#" PRIx64
+                 " home_va=%#" PRIx64 " size=%#" PRIx64
+                 " flags=%#" PRIx32 " version=%" PRIu32 "\n",
+                 key_rc, desc->key.segment_id, desc->key.home_va,
+                 desc->key.size, desc->key.flags, desc->key.version);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
     if (!gsva_key_contains(&desc->key, desc->gsva_base, desc->bytes)) {
+        qemu_log("UB_NPU_DESC: range outside key segment_id=%#" PRIx64
+                 " gsva=%#" PRIx64 " bytes=%#" PRIx64
+                 " key.home_va=%#" PRIx64 " key.size=%#" PRIx64 "\n",
+                 desc->key.segment_id, desc->gsva_base, desc->bytes,
+                 desc->key.home_va, desc->key.size);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
     if (desc->bytes == 0) {
+        qemu_log("UB_NPU_DESC: zero bytes segment_id=%#" PRIx64 "\n",
+                 desc->key.segment_id);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
     if (desc->access & ~NPU_ACCESS_READ_WRITE) {
+        qemu_log("UB_NPU_DESC: invalid access=%#" PRIx32
+                 " segment_id=%#" PRIx64 "\n",
+                 desc->access, desc->key.segment_id);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
     if ((desc->access & access) == 0) {
+        qemu_log("UB_NPU_DESC: access denied access=%#" PRIx32
+                 " required=%#" PRIx32 " segment_id=%#" PRIx64 "\n",
+                 desc->access, access, desc->key.segment_id);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
     return NPU_OK;
@@ -281,6 +306,13 @@ static int ub_npu_acquire_read(UbNpuState *s, const UbNpuBufferDescV1 *desc)
                                            desc->access,
                                            desc->token_id, desc->token_value,
                                            &s->pending_seq);
+    if (rc != GSVA_OK) {
+        qemu_log("UB_NPU_ACQUIRE: read rc=%d req_id=%#" PRIx64
+                 " segment_id=%#" PRIx64 " gsva=%#" PRIx64
+                 " len=%#" PRIx64 " token_id=%" PRIu32 "\n",
+                 rc, s->cmd.req_id, desc->key.segment_id,
+                 desc->gsva_base, desc->bytes, desc->token_id);
+    }
     if (rc == GSVA_ERR_TOKEN_DENIED) {
         s->stats.token_denied++;
         return NPU_ERR_TOKEN_DENIED;
@@ -298,7 +330,7 @@ static int ub_npu_acquire_read(UbNpuState *s, const UbNpuBufferDescV1 *desc)
         return NPU_ERR_COH_TIMEOUT;
     }
     if (rc == GSVA_ERR_COH_PENDING) {
-        return rc;
+        return NPU_INTERNAL_COH_PENDING;
     }
     if (rc != GSVA_OK) {
         return NPU_ERR_BAD_DESCRIPTOR;
@@ -314,6 +346,13 @@ static int ub_npu_acquire_write(UbNpuState *s, const UbNpuBufferDescV1 *desc)
                                             desc->access,
                                             desc->token_id, desc->token_value,
                                             &s->pending_seq);
+    if (rc != GSVA_OK) {
+        qemu_log("UB_NPU_ACQUIRE: write rc=%d req_id=%#" PRIx64
+                 " segment_id=%#" PRIx64 " gsva=%#" PRIx64
+                 " len=%#" PRIx64 " token_id=%" PRIu32 "\n",
+                 rc, s->cmd.req_id, desc->key.segment_id,
+                 desc->gsva_base, desc->bytes, desc->token_id);
+    }
     if (rc == GSVA_ERR_TOKEN_DENIED) {
         s->stats.token_denied++;
         return NPU_ERR_TOKEN_DENIED;
@@ -331,7 +370,7 @@ static int ub_npu_acquire_write(UbNpuState *s, const UbNpuBufferDescV1 *desc)
         return NPU_ERR_COH_TIMEOUT;
     }
     if (rc == GSVA_ERR_COH_PENDING) {
-        return rc;
+        return NPU_INTERNAL_COH_PENDING;
     }
     if (rc != GSVA_OK) {
         return NPU_ERR_BAD_DESCRIPTOR;
@@ -352,9 +391,14 @@ static int ub_npu_op_memcopy(UbNpuState *s, UbNpuCmdV1 *cmd)
     int rc;
 
     if (cmd->desc_count < 2) {
+        qemu_log("UB_NPU_DESC: MEMCOPY desc_count=%" PRIu32 " < 2\n",
+                 cmd->desc_count);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
     if (input->role != NPU_BUF_INPUT || output->role != NPU_BUF_OUTPUT) {
+        qemu_log("UB_NPU_DESC: MEMCOPY role mismatch input=%" PRIu32
+                 " output=%" PRIu32 "\n",
+                 input->role, output->role);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
 
@@ -408,9 +452,13 @@ static int ub_npu_op_fill(UbNpuState *s, UbNpuCmdV1 *cmd)
     int rc;
 
     if (cmd->desc_count < 1) {
+        qemu_log("UB_NPU_DESC: FILL desc_count=%" PRIu32 " < 1\n",
+                 cmd->desc_count);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
     if (output->role != NPU_BUF_OUTPUT) {
+        qemu_log("UB_NPU_DESC: FILL role mismatch output=%" PRIu32 "\n",
+                 output->role);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
 
@@ -454,14 +502,24 @@ static int ub_npu_op_vector_add_u32(UbNpuState *s, UbNpuCmdV1 *cmd)
     int rc;
 
     if (cmd->desc_count < 3) {
+        qemu_log("UB_NPU_DESC: VECTOR_ADD desc_count=%" PRIu32 " < 3\n",
+                 cmd->desc_count);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
     if (input0->role != NPU_BUF_INPUT || input1->role != NPU_BUF_INPUT ||
         output->role != NPU_BUF_OUTPUT) {
+        qemu_log("UB_NPU_DESC: VECTOR_ADD role mismatch input0=%" PRIu32
+                 " input1=%" PRIu32 " output=%" PRIu32 "\n",
+                 input0->role, input1->role, output->role);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
     if (element_count == 0 || byte_len > input0->bytes ||
         byte_len > input1->bytes || byte_len > output->bytes) {
+        qemu_log("UB_NPU_DESC: VECTOR_ADD size mismatch elements=%" PRIu32
+                 " byte_len=%#" PRIx64 " in0=%#" PRIx64
+                 " in1=%#" PRIx64 " out=%#" PRIx64 "\n",
+                 element_count, byte_len, input0->bytes,
+                 input1->bytes, output->bytes);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
 
@@ -531,9 +589,13 @@ static int ub_npu_op_checksum64(UbNpuState *s, UbNpuCmdV1 *cmd)
     int rc;
 
     if (cmd->desc_count < 1) {
+        qemu_log("UB_NPU_DESC: CHECKSUM desc_count=%" PRIu32 " < 1\n",
+                 cmd->desc_count);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
     if (input->role != NPU_BUF_INPUT) {
+        qemu_log("UB_NPU_DESC: CHECKSUM role mismatch input=%" PRIu32 "\n",
+                 input->role);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
 
@@ -618,8 +680,8 @@ static void ub_npu_execute_command(UbNpuState *s)
         return;
     }
 
-    if (rc == GSVA_ERR_COH_PENDING) {
-        s->pending_acquire_rc = GSVA_ERR_COH_PENDING;
+    if (rc == NPU_INTERNAL_COH_PENDING) {
+        s->pending_acquire_rc = NPU_INTERNAL_COH_PENDING;
         s->exec_phase = NPU_PHASE_PENDING_RETRY;
         timer_mod(s->poll_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
@@ -639,7 +701,7 @@ static void ub_npu_bh(void *opaque)
 {
     UbNpuState *s = UB_NPU(opaque);
 
-    if (s->pending_acquire_rc == GSVA_ERR_COH_PENDING && s->ubc) {
+    if (s->pending_acquire_rc == NPU_INTERNAL_COH_PENDING && s->ubc) {
         obmm_coh_poll_rx_links(s->ubc);
         s->pending_acquire_rc = 0;
     }
