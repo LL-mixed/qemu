@@ -14,6 +14,11 @@
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "exec/address-spaces.h"
+#include "qapi/qmp/qdict.h"
+#include "qapi/qmp/qlist.h"
+#include "qapi/qmp/qnum.h"
+#include "qapi/qmp/qjson.h"
+#include "qapi/qmp/qstring.h"
 
 /* ------------------------------------------------------------------ */
 /* SSD status bits                                                     */
@@ -34,6 +39,8 @@
 #define SSD_OP_BLOCK_TOMBSTONE 4
 #define SSD_OP_FLUSH          5
 #define SSD_OP_STAT           6
+#define SSD_OP_EXPORT_SNAPSHOT 7
+#define SSD_OP_IMPORT_SNAPSHOT 8
 
 /* ------------------------------------------------------------------ */
 /* SSD completion status codes                                         */
@@ -54,6 +61,7 @@
 #define SSD_ERR_SEALED            (-12)
 #define SSD_ERR_TOMBSTONED        (-13)
 #define SSD_ERR_BACKEND_IO        (-14)
+#define SSD_ERR_BAD_SNAPSHOT      (-15)
 
 /* ------------------------------------------------------------------ */
 /* Durable state for block records                                     */
@@ -342,7 +350,8 @@ static int ub_ssd_append_version(UbSsdBlockChain *chain,
                                   const uint8_t *data, uint64_t len,
                                   uint64_t version,
                                   UbSsdDurableState state,
-                                  uint32_t writer_cna)
+                                  uint32_t writer_cna,
+                                  uint32_t metadata_flags)
 {
     if (chain->version_count >= chain->version_capacity) {
         chain->version_capacity *= 2;
@@ -356,7 +365,7 @@ static int ub_ssd_append_version(UbSsdBlockChain *chain,
     rec->byte_count = len;
     rec->checksum64 = ub_ssd_checksum64(data, len);
     rec->writer_cna = writer_cna;
-    rec->metadata_flags = 0;
+    rec->metadata_flags = metadata_flags;
 
     if (len > 0) {
         rec->bytes = g_malloc(len);
@@ -395,6 +404,493 @@ static void ub_ssd_block_key_free(void *ptr)
     g_free(ptr);
 }
 
+static char *ub_ssd_bytes_to_hex(const uint8_t *data, uint64_t len)
+{
+    GString *hex;
+    uint64_t i;
+
+    hex = g_string_new(NULL);
+    for (i = 0; i < len; i++) {
+        g_string_append_printf(hex, "%02x", data[i]);
+    }
+    return g_string_free(hex, false);
+}
+
+static int ub_ssd_hex_to_nibble(char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return 10 + ch - 'a';
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return 10 + ch - 'A';
+    }
+    return -1;
+}
+
+static bool ub_ssd_hex_to_bytes(const char *hex, uint8_t *out, uint64_t out_len)
+{
+    uint64_t i;
+    size_t hex_len;
+
+    if (!hex) {
+        return false;
+    }
+
+    hex_len = strlen(hex);
+    if (hex_len != out_len * 2) {
+        return false;
+    }
+
+    for (i = 0; i < out_len; i++) {
+        int hi = ub_ssd_hex_to_nibble(hex[2 * i]);
+        int lo = ub_ssd_hex_to_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+static bool ub_ssd_get_u64_from_dict(const QDict *dict, const char *key,
+                                    uint64_t *value)
+{
+    QObject *obj = qdict_get(dict, key);
+    QNum *num = qobject_to(QNum, obj);
+    if (!num) {
+        return false;
+    }
+    return qnum_get_try_uint(num, value);
+}
+
+static bool ub_ssd_get_u32_from_dict(const QDict *dict, const char *key,
+                                    uint32_t *value)
+{
+    uint64_t tmp;
+    if (!ub_ssd_get_u64_from_dict(dict, key, &tmp)) {
+        return false;
+    }
+    if (tmp > UINT32_MAX) {
+        return false;
+    }
+    *value = (uint32_t)tmp;
+    return true;
+}
+
+static UbSsdBlockChain *ub_ssd_create_chain_in_table(GHashTable *backend,
+                                                    uint64_t block_hi,
+                                                    uint64_t block_lo)
+{
+    UbSsdBlockRefV1 *key = g_new(UbSsdBlockRefV1, 1);
+    UbSsdBlockChain *chain = g_new0(UbSsdBlockChain, 1);
+
+    key->block_hi = block_hi;
+    key->block_lo = block_lo;
+    chain->block_hi = block_hi;
+    chain->block_lo = block_lo;
+    chain->version_capacity = 4;
+    chain->versions = g_new0(UbSsdBlockRecord, chain->version_capacity);
+    chain->version_count = 0;
+
+    g_hash_table_insert(backend, key, chain);
+    return chain;
+}
+
+static QDict *ub_ssd_record_to_dict(const UbSsdBlockRecord *rec)
+{
+    QDict *obj = qdict_new();
+    char *bytes_hex = ub_ssd_bytes_to_hex(rec->bytes ? rec->bytes : (const uint8_t *)"",
+                                          rec->byte_count);
+
+    qdict_put_obj(obj, "version",
+                  QOBJECT(qnum_from_uint(rec->version)));
+    qdict_put_obj(obj, "durable_state",
+                  QOBJECT(qnum_from_uint(rec->durable_state)));
+    qdict_put_obj(obj, "byte_count",
+                  QOBJECT(qnum_from_uint(rec->byte_count)));
+    qdict_put_obj(obj, "checksum64",
+                  QOBJECT(qnum_from_uint(rec->checksum64)));
+    qdict_put_obj(obj, "writer_cna",
+                  QOBJECT(qnum_from_uint(rec->writer_cna)));
+    qdict_put_obj(obj, "metadata_flags",
+                  QOBJECT(qnum_from_uint(rec->metadata_flags)));
+    qdict_put_str(obj, "bytes", bytes_hex ? bytes_hex : "");
+    g_free(bytes_hex);
+    return obj;
+}
+
+static GString *ub_ssd_export_snapshot_json(UbSsdState *s)
+{
+    QDict *root = qdict_new();
+    GHashTableIter iter;
+    gpointer key;
+    gpointer value;
+    QList *blocks = qlist_new();
+    GString *json;
+
+    g_hash_table_iter_init(&iter, s->backend);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        UbSsdBlockRefV1 *chain_key = key;
+        UbSsdBlockChain *chain = value;
+        QList *versions = qlist_new();
+        QDict *block = qdict_new();
+        uint32_t idx;
+
+        qdict_put_obj(block, "block_hi",
+                      QOBJECT(qnum_from_uint(chain_key->block_hi)));
+        qdict_put_obj(block, "block_lo",
+                      QOBJECT(qnum_from_uint(chain_key->block_lo)));
+
+        for (idx = 0; idx < chain->version_count; idx++) {
+            UbSsdBlockRecord *rec = &chain->versions[idx];
+            QDict *ver_obj = ub_ssd_record_to_dict(rec);
+            qlist_append_obj(versions, QOBJECT(ver_obj));
+        }
+
+        qdict_put_obj(block, "versions", QOBJECT(versions));
+        qlist_append_obj(blocks, QOBJECT(block));
+    }
+
+    qdict_put_obj(root, "snapshot_version",
+                  QOBJECT(qnum_from_uint(1)));
+    qdict_put_obj(root, "blocks", QOBJECT(blocks));
+    json = qobject_to_json(QOBJECT(root));
+    qobject_unref(root);
+    return json;
+}
+
+static GHashTable *ub_ssd_parse_snapshot_json_to_backend(const uint8_t *data,
+                                                        uint64_t len,
+                                                        int *err_rc)
+{
+    const QListEntry *block_entry;
+    GHashTable *backend = NULL;
+    QList *blocks;
+    QDict *root;
+    QObject *obj;
+    Error *err = NULL;
+    char *text = NULL;
+    uint64_t snapshot_version = 0;
+    if (!data || len == 0) {
+        *err_rc = SSD_ERR_BAD_SNAPSHOT;
+        return NULL;
+    }
+
+    if (len > SSIZE_MAX) {
+        *err_rc = SSD_ERR_BAD_SNAPSHOT;
+        return NULL;
+    }
+
+    text = g_strndup((const char *)data, (size_t)len);
+    obj = qobject_from_json(text, &err);
+    g_free(text);
+    if (!obj) {
+        error_free(err);
+        *err_rc = SSD_ERR_BAD_SNAPSHOT;
+        return NULL;
+    }
+
+    root = qobject_to(QDict, obj);
+    if (!root) {
+        qobject_unref(obj);
+        *err_rc = SSD_ERR_BAD_SNAPSHOT;
+        return NULL;
+    }
+
+    if (!ub_ssd_get_u64_from_dict(root, "snapshot_version", &snapshot_version) ||
+        snapshot_version != 1) {
+        qobject_unref(obj);
+        *err_rc = SSD_ERR_BAD_SNAPSHOT;
+        return NULL;
+    }
+
+    blocks = qdict_get_qlist(root, "blocks");
+    if (!blocks) {
+        qobject_unref(obj);
+        *err_rc = SSD_ERR_BAD_SNAPSHOT;
+        return NULL;
+    }
+
+    backend = g_hash_table_new_full(ub_ssd_block_key_hash,
+                                   ub_ssd_block_key_equal,
+                                   ub_ssd_block_key_free,
+                                   ub_ssd_block_chain_free);
+
+    for (block_entry = qlist_first(blocks); block_entry;
+         block_entry = qlist_next(block_entry)) {
+        const QListEntry *version_entry;
+        QDict *block_dict = qobject_to(QDict,
+                                       qlist_entry_obj(block_entry));
+        QList *versions;
+        UbSsdBlockChain *chain = NULL;
+        uint64_t block_hi = 0;
+        uint64_t block_lo = 0;
+        uint64_t expected_version = 0;
+        uint32_t i = 0;
+        bool first_version = true;
+
+        if (!block_dict) {
+            goto parse_fail;
+        }
+
+        if (!ub_ssd_get_u64_from_dict(block_dict, "block_hi", &block_hi) ||
+            !ub_ssd_get_u64_from_dict(block_dict, "block_lo", &block_lo)) {
+            goto parse_fail;
+        }
+
+        if (g_hash_table_lookup(backend, &(UbSsdBlockRefV1){ .block_hi = block_hi,
+                                                            .block_lo = block_lo})) {
+            goto parse_fail;
+        }
+
+        versions = qdict_get_qlist(block_dict, "versions");
+        if (!versions) {
+            goto parse_fail;
+        }
+
+        chain = ub_ssd_create_chain_in_table(backend, block_hi, block_lo);
+        for (version_entry = qlist_first(versions);
+             version_entry;
+             version_entry = qlist_next(version_entry)) {
+            QDict *version_dict = qobject_to(QDict,
+                                            qlist_entry_obj(version_entry));
+            uint64_t rec_version = 0;
+            uint64_t rec_state = 0;
+            uint64_t rec_byte_count = 0;
+            uint64_t rec_checksum = 0;
+            uint32_t writer_cna = 0;
+            uint32_t metadata_flags = 0;
+            const char *bytes_hex = NULL;
+            uint8_t *bytes = NULL;
+            UbSsdDurableState durable_state;
+
+            if (!version_dict) {
+                goto parse_fail;
+            }
+
+            if (!ub_ssd_get_u64_from_dict(version_dict, "version", &rec_version) ||
+                (first_version ? (rec_version == 0) : (rec_version <= expected_version)) ||
+                !ub_ssd_get_u64_from_dict(version_dict, "durable_state", &rec_state) ||
+                rec_state > UB_SSD_DURABLE_QUARANTINED ||
+                !ub_ssd_get_u64_from_dict(version_dict, "byte_count", &rec_byte_count) ||
+                !ub_ssd_get_u64_from_dict(version_dict, "checksum64", &rec_checksum) ||
+                !ub_ssd_get_u32_from_dict(version_dict, "writer_cna", &writer_cna) ||
+                !ub_ssd_get_u32_from_dict(version_dict, "metadata_flags",
+                                          &metadata_flags)) {
+                goto parse_fail;
+            }
+
+            if (rec_byte_count > 1024 * 1024 * 1024ULL) {
+                goto parse_fail;
+            }
+
+            bytes_hex = qdict_get_try_str(version_dict, "bytes");
+            if (!bytes_hex) {
+                goto parse_fail;
+            }
+
+            bytes = g_malloc0((size_t)rec_byte_count);
+            if (!ub_ssd_hex_to_bytes(bytes_hex, bytes, rec_byte_count)) {
+                g_free(bytes);
+                goto parse_fail;
+            }
+
+            if (ub_ssd_checksum64(bytes, rec_byte_count) != rec_checksum) {
+                g_free(bytes);
+                goto parse_fail;
+            }
+
+            durable_state = (UbSsdDurableState)rec_state;
+            if (durable_state > UB_SSD_DURABLE_QUARANTINED) {
+                g_free(bytes);
+                goto parse_fail;
+            }
+
+            if (ub_ssd_append_version(chain, bytes, rec_byte_count, rec_version,
+                                      durable_state, writer_cna,
+                                      metadata_flags) < 0) {
+                g_free(bytes);
+                goto parse_fail;
+            }
+            expected_version = rec_version;
+            first_version = false;
+            g_free(bytes);
+        }
+        if (chain->version_count == 0) {
+            g_hash_table_remove(backend, &(UbSsdBlockRefV1){ .block_hi = block_hi,
+                                                             .block_lo = block_lo});
+            goto parse_fail;
+        }
+    }
+
+    qobject_unref(obj);
+    *err_rc = SSD_OK;
+    return backend;
+
+parse_fail:
+    if (backend) {
+        g_hash_table_destroy(backend);
+    }
+    qobject_unref(obj);
+    *err_rc = SSD_ERR_BAD_SNAPSHOT;
+    return NULL;
+}
+
+static int ub_ssd_apply_snapshot_import(UbSsdState *s, const uint8_t *data,
+                                       uint64_t len)
+{
+    int rc = SSD_OK;
+    GHashTable *new_backend;
+
+    new_backend = ub_ssd_parse_snapshot_json_to_backend(s, data, len, &rc);
+    if (!new_backend) {
+        return rc;
+    }
+
+    g_hash_table_destroy(s->backend);
+    s->backend = new_backend;
+    return SSD_OK;
+}
+
+static int ub_ssd_load_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV1 *buf,
+                                          void *out, uint64_t len)
+{
+    int rc;
+    rc = ubc_gsva_device_read_acquire(s->ubc, &buf->key, s->device_cna,
+                                      buf->gsva_base, buf->bytes, 0,
+                                      buf->token_id, buf->token_value,
+                                      &s->pending_seq);
+    if (rc == GSVA_ERR_TOKEN_DENIED) {
+        return SSD_ERR_TOKEN_DENIED;
+    }
+    if (rc == GSVA_ERR_STALE_EPOCH) {
+        return SSD_ERR_STALE_EPOCH;
+    }
+    if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        return SSD_ERR_SEGMENT_RETIRED;
+    }
+    if (rc == GSVA_ERR_COH_PENDING) {
+        return rc;
+    }
+    if (rc != GSVA_OK) {
+        return SSD_ERR_BAD_DESCRIPTOR;
+    }
+
+    rc = ubc_gsva_device_read(s->ubc, &buf->key, s->device_cna,
+                              buf->gsva_base, out, len);
+    if (rc != GSVA_OK) {
+        return SSD_ERR_BAD_DESCRIPTOR;
+    }
+    return SSD_OK;
+}
+
+static int ub_ssd_store_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV1 *buf,
+                                           const void *in, uint64_t len)
+{
+    int rc;
+    rc = ubc_gsva_device_write_acquire(s->ubc, &buf->key, s->device_cna,
+                                       buf->gsva_base, buf->bytes, 0,
+                                       buf->token_id, buf->token_value,
+                                       &s->pending_seq);
+    if (rc == GSVA_ERR_TOKEN_DENIED) {
+        return SSD_ERR_TOKEN_DENIED;
+    }
+    if (rc == GSVA_ERR_STALE_EPOCH) {
+        return SSD_ERR_STALE_EPOCH;
+    }
+    if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        return SSD_ERR_SEGMENT_RETIRED;
+    }
+    if (rc == GSVA_ERR_COH_PENDING) {
+        return rc;
+    }
+    if (rc != GSVA_OK) {
+        return SSD_ERR_BAD_DESCRIPTOR;
+    }
+
+    rc = ubc_gsva_device_write(s->ubc, &buf->key, s->device_cna,
+                               buf->gsva_base, in, len);
+    if (rc != GSVA_OK) {
+        return SSD_ERR_BAD_DESCRIPTOR;
+    }
+
+    ubc_gsva_device_fence(s->ubc, &buf->key, s->device_cna,
+                          buf->gsva_base, len);
+    return SSD_OK;
+}
+
+static int ub_ssd_op_export_snapshot(UbSsdState *s, UbSsdCmdV1 *cmd)
+{
+    const UbSsdBufferDescV1 *buf = &cmd->buffer;
+    GString *json;
+    uint64_t snapshot_len;
+    int rc;
+
+    if (buf->bytes == 0) {
+        return SSD_ERR_BAD_SNAPSHOT;
+    }
+    if (buf->bytes > SSIZE_MAX) {
+        return SSD_ERR_BAD_SNAPSHOT;
+    }
+
+    json = ub_ssd_export_snapshot_json(s);
+    if (!json) {
+        return SSD_ERR_BAD_DESCRIPTOR;
+    }
+
+    snapshot_len = (uint64_t)json->len;
+    if (snapshot_len > buf->bytes) {
+        g_string_free(json, true);
+        return SSD_ERR_BAD_SNAPSHOT;
+    }
+
+    rc = ub_ssd_store_u8_buffer_via_gsva(s, buf, json->str, snapshot_len);
+    g_string_free(json, true);
+    if (rc != SSD_OK) {
+        return rc;
+    }
+
+    s->cpl.bytes_written = snapshot_len;
+    return SSD_OK;
+}
+
+static int ub_ssd_op_import_snapshot(UbSsdState *s, UbSsdCmdV1 *cmd)
+{
+    const UbSsdBufferDescV1 *buf = &cmd->buffer;
+    void *snapshot = NULL;
+    int rc;
+
+    if (buf->bytes == 0) {
+        return SSD_ERR_BAD_SNAPSHOT;
+    }
+    if (buf->bytes > SSIZE_MAX) {
+        return SSD_ERR_BAD_SNAPSHOT;
+    }
+
+    snapshot = g_malloc0((size_t)buf->bytes);
+    if (!snapshot) {
+        return SSD_ERR_BACKEND_IO;
+    }
+
+    rc = ub_ssd_load_u8_buffer_via_gsva(s, buf, snapshot, buf->bytes);
+    if (rc != SSD_OK) {
+        g_free(snapshot);
+        return rc;
+    }
+
+    rc = ub_ssd_apply_snapshot_import(s, snapshot, buf->bytes);
+    g_free(snapshot);
+    if (rc != SSD_OK) {
+        return rc;
+    }
+
+    s->cpl.bytes_read = buf->bytes;
+    return SSD_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
@@ -408,6 +904,8 @@ static const char *ssd_opcode_name(uint32_t opcode)
     case SSD_OP_BLOCK_TOMBSTONE: return "BLOCK_TOMBSTONE";
     case SSD_OP_FLUSH:          return "FLUSH";
     case SSD_OP_STAT:           return "STAT";
+    case SSD_OP_EXPORT_SNAPSHOT: return "EXPORT_SNAPSHOT";
+    case SSD_OP_IMPORT_SNAPSHOT: return "IMPORT_SNAPSHOT";
     default:                    return "UNKNOWN";
     }
 }
@@ -483,7 +981,7 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
         }
         chain = ub_ssd_create_chain(s, ref->block_hi, ref->block_lo);
         ub_ssd_append_version(chain, data, data_len, 1,
-                              UB_SSD_DURABLE_COMMITTED, cmd->source_cna);
+                              UB_SSD_DURABLE_COMMITTED, cmd->source_cna, 0);
         s->cpl.committed_ref = *ref;
         s->cpl.committed_ref.version = 1;
     } else {
@@ -505,7 +1003,7 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
         }
         uint64_t new_version = latest->version + 1;
         ub_ssd_append_version(chain, data, data_len, new_version,
-                              UB_SSD_DURABLE_COMMITTED, cmd->source_cna);
+                              UB_SSD_DURABLE_COMMITTED, cmd->source_cna, 0);
         s->cpl.committed_ref = *ref;
         s->cpl.committed_ref.version = new_version;
     }
@@ -704,6 +1202,12 @@ static void ub_ssd_execute_command(UbSsdState *s)
     case SSD_OP_STAT:
         if (!is_retry) s->stats.stat++;
         rc = SSD_OK;
+        break;
+    case SSD_OP_EXPORT_SNAPSHOT:
+        rc = ub_ssd_op_export_snapshot(s, cmd);
+        break;
+    case SSD_OP_IMPORT_SNAPSHOT:
+        rc = ub_ssd_op_import_snapshot(s, cmd);
         break;
     default:
         ub_ssd_complete_command(s, SSD_ERR_BAD_OPCODE);
