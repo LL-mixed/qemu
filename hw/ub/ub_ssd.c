@@ -90,7 +90,7 @@ typedef enum UbSsdDurableState {
 #define SSD_CLEAR_CPL_OFF    0x514
 #define SSD_LAST_REQ_ID_OFF  0x518
 #define SSD_STATS_OFF        0x520
-#define SSD_STATS_SIZE       0x080
+#define SSD_STATS_SIZE       0x090
 #define SSD_BACKEND_PROFILE_OFF 0x5a0
 
 /* ------------------------------------------------------------------ */
@@ -180,7 +180,7 @@ typedef struct UbSsdBlockChain {
 /* SSD stats                                                           */
 /* ------------------------------------------------------------------ */
 
-#define SSD_STATS_COUNT 17
+#define SSD_STATS_COUNT 18
 
 typedef struct UbSsdStats {
     uint64_t cmd_total;
@@ -198,6 +198,7 @@ typedef struct UbSsdStats {
     uint64_t bytes_read_from_backend;
     uint64_t token_denied;
     uint64_t stale_epoch;
+    uint64_t version_conflict;
     uint64_t coh_timeout;
     uint64_t checksum_error;
 } UbSsdStats;
@@ -672,7 +673,8 @@ static GHashTable *ub_ssd_parse_snapshot_json_to_backend(const uint8_t *data,
             }
 
             if (!ub_ssd_get_u64_from_dict(version_dict, "version", &rec_version) ||
-                (first_version ? (rec_version == 0) : (rec_version <= expected_version)) ||
+                (first_version ? (rec_version != 1) :
+                                 (rec_version != expected_version + 1)) ||
                 !ub_ssd_get_u64_from_dict(version_dict, "durable_state", &rec_state) ||
                 rec_state > UB_SSD_DURABLE_QUARANTINED ||
                 !ub_ssd_get_u64_from_dict(version_dict, "byte_count", &rec_byte_count) ||
@@ -921,6 +923,9 @@ static void ub_ssd_complete_command(UbSsdState *s, uint32_t status)
         s->stats.cmd_completed++;
     } else {
         s->stats.cmd_failed++;
+        if (status == SSD_ERR_VERSION_CONFLICT) {
+            s->stats.version_conflict++;
+        }
         s->status |= SSD_STATUS_ERROR;
         s->error_reg = (uint32_t)(-status);
     }
