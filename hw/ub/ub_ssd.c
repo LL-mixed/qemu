@@ -180,7 +180,7 @@ typedef struct UbSsdBlockChain {
 /* SSD stats                                                           */
 /* ------------------------------------------------------------------ */
 
-#define SSD_STATS_COUNT 18
+#define SSD_STATS_COUNT 19
 
 typedef struct UbSsdStats {
     uint64_t cmd_total;
@@ -198,6 +198,7 @@ typedef struct UbSsdStats {
     uint64_t bytes_read_from_backend;
     uint64_t token_denied;
     uint64_t stale_epoch;
+    uint64_t retired_segment;
     uint64_t version_conflict;
     uint64_t coh_timeout;
     uint64_t checksum_error;
@@ -769,9 +770,11 @@ static int ub_ssd_load_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV1
         return SSD_ERR_TOKEN_DENIED;
     }
     if (rc == GSVA_ERR_STALE_EPOCH) {
+        s->stats.stale_epoch++;
         return SSD_ERR_STALE_EPOCH;
     }
     if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        s->stats.retired_segment++;
         return SSD_ERR_SEGMENT_RETIRED;
     }
     if (rc == GSVA_ERR_COH_PENDING) {
@@ -801,9 +804,11 @@ static int ub_ssd_store_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV
         return SSD_ERR_TOKEN_DENIED;
     }
     if (rc == GSVA_ERR_STALE_EPOCH) {
+        s->stats.stale_epoch++;
         return SSD_ERR_STALE_EPOCH;
     }
     if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        s->stats.retired_segment++;
         return SSD_ERR_SEGMENT_RETIRED;
     }
     if (rc == GSVA_ERR_COH_PENDING) {
@@ -962,8 +967,18 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
                                        buf->token_id, buf->token_value,
                                        &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) return SSD_ERR_TOKEN_DENIED;
-    if (rc == GSVA_ERR_STALE_EPOCH) return SSD_ERR_STALE_EPOCH;
-    if (rc == GSVA_ERR_SEGMENT_RETIRED) return SSD_ERR_SEGMENT_RETIRED;
+    if (rc == GSVA_ERR_STALE_EPOCH) {
+        s->stats.stale_epoch++;
+        return SSD_ERR_STALE_EPOCH;
+    }
+    if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        s->stats.retired_segment++;
+        return SSD_ERR_SEGMENT_RETIRED;
+    }
+    if (rc == GSVA_ERR_COH_TIMEOUT) {
+        s->stats.coh_timeout++;
+        return SSD_ERR_COH_TIMEOUT;
+    }
     if (rc == GSVA_ERR_COH_PENDING) return rc;
     if (rc != GSVA_OK) return SSD_ERR_BAD_DESCRIPTOR;
 
@@ -1074,8 +1089,18 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
                                         buf->token_id, buf->token_value,
                                         &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) return SSD_ERR_TOKEN_DENIED;
-    if (rc == GSVA_ERR_STALE_EPOCH) return SSD_ERR_STALE_EPOCH;
-    if (rc == GSVA_ERR_SEGMENT_RETIRED) return SSD_ERR_SEGMENT_RETIRED;
+    if (rc == GSVA_ERR_STALE_EPOCH) {
+        s->stats.stale_epoch++;
+        return SSD_ERR_STALE_EPOCH;
+    }
+    if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        s->stats.retired_segment++;
+        return SSD_ERR_SEGMENT_RETIRED;
+    }
+    if (rc == GSVA_ERR_COH_TIMEOUT) {
+        s->stats.coh_timeout++;
+        return SSD_ERR_COH_TIMEOUT;
+    }
     if (rc == GSVA_ERR_COH_PENDING) return rc;
     if (rc != GSVA_OK) return SSD_ERR_BAD_DESCRIPTOR;
 

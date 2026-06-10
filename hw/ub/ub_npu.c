@@ -135,7 +135,7 @@ QEMU_BUILD_BUG_ON(sizeof(UbNpuCplV1) != 48);
 /* NPU stats                                                           */
 /* ------------------------------------------------------------------ */
 
-#define NPU_STATS_COUNT 12
+#define NPU_STATS_COUNT 13
 
 typedef struct UbNpuStats {
     uint64_t cmd_total;
@@ -149,8 +149,19 @@ typedef struct UbNpuStats {
     uint64_t bytes_written;
     uint64_t token_denied;
     uint64_t stale_epoch;
+    uint64_t retired_segment;
     uint64_t coh_timeout;
 } UbNpuStats;
+
+/* ------------------------------------------------------------------ */
+/* Execution state machine                                              */
+/* ------------------------------------------------------------------ */
+
+enum ub_npu_exec_phase {
+    NPU_PHASE_IDLE = 0,
+    NPU_PHASE_EXECUTING,
+    NPU_PHASE_PENDING_RETRY,
+};
 
 /* ------------------------------------------------------------------ */
 /* Device state                                                        */
@@ -184,6 +195,7 @@ struct UbNpuState {
     bool poll_timer_active;
     uint64_t pending_seq;
     int pending_acquire_rc;
+    enum ub_npu_exec_phase exec_phase;
 
     /* Stats */
     UbNpuStats stats;
@@ -275,6 +287,7 @@ static int ub_npu_acquire_read(UbNpuState *s, const UbNpuBufferDescV1 *desc)
         return NPU_ERR_STALE_EPOCH;
     }
     if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        s->stats.retired_segment++;
         return NPU_ERR_SEGMENT_RETIRED;
     }
     if (rc == GSVA_ERR_COH_TIMEOUT) {
@@ -307,6 +320,7 @@ static int ub_npu_acquire_write(UbNpuState *s, const UbNpuBufferDescV1 *desc)
         return NPU_ERR_STALE_EPOCH;
     }
     if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        s->stats.retired_segment++;
         return NPU_ERR_SEGMENT_RETIRED;
     }
     if (rc == GSVA_ERR_COH_TIMEOUT) {
@@ -556,17 +570,24 @@ static void ub_npu_execute_command(UbNpuState *s)
     UbNpuCmdV1 *cmd = &s->cmd;
     uint32_t opcode = cmd->opcode;
     int rc = NPU_OK;
+    bool is_retry = (s->exec_phase == NPU_PHASE_PENDING_RETRY);
 
-    qemu_log("UB_NPU_CMD: req_id=%#" PRIx64 " opcode=%s(%" PRIu32 ")"
-             " source_cna=%#" PRIx32 " desc_count=%" PRIu32 "\n",
-             cmd->req_id, npu_opcode_name(opcode), opcode,
-             cmd->source_cna, cmd->desc_count);
+    if (!is_retry) {
+        qemu_log("UB_NPU_CMD: req_id=%#" PRIx64 " opcode=%s(%" PRIu32 ")"
+                 " source_cna=%#" PRIx32 " desc_count=%" PRIu32 "\n",
+                 cmd->req_id, npu_opcode_name(opcode), opcode,
+                 cmd->source_cna, cmd->desc_count);
+        s->stats.cmd_total++;
 
-    s->stats.cmd_total++;
+        if (cmd->version != 1) {
+            ub_npu_complete_command(s, NPU_ERR_BAD_VERSION);
+            return;
+        }
 
-    if (cmd->version != 1) {
-        ub_npu_complete_command(s, NPU_ERR_BAD_VERSION);
-        return;
+        s->exec_phase = NPU_PHASE_EXECUTING;
+    } else {
+        qemu_log("UB_NPU_CMD: retry req_id=%#" PRIx64 " opcode=%s(%" PRIu32 ")\n",
+                 cmd->req_id, npu_opcode_name(opcode), opcode);
     }
 
     switch (opcode) {
@@ -574,19 +595,19 @@ static void ub_npu_execute_command(UbNpuState *s)
         rc = NPU_OK;
         break;
     case NPU_OP_MEMCOPY:
-        s->stats.opcode_memcopy++;
+        if (!is_retry) s->stats.opcode_memcopy++;
         rc = ub_npu_op_memcopy(s, cmd);
         break;
     case NPU_OP_FILL:
-        s->stats.opcode_fill++;
+        if (!is_retry) s->stats.opcode_fill++;
         rc = ub_npu_op_fill(s, cmd);
         break;
     case NPU_OP_VECTOR_ADD_U32:
-        s->stats.opcode_vector_add_u32++;
+        if (!is_retry) s->stats.opcode_vector_add_u32++;
         rc = ub_npu_op_vector_add_u32(s, cmd);
         break;
     case NPU_OP_CHECKSUM64:
-        s->stats.opcode_checksum64++;
+        if (!is_retry) s->stats.opcode_checksum64++;
         rc = ub_npu_op_checksum64(s, cmd);
         break;
     default:
@@ -596,12 +617,14 @@ static void ub_npu_execute_command(UbNpuState *s)
 
     if (rc == GSVA_ERR_COH_PENDING) {
         s->pending_acquire_rc = GSVA_ERR_COH_PENDING;
+        s->exec_phase = NPU_PHASE_PENDING_RETRY;
         timer_mod(s->poll_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
         s->poll_timer_active = true;
         return;
     }
 
+    s->exec_phase = NPU_PHASE_IDLE;
     ub_npu_complete_command(s, rc);
 }
 
