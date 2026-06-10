@@ -195,6 +195,36 @@ typedef struct UbSsdStats {
 } UbSsdStats;
 
 /* ------------------------------------------------------------------ */
+/* Execution state machine                                              */
+/* ------------------------------------------------------------------ */
+
+enum ub_ssd_exec_phase {
+    SSD_PHASE_IDLE = 0,
+    SSD_PHASE_EXECUTING,
+    SSD_PHASE_PENDING_RETRY,
+};
+
+/* ------------------------------------------------------------------ */
+/* Backend profile                                                     */
+/* ------------------------------------------------------------------ */
+
+#define UB_SSD_BACKEND_PROFILE_MEMORY "memory"
+
+static uint32_t ub_ssd_parse_backend_profile(const char *profile)
+{
+    if (!profile || profile[0] == '\0' ||
+        g_strcmp0(profile, UB_SSD_BACKEND_PROFILE_MEMORY) == 0) {
+        return 0;
+    }
+
+    if (g_ascii_strcasecmp(profile, UB_SSD_BACKEND_PROFILE_MEMORY) == 0) {
+        return 0;
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Device state                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -226,10 +256,12 @@ struct UbSsdState {
     bool poll_timer_active;
     uint64_t pending_seq;
     int pending_acquire_rc;
+    enum ub_ssd_exec_phase exec_phase;
 
     /* Memory backend */
     GHashTable *backend;
     uint32_t backend_profile;
+    char *backend_profile_name;
 
     /* Stats */
     UbSsdStats stats;
@@ -629,20 +661,27 @@ static void ub_ssd_execute_command(UbSsdState *s)
     UbSsdCmdV1 *cmd = &s->cmd;
     uint32_t opcode = cmd->opcode;
     int rc = SSD_OK;
+    bool is_retry = (s->exec_phase == SSD_PHASE_PENDING_RETRY);
 
-    qemu_log("UB_SSD_CMD: req_id=%#" PRIx64 " opcode=%s(%" PRIu32 ")"
-             " source_cna=%#" PRIx32
-             " block=%#" PRIx64 ":%#" PRIx64 ":%#" PRIx64 "\n",
-             cmd->req_id, ssd_opcode_name(opcode), opcode,
-             cmd->source_cna,
-             cmd->block_ref.block_hi, cmd->block_ref.block_lo,
-             cmd->block_ref.version);
+    if (!is_retry) {
+        qemu_log("UB_SSD_CMD: req_id=%#" PRIx64 " opcode=%s(%" PRIu32 ")"
+                 " source_cna=%#" PRIx32
+                 " block=%#" PRIx64 ":%#" PRIx64 ":%#" PRIx64 "\n",
+                 cmd->req_id, ssd_opcode_name(opcode), opcode,
+                 cmd->source_cna,
+                 cmd->block_ref.block_hi, cmd->block_ref.block_lo,
+                 cmd->block_ref.version);
+        s->stats.cmd_total++;
 
-    s->stats.cmd_total++;
+        if (cmd->version != 1) {
+            ub_ssd_complete_command(s, SSD_ERR_BAD_VERSION);
+            return;
+        }
 
-    if (cmd->version != 1) {
-        ub_ssd_complete_command(s, SSD_ERR_BAD_VERSION);
-        return;
+        s->exec_phase = SSD_PHASE_EXECUTING;
+    } else {
+        qemu_log("UB_SSD_CMD: retry req_id=%#" PRIx64 " opcode=%s(%" PRIu32 ")\n",
+                 cmd->req_id, ssd_opcode_name(opcode), opcode);
     }
 
     switch (opcode) {
@@ -659,11 +698,11 @@ static void ub_ssd_execute_command(UbSsdState *s)
         rc = ub_ssd_op_block_tombstone(s, cmd);
         break;
     case SSD_OP_FLUSH:
-        s->stats.flush++;
+        if (!is_retry) s->stats.flush++;
         rc = SSD_OK;
         break;
     case SSD_OP_STAT:
-        s->stats.stat++;
+        if (!is_retry) s->stats.stat++;
         rc = SSD_OK;
         break;
     default:
@@ -673,12 +712,14 @@ static void ub_ssd_execute_command(UbSsdState *s)
 
     if (rc == GSVA_ERR_COH_PENDING) {
         s->pending_acquire_rc = GSVA_ERR_COH_PENDING;
+        s->exec_phase = SSD_PHASE_PENDING_RETRY;
         timer_mod(s->poll_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
         s->poll_timer_active = true;
         return;
     }
 
+    s->exec_phase = SSD_PHASE_IDLE;
     ub_ssd_complete_command(s, rc);
 }
 
@@ -838,7 +879,11 @@ static void ub_ssd_realize(DeviceState *dev, Error **errp)
                                         ub_ssd_block_key_equal,
                                         ub_ssd_block_key_free,
                                         ub_ssd_block_chain_free);
-    s->backend_profile = 0; /* memory */
+    s->backend_profile = ub_ssd_parse_backend_profile(s->backend_profile_name);
+    if (!s->backend_profile_name) {
+        s->backend_profile_name = g_strdup(UB_SSD_BACKEND_PROFILE_MEMORY);
+    }
+
     s->status = SSD_STATUS_READY;
     memset(&s->cmd, 0, sizeof(s->cmd));
     memset(&s->cpl, 0, sizeof(s->cpl));
@@ -885,6 +930,7 @@ static Property ub_ssd_properties[] = {
     DEFINE_PROP_UINT32("node-id", UbSsdState, node_id, 0),
     DEFINE_PROP_UINT32("instance-id", UbSsdState, instance_id, 0),
     DEFINE_PROP_UINT32("cna", UbSsdState, device_cna, 0),
+    DEFINE_PROP_STRING("backend-profile", UbSsdState, backend_profile_name),
     DEFINE_PROP_LINK("ubc", UbSsdState, ubc,
                      TYPE_BUS_CONTROLLER_DEV, BusControllerDev *),
     DEFINE_PROP_END_OF_LIST(),

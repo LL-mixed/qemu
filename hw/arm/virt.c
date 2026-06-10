@@ -443,6 +443,7 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
     MachineState *ms = MACHINE(vms);
     char *ubc_nodename;
     char *ummu_nodename;
+    const char *ssd_backend_profile = "memory";
 
     qemu_fdt_setprop_u64(ms->fdt, "/chosen", "linux,ubios-information-table",
                          vms->memmap[VIRT_UBIOS_INFO_TABLE].base);
@@ -461,52 +462,63 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
                            vms->irqmap[VIRT_PLATFORM_BUS],
                            GIC_FDT_IRQ_FLAGS_LEVEL_HI);
     qemu_fdt_setprop_cell(ms->fdt, ubc_nodename, "index", 0);
+    {
+        uint32_t ubc_phandle = qemu_fdt_alloc_phandle(ms->fdt);
+        qemu_fdt_setprop_cell(ms->fdt, ubc_nodename, "phandle", ubc_phandle);
 
-    ummu_nodename = g_strdup_printf("/ummu@%" PRIx64,
-                                    vms->memmap[VIRT_UBC_BASE_REG].base + UMMU_REG_OFFSET);
-    qemu_fdt_add_subnode(ms->fdt, ummu_nodename);
-    qemu_fdt_setprop_string(ms->fdt, ummu_nodename, "compatible", "ub,ummu");
-    qemu_fdt_setprop_sized_cells(ms->fdt, ummu_nodename, "reg",
-                                 2, vms->memmap[VIRT_UBC_BASE_REG].base + UMMU_REG_OFFSET,
-                                 2, UMMU_REG_SIZE);
-    qemu_fdt_setprop_cell(ms->fdt, ummu_nodename, "index", 0);
+        ummu_nodename = g_strdup_printf("/ummu@%" PRIx64,
+                                        vms->memmap[VIRT_UBC_BASE_REG].base + UMMU_REG_OFFSET);
+        qemu_fdt_add_subnode(ms->fdt, ummu_nodename);
+        qemu_fdt_setprop_string(ms->fdt, ummu_nodename, "compatible", "ub,ummu");
+        qemu_fdt_setprop_sized_cells(ms->fdt, ummu_nodename, "reg",
+                                     2, vms->memmap[VIRT_UBC_BASE_REG].base + UMMU_REG_OFFSET,
+                                     2, UMMU_REG_SIZE);
+        qemu_fdt_setprop_cell(ms->fdt, ummu_nodename, "index", 0);
 
-    g_free(ummu_nodename);
-    g_free(ubc_nodename);
+        g_free(ummu_nodename);
+        g_free(ubc_nodename);
 
-    /* NPU FDT node */
+        /* NPU FDT node */
     {
         char *npu_nodename;
         uint32_t npu_cna;
         uint64_t npu_base = vms->memmap[VIRT_UBC_BASE_REG].base + 0x20000000ULL;
-        npu_nodename = g_strdup_printf("/ub-npu@%" PRIx64, npu_base);
-        qemu_fdt_add_subnode(ms->fdt, npu_nodename);
-        qemu_fdt_setprop_string(ms->fdt, npu_nodename, "compatible", "ub-sim,npu-v1");
-        qemu_fdt_setprop_sized_cells(ms->fdt, npu_nodename, "reg",
-                                     2, npu_base, 2, 0x1000);
-        qemu_fdt_setprop_cell(ms->fdt, npu_nodename, "ub,node-id",
-                              virt_ub_node_seq(0));
-        npu_cna = (virt_ub_node_seq(0) << 16) | (0x10 << 8) | 0;
-        qemu_fdt_setprop_cell(ms->fdt, npu_nodename, "ub,cna", npu_cna);
-        g_free(npu_nodename);
+            npu_nodename = g_strdup_printf("/ub-npu@%" PRIx64, npu_base);
+            qemu_fdt_add_subnode(ms->fdt, npu_nodename);
+            qemu_fdt_setprop_string(ms->fdt, npu_nodename, "compatible", "ub-sim,npu-v1");
+            qemu_fdt_setprop_sized_cells(ms->fdt, npu_nodename, "reg",
+                                         2, npu_base, 2, 0x1000);
+            qemu_fdt_setprop_cell(ms->fdt, npu_nodename, "ub,node-id",
+                                  virt_ub_node_seq(0));
+            npu_cna = (virt_ub_node_seq(0) << 16) | (0x10 << 8) | 0;
+            qemu_fdt_setprop_cell(ms->fdt, npu_nodename, "ub,cna", npu_cna);
+            qemu_fdt_setprop_cell(ms->fdt, npu_nodename, "ub,ubc-phandle",
+                                  ubc_phandle);
+            g_free(npu_nodename);
+        }
+
+        /* SSD FDT node */
+        {
+            char *ssd_nodename;
+            uint32_t ssd_cna;
+            uint64_t ssd_base = vms->memmap[VIRT_UBC_BASE_REG].base + 0x20001000ULL;
+            ssd_nodename = g_strdup_printf("/ub-ssd@%" PRIx64, ssd_base);
+            qemu_fdt_add_subnode(ms->fdt, ssd_nodename);
+            qemu_fdt_setprop_string(ms->fdt, ssd_nodename, "compatible", "ub-sim,ssd-v1");
+            qemu_fdt_setprop_sized_cells(ms->fdt, ssd_nodename, "reg",
+                                         2, ssd_base, 2, 0x1000);
+            qemu_fdt_setprop_cell(ms->fdt, ssd_nodename, "ub,node-id",
+                                  virt_ub_node_seq(0));
+            ssd_cna = (virt_ub_node_seq(0) << 16) | (0x20 << 8) | 0;
+            qemu_fdt_setprop_cell(ms->fdt, ssd_nodename, "ub,cna", ssd_cna);
+            qemu_fdt_setprop_cell(ms->fdt, ssd_nodename, "ub,ubc-phandle",
+                                  ubc_phandle);
+            qemu_fdt_setprop_string(ms->fdt, ssd_nodename, "ub,backend-profile",
+                                    ssd_backend_profile);
+            g_free(ssd_nodename);
+        }
     }
 
-    /* SSD FDT node */
-    {
-        char *ssd_nodename;
-        uint32_t ssd_cna;
-        uint64_t ssd_base = vms->memmap[VIRT_UBC_BASE_REG].base + 0x20001000ULL;
-        ssd_nodename = g_strdup_printf("/ub-ssd@%" PRIx64, ssd_base);
-        qemu_fdt_add_subnode(ms->fdt, ssd_nodename);
-        qemu_fdt_setprop_string(ms->fdt, ssd_nodename, "compatible", "ub-sim,ssd-v1");
-        qemu_fdt_setprop_sized_cells(ms->fdt, ssd_nodename, "reg",
-                                     2, ssd_base, 2, 0x1000);
-        qemu_fdt_setprop_cell(ms->fdt, ssd_nodename, "ub,node-id",
-                              virt_ub_node_seq(0));
-        ssd_cna = (virt_ub_node_seq(0) << 16) | (0x20 << 8) | 0;
-        qemu_fdt_setprop_cell(ms->fdt, ssd_nodename, "ub,cna", ssd_cna);
-        g_free(ssd_nodename);
-    }
 
     ub_init_ubios_info_table(ROUND_UP(UBIOS_TABLE_SIZE, 4 * KiB));
 }
@@ -2056,6 +2068,7 @@ static void create_ub(VirtMachineState *vms)
         bool create_ssd = !skip_devices || !strstr(skip_devices, "ssd");
         uint32_t node_id = virt_ub_node_seq(0);
         uint64_t ubc_base = vms->memmap[VIRT_UBC_BASE_REG].base;
+        const char *ssd_backend_profile = "memory";
 
         if (create_npu) {
             DeviceState *npu = qdev_new("ub-npu");
@@ -2074,6 +2087,7 @@ static void create_ub(VirtMachineState *vms)
             DeviceState *ssd = qdev_new("ub-ssd");
             qdev_prop_set_uint32(ssd, "node-id", node_id);
             qdev_prop_set_uint32(ssd, "instance-id", 0);
+            qdev_prop_set_string(ssd, "backend-profile", ssd_backend_profile);
             object_property_set_link(OBJECT(ssd), "ubc",
                                      OBJECT(ubc_dev_state), &error_abort);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(ssd), &error_fatal);
