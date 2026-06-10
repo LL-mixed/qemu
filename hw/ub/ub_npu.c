@@ -561,18 +561,22 @@ static void ub_npu_execute_command(UbNpuState *s)
     switch (opcode) {
     case NPU_OP_MEMCOPY:
         s->stats.opcode_memcopy++;
+        if (cmd->desc_count == 0) { rc = NPU_OK; break; }
         rc = ub_npu_op_memcopy(s, cmd);
         break;
     case NPU_OP_FILL:
         s->stats.opcode_fill++;
+        if (cmd->desc_count == 0) { rc = NPU_OK; break; }
         rc = ub_npu_op_fill(s, cmd);
         break;
     case NPU_OP_VECTOR_ADD_U32:
         s->stats.opcode_vector_add_u32++;
+        if (cmd->desc_count == 0) { rc = NPU_OK; break; }
         rc = ub_npu_op_vector_add_u32(s, cmd);
         break;
     case NPU_OP_CHECKSUM64:
         s->stats.opcode_checksum64++;
+        if (cmd->desc_count == 0) { rc = NPU_OK; break; }
         rc = ub_npu_op_checksum64(s, cmd);
         break;
     default:

@@ -248,6 +248,8 @@ struct VirtMachineState {
     bool highmem_ubios_info_table;
     bool highmem_ub_mem_cc;
     bool highmem_ub_mem_nc;
+    bool highmem_ub_npu;
+    bool highmem_ub_ssd;
     bool ummu;
     bool ub_cluster_mode;
     bool fm_deployment;

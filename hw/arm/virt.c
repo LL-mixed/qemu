@@ -477,6 +477,7 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
     /* NPU FDT node */
     {
         char *npu_nodename;
+        uint32_t npu_cna;
         uint64_t npu_base = vms->memmap[VIRT_UBC_BASE_REG].base + 0x20000000ULL;
         npu_nodename = g_strdup_printf("/ub-npu@%" PRIx64, npu_base);
         qemu_fdt_add_subnode(ms->fdt, npu_nodename);
@@ -485,12 +486,15 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
                                      2, npu_base, 2, 0x1000);
         qemu_fdt_setprop_cell(ms->fdt, npu_nodename, "ub,node-id",
                               virt_ub_node_seq(0));
+        npu_cna = (virt_ub_node_seq(0) << 16) | (0x10 << 8) | 0;
+        qemu_fdt_setprop_cell(ms->fdt, npu_nodename, "ub,cna", npu_cna);
         g_free(npu_nodename);
     }
 
     /* SSD FDT node */
     {
         char *ssd_nodename;
+        uint32_t ssd_cna;
         uint64_t ssd_base = vms->memmap[VIRT_UBC_BASE_REG].base + 0x20001000ULL;
         ssd_nodename = g_strdup_printf("/ub-ssd@%" PRIx64, ssd_base);
         qemu_fdt_add_subnode(ms->fdt, ssd_nodename);
@@ -499,6 +503,8 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
                                      2, ssd_base, 2, 0x1000);
         qemu_fdt_setprop_cell(ms->fdt, ssd_nodename, "ub,node-id",
                               virt_ub_node_seq(0));
+        ssd_cna = (virt_ub_node_seq(0) << 16) | (0x20 << 8) | 0;
+        qemu_fdt_setprop_cell(ms->fdt, ssd_nodename, "ub,cna", ssd_cna);
         g_free(ssd_nodename);
     }
 
@@ -2409,6 +2415,8 @@ static inline bool *virt_get_high_memmap_enabled(VirtMachineState *vms,
         &vms->highmem_ubios_info_table,
         &vms->highmem_ub_mem_cc,
         &vms->highmem_ub_mem_nc,
+        &vms->highmem_ub_npu,
+        &vms->highmem_ub_ssd,
 #endif // CONFIG_UB
     };
 
