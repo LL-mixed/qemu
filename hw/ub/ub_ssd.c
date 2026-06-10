@@ -399,13 +399,228 @@ static void ub_ssd_complete_command(UbSsdState *s, uint32_t status)
 }
 
 /* ------------------------------------------------------------------ */
-/* Command execution (V1: echo only, GSVA ops in Step 5)              */
+/* Opcode implementations                                              */
+/* ------------------------------------------------------------------ */
+
+static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
+{
+    const UbSsdBufferDescV1 *buf = &cmd->buffer;
+    const UbSsdBlockRefV1 *ref = &cmd->block_ref;
+    UbSsdBlockChain *chain;
+    UbSsdBlockRecord *latest;
+    uint8_t *data;
+    uint64_t data_len = buf->bytes;
+    int rc;
+
+    if (ref->block_hi == 0 && ref->block_lo == 0) {
+        return SSD_ERR_BAD_BLOCK;
+    }
+
+    rc = ubc_gsva_device_read_acquire(s->ubc, &buf->key, s->device_cna,
+                                       buf->gsva_base, buf->bytes, 0,
+                                       &s->pending_seq);
+    if (rc == GSVA_ERR_TOKEN_DENIED) return SSD_ERR_TOKEN_DENIED;
+    if (rc == GSVA_ERR_STALE_EPOCH) return SSD_ERR_STALE_EPOCH;
+    if (rc == GSVA_ERR_SEGMENT_RETIRED) return SSD_ERR_SEGMENT_RETIRED;
+    if (rc == GSVA_ERR_COH_PENDING) return rc;
+    if (rc != GSVA_OK) return SSD_ERR_BAD_DESCRIPTOR;
+
+    data = g_malloc(data_len);
+    rc = ubc_gsva_device_read(s->ubc, &buf->key, s->device_cna,
+                               buf->gsva_base, data, data_len);
+    if (rc != GSVA_OK) {
+        g_free(data);
+        return SSD_ERR_BAD_DESCRIPTOR;
+    }
+    s->stats.bytes_read_from_gsva += data_len;
+
+    chain = ub_ssd_find_chain(s, ref->block_hi, ref->block_lo);
+    latest = ub_ssd_latest_record(chain);
+
+    if (ref->version == 0) {
+        if (latest) {
+            g_free(data);
+            return SSD_ERR_VERSION_CONFLICT;
+        }
+        chain = ub_ssd_create_chain(s, ref->block_hi, ref->block_lo);
+        ub_ssd_append_version(chain, data, data_len, 1,
+                              UB_SSD_DURABLE_COMMITTED, cmd->source_cna);
+        s->cpl.committed_ref = *ref;
+        s->cpl.committed_ref.version = 1;
+    } else {
+        if (!chain || !latest) {
+            g_free(data);
+            return SSD_ERR_BAD_BLOCK;
+        }
+        if (latest->durable_state == UB_SSD_DURABLE_SEALED) {
+            g_free(data);
+            return SSD_ERR_SEALED;
+        }
+        if (latest->durable_state == UB_SSD_DURABLE_TOMBSTONED) {
+            g_free(data);
+            return SSD_ERR_TOMBSTONED;
+        }
+        if (latest->version != ref->version) {
+            g_free(data);
+            return SSD_ERR_VERSION_CONFLICT;
+        }
+        uint64_t new_version = latest->version + 1;
+        ub_ssd_append_version(chain, data, data_len, new_version,
+                              UB_SSD_DURABLE_COMMITTED, cmd->source_cna);
+        s->cpl.committed_ref = *ref;
+        s->cpl.committed_ref.version = new_version;
+    }
+
+    s->stats.bytes_written_to_backend += data_len;
+    s->stats.block_write++;
+    s->cpl.bytes_written = data_len;
+    s->cpl.checksum64 = ub_ssd_checksum64(data, data_len);
+    g_free(data);
+
+    return SSD_OK;
+}
+
+static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
+{
+    const UbSsdBufferDescV1 *buf = &cmd->buffer;
+    const UbSsdBlockRefV1 *ref = &cmd->block_ref;
+    UbSsdBlockChain *chain;
+    UbSsdBlockRecord *target = NULL;
+    int rc;
+
+    if (ref->block_hi == 0 && ref->block_lo == 0) {
+        return SSD_ERR_BAD_BLOCK;
+    }
+
+    chain = ub_ssd_find_chain(s, ref->block_hi, ref->block_lo);
+    if (!chain || chain->version_count == 0) {
+        return SSD_ERR_BAD_BLOCK;
+    }
+
+    if (ref->version == 0) {
+        target = ub_ssd_latest_record(chain);
+    } else {
+        for (uint32_t i = 0; i < chain->version_count; i++) {
+            if (chain->versions[i].version == ref->version) {
+                target = &chain->versions[i];
+                break;
+            }
+        }
+    }
+
+    if (!target) {
+        return SSD_ERR_BAD_BLOCK;
+    }
+    if (target->durable_state == UB_SSD_DURABLE_TOMBSTONED) {
+        return SSD_ERR_TOMBSTONED;
+    }
+
+    uint64_t read_len = MIN(target->byte_count, buf->bytes);
+    if (ref->offset + read_len > target->byte_count) {
+        return SSD_ERR_BAD_BLOCK;
+    }
+
+    /* Validate checksum */
+    uint64_t actual_csum = ub_ssd_checksum64(target->bytes, target->byte_count);
+    if (actual_csum != target->checksum64) {
+        s->stats.checksum_error++;
+        return SSD_ERR_CHECKSUM;
+    }
+
+    rc = ubc_gsva_device_write_acquire(s->ubc, &buf->key, s->device_cna,
+                                        buf->gsva_base, buf->bytes, 0,
+                                        &s->pending_seq);
+    if (rc == GSVA_ERR_TOKEN_DENIED) return SSD_ERR_TOKEN_DENIED;
+    if (rc == GSVA_ERR_STALE_EPOCH) return SSD_ERR_STALE_EPOCH;
+    if (rc == GSVA_ERR_SEGMENT_RETIRED) return SSD_ERR_SEGMENT_RETIRED;
+    if (rc == GSVA_ERR_COH_PENDING) return rc;
+    if (rc != GSVA_OK) return SSD_ERR_BAD_DESCRIPTOR;
+
+    rc = ubc_gsva_device_write(s->ubc, &buf->key, s->device_cna,
+                                buf->gsva_base, target->bytes + ref->offset,
+                                read_len);
+    if (rc != GSVA_OK) {
+        return SSD_ERR_BAD_DESCRIPTOR;
+    }
+
+    ubc_gsva_device_fence(s->ubc, &buf->key, s->device_cna,
+                          buf->gsva_base, read_len);
+
+    s->stats.bytes_read_from_backend += read_len;
+    s->stats.bytes_written_to_gsva += read_len;
+    s->stats.block_read++;
+    s->cpl.bytes_read = read_len;
+    s->cpl.checksum64 = actual_csum;
+
+    return SSD_OK;
+}
+
+static int ub_ssd_op_block_seal(UbSsdState *s, UbSsdCmdV1 *cmd)
+{
+    const UbSsdBlockRefV1 *ref = &cmd->block_ref;
+    UbSsdBlockChain *chain;
+    UbSsdBlockRecord *latest;
+
+    chain = ub_ssd_find_chain(s, ref->block_hi, ref->block_lo);
+    if (!chain || chain->version_count == 0) {
+        return SSD_ERR_BAD_BLOCK;
+    }
+
+    latest = ub_ssd_latest_record(chain);
+    if (latest->durable_state == UB_SSD_DURABLE_SEALED) {
+        return SSD_ERR_SEALED;
+    }
+    if (latest->durable_state == UB_SSD_DURABLE_TOMBSTONED) {
+        return SSD_ERR_TOMBSTONED;
+    }
+    if (ref->version != 0 && latest->version != ref->version) {
+        return SSD_ERR_VERSION_CONFLICT;
+    }
+
+    latest->durable_state = UB_SSD_DURABLE_SEALED;
+    s->stats.block_seal++;
+    s->cpl.committed_ref.block_hi = ref->block_hi;
+    s->cpl.committed_ref.block_lo = ref->block_lo;
+    s->cpl.committed_ref.version = latest->version;
+    return SSD_OK;
+}
+
+static int ub_ssd_op_block_tombstone(UbSsdState *s, UbSsdCmdV1 *cmd)
+{
+    const UbSsdBlockRefV1 *ref = &cmd->block_ref;
+    UbSsdBlockChain *chain;
+    UbSsdBlockRecord *latest;
+
+    chain = ub_ssd_find_chain(s, ref->block_hi, ref->block_lo);
+    if (!chain || chain->version_count == 0) {
+        return SSD_ERR_BAD_BLOCK;
+    }
+
+    latest = ub_ssd_latest_record(chain);
+    if (latest->durable_state == UB_SSD_DURABLE_TOMBSTONED) {
+        return SSD_ERR_TOMBSTONED;
+    }
+    if (ref->version != 0 && latest->version != ref->version) {
+        return SSD_ERR_VERSION_CONFLICT;
+    }
+
+    latest->durable_state = UB_SSD_DURABLE_TOMBSTONED;
+    s->stats.block_tombstone++;
+    s->cpl.committed_ref.block_hi = ref->block_hi;
+    s->cpl.committed_ref.block_lo = ref->block_lo;
+    s->cpl.committed_ref.version = latest->version;
+    return SSD_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Command execution                                                   */
 /* ------------------------------------------------------------------ */
 
 static void ub_ssd_execute_command(UbSsdState *s)
 {
     UbSsdCmdV1 *cmd = &s->cmd;
     uint32_t opcode = cmd->opcode;
+    int rc = SSD_OK;
 
     qemu_log("UB_SSD_CMD: req_id=%#" PRIx64 " opcode=%s(%" PRIu32 ")"
              " source_cna=%#" PRIx32
@@ -424,18 +639,39 @@ static void ub_ssd_execute_command(UbSsdState *s)
 
     switch (opcode) {
     case SSD_OP_BLOCK_WRITE:
+        rc = ub_ssd_op_block_write(s, cmd);
+        break;
     case SSD_OP_BLOCK_READ:
+        rc = ub_ssd_op_block_read(s, cmd);
+        break;
     case SSD_OP_BLOCK_SEAL:
+        rc = ub_ssd_op_block_seal(s, cmd);
+        break;
     case SSD_OP_BLOCK_TOMBSTONE:
+        rc = ub_ssd_op_block_tombstone(s, cmd);
+        break;
     case SSD_OP_FLUSH:
+        s->stats.flush++;
+        rc = SSD_OK;
+        break;
     case SSD_OP_STAT:
-        /* V1 echo: complete with OK, actual ops in Step 5 */
-        ub_ssd_complete_command(s, SSD_OK);
+        s->stats.stat++;
+        rc = SSD_OK;
         break;
     default:
         ub_ssd_complete_command(s, SSD_ERR_BAD_OPCODE);
-        break;
+        return;
     }
+
+    if (rc == GSVA_ERR_COH_PENDING) {
+        s->pending_acquire_rc = GSVA_ERR_COH_PENDING;
+        timer_mod(s->poll_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+        s->poll_timer_active = true;
+        return;
+    }
+
+    ub_ssd_complete_command(s, rc);
 }
 
 /* ------------------------------------------------------------------ */
@@ -445,6 +681,12 @@ static void ub_ssd_execute_command(UbSsdState *s)
 static void ub_ssd_bh(void *opaque)
 {
     UbSsdState *s = UB_SSD(opaque);
+
+    if (s->pending_acquire_rc == GSVA_ERR_COH_PENDING && s->ubc) {
+        obmm_coh_poll_rx_links(s->ubc);
+        s->pending_acquire_rc = 0;
+    }
+
     ub_ssd_execute_command(s);
 }
 
