@@ -748,7 +748,7 @@ static int ub_ssd_apply_snapshot_import(UbSsdState *s, const uint8_t *data,
     int rc = SSD_OK;
     GHashTable *new_backend;
 
-    new_backend = ub_ssd_parse_snapshot_json_to_backend(s, data, len, &rc);
+    new_backend = ub_ssd_parse_snapshot_json_to_backend(data, len, &rc);
     if (!new_backend) {
         return rc;
     }
@@ -763,7 +763,8 @@ static int ub_ssd_load_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV1
 {
     int rc;
     rc = ubc_gsva_device_read_acquire(s->ubc, &buf->key, s->device_cna,
-                                      buf->gsva_base, buf->bytes, 0,
+                                      buf->gsva_base, buf->bytes,
+                                      UB_GSVA_DEVICE_ACCESS_READ,
                                       buf->token_id, buf->token_value,
                                       &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) {
@@ -797,7 +798,8 @@ static int ub_ssd_store_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV
 {
     int rc;
     rc = ubc_gsva_device_write_acquire(s->ubc, &buf->key, s->device_cna,
-                                       buf->gsva_base, buf->bytes, 0,
+                                       buf->gsva_base, buf->bytes,
+                                       UB_GSVA_DEVICE_ACCESS_WRITE,
                                        buf->token_id, buf->token_value,
                                        &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) {
@@ -963,7 +965,8 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
     }
 
     rc = ubc_gsva_device_read_acquire(s->ubc, &buf->key, s->device_cna,
-                                       buf->gsva_base, buf->bytes, 0,
+                                       buf->gsva_base, buf->bytes,
+                                       UB_GSVA_DEVICE_ACCESS_READ,
                                        buf->token_id, buf->token_value,
                                        &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) return SSD_ERR_TOKEN_DENIED;
@@ -1085,7 +1088,8 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
     }
 
     rc = ubc_gsva_device_write_acquire(s->ubc, &buf->key, s->device_cna,
-                                        buf->gsva_base, buf->bytes, 0,
+                                        buf->gsva_base, buf->bytes,
+                                        UB_GSVA_DEVICE_ACCESS_WRITE,
                                         buf->token_id, buf->token_value,
                                         &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) return SSD_ERR_TOKEN_DENIED;

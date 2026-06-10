@@ -57,9 +57,9 @@
 #define NPU_BUF_OUTPUT      2
 #define NPU_BUF_SCRATCH     3
 
-#define NPU_ACCESS_READ      1
-#define NPU_ACCESS_WRITE     2
-#define NPU_ACCESS_READ_WRITE 3
+#define NPU_ACCESS_READ       UB_GSVA_DEVICE_ACCESS_READ
+#define NPU_ACCESS_WRITE      UB_GSVA_DEVICE_ACCESS_WRITE
+#define NPU_ACCESS_READ_WRITE UB_GSVA_DEVICE_ACCESS_READ_WRITE
 
 /* ------------------------------------------------------------------ */
 /* MMIO layout (4 KiB page)                                           */
@@ -264,6 +264,9 @@ static int ub_npu_validate_desc(const UbNpuBufferDescV1 *desc, uint32_t access)
     if (desc->bytes == 0) {
         return NPU_ERR_BAD_DESCRIPTOR;
     }
+    if (desc->access & ~NPU_ACCESS_READ_WRITE) {
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
     if ((desc->access & access) == 0) {
         return NPU_ERR_BAD_DESCRIPTOR;
     }
@@ -275,7 +278,7 @@ static int ub_npu_acquire_read(UbNpuState *s, const UbNpuBufferDescV1 *desc)
     int rc = ubc_gsva_device_read_acquire(s->ubc, &desc->key,
                                            s->device_cna,
                                            desc->gsva_base, desc->bytes,
-                                           0,
+                                           desc->access,
                                            desc->token_id, desc->token_value,
                                            &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) {
@@ -308,7 +311,7 @@ static int ub_npu_acquire_write(UbNpuState *s, const UbNpuBufferDescV1 *desc)
     int rc = ubc_gsva_device_write_acquire(s->ubc, &desc->key,
                                             s->device_cna,
                                             desc->gsva_base, desc->bytes,
-                                            0,
+                                            desc->access,
                                             desc->token_id, desc->token_value,
                                             &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) {

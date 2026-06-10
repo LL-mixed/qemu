@@ -547,6 +547,11 @@ int gsva_arm_mmu_translate_full(uint64_t va, bool is_write,
 int gsva_arm_mmu_translate(uint64_t va, bool is_write, uint32_t cpu_index);
 
 /* Device-side GSVA access wrappers (NPU, SSD, etc.) */
+#define UB_GSVA_DEVICE_ACCESS_READ       (1u << 0)
+#define UB_GSVA_DEVICE_ACCESS_WRITE      (1u << 1)
+#define UB_GSVA_DEVICE_ACCESS_READ_WRITE \
+    (UB_GSVA_DEVICE_ACCESS_READ | UB_GSVA_DEVICE_ACCESS_WRITE)
+
 int ubc_gsva_device_read_acquire(BusControllerDev *ubc,
                                  const GsvaKeyV1 *key,
                                  uint32_t requester_cna,

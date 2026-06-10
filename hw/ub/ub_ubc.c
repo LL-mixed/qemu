@@ -11162,6 +11162,16 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
 /* address_space read/write.                                           */
 /* ------------------------------------------------------------------ */
 
+static bool ubc_gsva_device_access_allows(uint32_t access_flags,
+                                          uint32_t required_access)
+{
+    if (access_flags & ~UB_GSVA_DEVICE_ACCESS_READ_WRITE) {
+        return false;
+    }
+
+    return (access_flags & required_access) == required_access;
+}
+
 int ubc_gsva_device_read_acquire(BusControllerDev *ubc,
                                  const GsvaKeyV1 *key,
                                  uint32_t requester_cna,
@@ -11177,6 +11187,13 @@ int ubc_gsva_device_read_acquire(BusControllerDev *ubc,
 
     if (!ubc || !key) {
         return GSVA_ERR_ROUTE_MISSING;
+    }
+    if (!ubc_gsva_device_access_allows(access_flags,
+                                       UB_GSVA_DEVICE_ACCESS_READ)) {
+        qemu_log("UB_DEV_GSVA: ReadAcquire denied by access_flags=%#" PRIx32
+                 " key.segment=%#" PRIx64 " cna=%#" PRIx32 "\n",
+                 access_flags, key->segment_id, requester_cna);
+        return GSVA_ERR_UNSUPPORTED_POLICY;
     }
 
     gsva_tables_init();
@@ -11212,8 +11229,10 @@ int ubc_gsva_device_read_acquire(BusControllerDev *ubc,
 
     if (rc == GSVA_OK) {
         qemu_log("UB_DEV_GSVA: ReadAcquire ok key.segment=%#" PRIx64
-                 " cna=%#" PRIx32 " va=%#" PRIx64 " len=%#" PRIx64 "\n",
-                 key->segment_id, requester_cna, access_va, access_len);
+                 " cna=%#" PRIx32 " va=%#" PRIx64 " len=%#" PRIx64
+                 " access_flags=%#" PRIx32 "\n",
+                 key->segment_id, requester_cna, access_va, access_len,
+                 access_flags);
     }
 
     return rc;
@@ -11234,6 +11253,13 @@ int ubc_gsva_device_write_acquire(BusControllerDev *ubc,
 
     if (!ubc || !key) {
         return GSVA_ERR_ROUTE_MISSING;
+    }
+    if (!ubc_gsva_device_access_allows(access_flags,
+                                       UB_GSVA_DEVICE_ACCESS_WRITE)) {
+        qemu_log("UB_DEV_GSVA: WriteAcquire denied by access_flags=%#" PRIx32
+                 " key.segment=%#" PRIx64 " cna=%#" PRIx32 "\n",
+                 access_flags, key->segment_id, requester_cna);
+        return GSVA_ERR_UNSUPPORTED_POLICY;
     }
 
     gsva_tables_init();
@@ -11269,8 +11295,10 @@ int ubc_gsva_device_write_acquire(BusControllerDev *ubc,
 
     if (rc == GSVA_OK) {
         qemu_log("UB_DEV_GSVA: WriteAcquire ok key.segment=%#" PRIx64
-                 " cna=%#" PRIx32 " va=%#" PRIx64 " len=%#" PRIx64 "\n",
-                 key->segment_id, requester_cna, access_va, access_len);
+                 " cna=%#" PRIx32 " va=%#" PRIx64 " len=%#" PRIx64
+                 " access_flags=%#" PRIx32 "\n",
+                 key->segment_id, requester_cna, access_va, access_len,
+                 access_flags);
     }
 
     return rc;
