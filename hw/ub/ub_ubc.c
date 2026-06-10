@@ -11168,6 +11168,8 @@ int ubc_gsva_device_read_acquire(BusControllerDev *ubc,
                                  uint64_t access_va,
                                  uint64_t access_len,
                                  uint32_t access_flags,
+                                 uint32_t cmd_token_id,
+                                 uint32_t cmd_token_value,
                                  uint64_t *pending_seq)
 {
     GsvaRouteEntry *route;
@@ -11188,8 +11190,8 @@ int ubc_gsva_device_read_acquire(BusControllerDev *ubc,
     }
 
     rc = gsva_route_validate_token(route, requester_cna,
-                                   route->token.token_id,
-                                   route->token.token_value,
+                                   cmd_token_id,
+                                   cmd_token_value,
                                    0 /* read */);
     if (rc != GSVA_OK) {
         return rc;
@@ -11201,8 +11203,8 @@ int ubc_gsva_device_read_acquire(BusControllerDev *ubc,
 
     rc = gsva_coh_read_acquire_tx(&g_gsva_coh, &g_gsva_routes,
                                   ubc, key, requester_cna,
-                                  route->token.token_id,
-                                  route->token.token_value);
+                                  cmd_token_id,
+                                  cmd_token_value);
     if (rc == GSVA_ERR_COH_PENDING && pending_seq) {
         GsvaCohObject *obj = gsva_coh_lookup(&g_gsva_coh, key);
         *pending_seq = obj ? obj->pending_seq : 0;
@@ -11223,6 +11225,8 @@ int ubc_gsva_device_write_acquire(BusControllerDev *ubc,
                                   uint64_t access_va,
                                   uint64_t access_len,
                                   uint32_t access_flags,
+                                  uint32_t cmd_token_id,
+                                  uint32_t cmd_token_value,
                                   uint64_t *pending_seq)
 {
     GsvaRouteEntry *route;
@@ -11243,8 +11247,8 @@ int ubc_gsva_device_write_acquire(BusControllerDev *ubc,
     }
 
     rc = gsva_route_validate_token(route, requester_cna,
-                                   route->token.token_id,
-                                   route->token.token_value,
+                                   cmd_token_id,
+                                   cmd_token_value,
                                    1 /* write */);
     if (rc != GSVA_OK) {
         return rc;
@@ -11256,8 +11260,8 @@ int ubc_gsva_device_write_acquire(BusControllerDev *ubc,
 
     rc = gsva_coh_write_acquire_tx(&g_gsva_coh, &g_gsva_routes,
                                    ubc, key, requester_cna,
-                                   route->token.token_id,
-                                   route->token.token_value);
+                                   cmd_token_id,
+                                   cmd_token_value);
     if (rc == GSVA_ERR_COH_PENDING && pending_seq) {
         GsvaCohObject *obj = gsva_coh_lookup(&g_gsva_coh, key);
         *pending_seq = obj ? obj->pending_seq : 0;

@@ -28,6 +28,7 @@
 /* NPU opcodes                                                         */
 /* ------------------------------------------------------------------ */
 
+#define NPU_OP_NOOP           0
 #define NPU_OP_MEMCOPY        1
 #define NPU_OP_FILL           2
 #define NPU_OP_VECTOR_ADD_U32 3
@@ -82,7 +83,7 @@
 /* NPU buffer descriptor (matches design doc ub_npu_buffer_desc_v1)    */
 /* ------------------------------------------------------------------ */
 
-typedef struct UbNpuBufferDescV1 {
+typedef struct QEMU_PACKED UbNpuBufferDescV1 {
     uint32_t role;
     uint32_t access;
     uint64_t gsva_base;
@@ -98,7 +99,7 @@ typedef struct UbNpuBufferDescV1 {
 
 #define NPU_MAX_DESCS 4
 
-typedef struct UbNpuCmdV1 {
+typedef struct QEMU_PACKED UbNpuCmdV1 {
     uint32_t version;
     uint32_t opcode;
     uint64_t req_id;
@@ -115,7 +116,7 @@ typedef struct UbNpuCmdV1 {
 /* NPU completion (matches design doc ub_npu_cpl_v1)                   */
 /* ------------------------------------------------------------------ */
 
-typedef struct UbNpuCplV1 {
+typedef struct QEMU_PACKED UbNpuCplV1 {
     uint32_t version;
     uint32_t status;
     uint64_t req_id;
@@ -124,6 +125,11 @@ typedef struct UbNpuCplV1 {
     uint64_t checksum64;
     uint64_t error_detail;
 } UbNpuCplV1;
+
+/* Compile-time layout checks: must match guest UAPI struct sizes */
+QEMU_BUILD_BUG_ON(sizeof(UbNpuBufferDescV1) != 104);
+QEMU_BUILD_BUG_ON(sizeof(UbNpuCmdV1) != 464);
+QEMU_BUILD_BUG_ON(sizeof(UbNpuCplV1) != 48);
 
 /* ------------------------------------------------------------------ */
 /* NPU stats                                                           */
@@ -197,6 +203,7 @@ static void ub_npu_poll_timer_cb(void *opaque);
 static const char *npu_opcode_name(uint32_t opcode)
 {
     switch (opcode) {
+    case NPU_OP_NOOP:            return "NOOP";
     case NPU_OP_MEMCOPY:        return "MEMCOPY";
     case NPU_OP_FILL:           return "FILL";
     case NPU_OP_VECTOR_ADD_U32: return "VECTOR_ADD_U32";
@@ -256,7 +263,9 @@ static int ub_npu_acquire_read(UbNpuState *s, const UbNpuBufferDescV1 *desc)
     int rc = ubc_gsva_device_read_acquire(s->ubc, &desc->key,
                                            s->device_cna,
                                            desc->gsva_base, desc->bytes,
-                                           0, &s->pending_seq);
+                                           0,
+                                           desc->token_id, desc->token_value,
+                                           &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) {
         s->stats.token_denied++;
         return NPU_ERR_TOKEN_DENIED;
@@ -286,7 +295,9 @@ static int ub_npu_acquire_write(UbNpuState *s, const UbNpuBufferDescV1 *desc)
     int rc = ubc_gsva_device_write_acquire(s->ubc, &desc->key,
                                             s->device_cna,
                                             desc->gsva_base, desc->bytes,
-                                            0, &s->pending_seq);
+                                            0,
+                                            desc->token_id, desc->token_value,
+                                            &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) {
         s->stats.token_denied++;
         return NPU_ERR_TOKEN_DENIED;
@@ -559,24 +570,23 @@ static void ub_npu_execute_command(UbNpuState *s)
     }
 
     switch (opcode) {
+    case NPU_OP_NOOP:
+        rc = NPU_OK;
+        break;
     case NPU_OP_MEMCOPY:
         s->stats.opcode_memcopy++;
-        if (cmd->desc_count == 0) { rc = NPU_OK; break; }
         rc = ub_npu_op_memcopy(s, cmd);
         break;
     case NPU_OP_FILL:
         s->stats.opcode_fill++;
-        if (cmd->desc_count == 0) { rc = NPU_OK; break; }
         rc = ub_npu_op_fill(s, cmd);
         break;
     case NPU_OP_VECTOR_ADD_U32:
         s->stats.opcode_vector_add_u32++;
-        if (cmd->desc_count == 0) { rc = NPU_OK; break; }
         rc = ub_npu_op_vector_add_u32(s, cmd);
         break;
     case NPU_OP_CHECKSUM64:
         s->stats.opcode_checksum64++;
-        if (cmd->desc_count == 0) { rc = NPU_OK; break; }
         rc = ub_npu_op_checksum64(s, cmd);
         break;
     default:
@@ -706,6 +716,10 @@ static void ub_npu_mmio_write(void *opaque, hwaddr offset,
     default:
         if (offset >= NPU_CMD_SLOT_OFF &&
             offset < NPU_CMD_SLOT_OFF + NPU_CMD_SLOT_SIZE) {
+            if (s->status & (NPU_STATUS_BUSY | NPU_STATUS_COMPLETION_VALID)) {
+                qemu_log("UB_NPU: cmd slot write rejected while busy\n");
+                return;
+            }
             uint64_t off = offset - NPU_CMD_SLOT_OFF;
             if (off + size <= sizeof(s->cmd)) {
                 uint8_t *p = (uint8_t *)&s->cmd + off;

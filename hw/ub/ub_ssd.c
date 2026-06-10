@@ -89,7 +89,7 @@ typedef enum UbSsdDurableState {
 /* SSD block ref (matches design doc ub_ssd_block_ref_v1)             */
 /* ------------------------------------------------------------------ */
 
-typedef struct UbSsdBlockRefV1 {
+typedef struct QEMU_PACKED UbSsdBlockRefV1 {
     uint64_t block_hi;
     uint64_t block_lo;
     uint64_t version;
@@ -102,7 +102,7 @@ typedef struct UbSsdBlockRefV1 {
 /* SSD buffer descriptor (matches design doc ub_ssd_buffer_desc_v1)   */
 /* ------------------------------------------------------------------ */
 
-typedef struct UbSsdBufferDescV1 {
+typedef struct QEMU_PACKED UbSsdBufferDescV1 {
     uint64_t gsva_base;
     uint64_t bytes;
     GsvaKeyV1 key;
@@ -114,7 +114,7 @@ typedef struct UbSsdBufferDescV1 {
 /* SSD command (matches design doc ub_ssd_cmd_v1)                      */
 /* ------------------------------------------------------------------ */
 
-typedef struct UbSsdCmdV1 {
+typedef struct QEMU_PACKED UbSsdCmdV1 {
     uint32_t version;
     uint32_t opcode;
     uint64_t req_id;
@@ -129,7 +129,7 @@ typedef struct UbSsdCmdV1 {
 /* SSD completion (matches design doc ub_ssd_cpl_v1)                   */
 /* ------------------------------------------------------------------ */
 
-typedef struct UbSsdCplV1 {
+typedef struct QEMU_PACKED UbSsdCplV1 {
     uint32_t version;
     uint32_t status;
     uint64_t req_id;
@@ -139,6 +139,12 @@ typedef struct UbSsdCplV1 {
     uint64_t checksum64;
     uint64_t error_detail;
 } UbSsdCplV1;
+
+/* Compile-time layout checks: must match guest UAPI struct sizes */
+QEMU_BUILD_BUG_ON(sizeof(UbSsdBufferDescV1) != 96);
+QEMU_BUILD_BUG_ON(sizeof(UbSsdBlockRefV1) != 48);
+QEMU_BUILD_BUG_ON(sizeof(UbSsdCmdV1) != 172);
+QEMU_BUILD_BUG_ON(sizeof(UbSsdCplV1) != 96);
 
 /* ------------------------------------------------------------------ */
 /* Memory backend structures                                           */
@@ -418,6 +424,7 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
 
     rc = ubc_gsva_device_read_acquire(s->ubc, &buf->key, s->device_cna,
                                        buf->gsva_base, buf->bytes, 0,
+                                       buf->token_id, buf->token_value,
                                        &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) return SSD_ERR_TOKEN_DENIED;
     if (rc == GSVA_ERR_STALE_EPOCH) return SSD_ERR_STALE_EPOCH;
@@ -529,6 +536,7 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
 
     rc = ubc_gsva_device_write_acquire(s->ubc, &buf->key, s->device_cna,
                                         buf->gsva_base, buf->bytes, 0,
+                                        buf->token_id, buf->token_value,
                                         &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) return SSD_ERR_TOKEN_DENIED;
     if (rc == GSVA_ERR_STALE_EPOCH) return SSD_ERR_STALE_EPOCH;
@@ -787,6 +795,10 @@ static void ub_ssd_mmio_write(void *opaque, hwaddr offset,
     default:
         if (offset >= SSD_CMD_SLOT_OFF &&
             offset < SSD_CMD_SLOT_OFF + SSD_CMD_SLOT_SIZE) {
+            if (s->status & (SSD_STATUS_BUSY | SSD_STATUS_COMPLETION_VALID)) {
+                qemu_log("UB_SSD: cmd slot write rejected while busy\n");
+                return;
+            }
             uint64_t off = offset - SSD_CMD_SLOT_OFF;
             if (off + size <= sizeof(s->cmd)) {
                 uint8_t *p = (uint8_t *)&s->cmd + off;
