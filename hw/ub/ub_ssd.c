@@ -638,7 +638,6 @@ static GHashTable *ub_ssd_parse_snapshot_json_to_backend(const uint8_t *data,
         uint64_t block_hi = 0;
         uint64_t block_lo = 0;
         uint64_t expected_version = 0;
-        uint32_t i = 0;
         bool first_version = true;
 
         if (!block_dict) {
@@ -965,6 +964,7 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
     UbSsdBlockRecord *latest;
     uint8_t *data;
     uint64_t data_len = buf->bytes;
+    uint64_t data_csum;
     int rc;
 
     if (ref->block_hi == 0 && ref->block_lo == 0) {
@@ -989,7 +989,7 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
         s->stats.coh_timeout++;
         return SSD_ERR_COH_TIMEOUT;
     }
-    if (rc == GSVA_ERR_COH_PENDING) return rc;
+    if (rc == GSVA_ERR_COH_PENDING) return SSD_INTERNAL_COH_PENDING;
     if (rc != GSVA_OK) return SSD_ERR_BAD_DESCRIPTOR;
 
     data = g_malloc(data_len);
@@ -1000,6 +1000,7 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
         return SSD_ERR_BAD_DESCRIPTOR;
     }
     s->stats.bytes_read_from_gsva += data_len;
+    data_csum = ub_ssd_checksum64(data, data_len);
 
     chain = ub_ssd_find_chain(s, ref->block_hi, ref->block_lo);
     latest = ub_ssd_latest_record(chain);
@@ -1014,6 +1015,7 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
                               UB_SSD_DURABLE_COMMITTED, cmd->source_cna, 0);
         s->cpl.committed_ref = *ref;
         s->cpl.committed_ref.version = 1;
+        s->cpl.committed_ref.checksum64 = data_csum;
     } else {
         if (!chain || !latest) {
             g_free(data);
@@ -1036,12 +1038,13 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
                               UB_SSD_DURABLE_COMMITTED, cmd->source_cna, 0);
         s->cpl.committed_ref = *ref;
         s->cpl.committed_ref.version = new_version;
+        s->cpl.committed_ref.checksum64 = data_csum;
     }
 
     s->stats.bytes_written_to_backend += data_len;
     s->stats.block_write++;
     s->cpl.bytes_written = data_len;
-    s->cpl.checksum64 = ub_ssd_checksum64(data, data_len);
+    s->cpl.checksum64 = data_csum;
     g_free(data);
 
     return SSD_OK;
@@ -1093,6 +1096,10 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
         s->stats.checksum_error++;
         return SSD_ERR_CHECKSUM;
     }
+    if (ref->checksum64 != 0 && ref->checksum64 != actual_csum) {
+        s->stats.checksum_error++;
+        return SSD_ERR_CHECKSUM;
+    }
 
     rc = ubc_gsva_device_write_acquire(s->ubc, &buf->key, s->device_cna,
                                         buf->gsva_base, buf->bytes,
@@ -1112,7 +1119,7 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
         s->stats.coh_timeout++;
         return SSD_ERR_COH_TIMEOUT;
     }
-    if (rc == GSVA_ERR_COH_PENDING) return rc;
+    if (rc == GSVA_ERR_COH_PENDING) return SSD_INTERNAL_COH_PENDING;
     if (rc != GSVA_OK) return SSD_ERR_BAD_DESCRIPTOR;
 
     rc = ubc_gsva_device_write(s->ubc, &buf->key, s->device_cna,
