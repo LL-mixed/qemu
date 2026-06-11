@@ -444,6 +444,9 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
     char *ubc_nodename;
     char *ummu_nodename;
     const char *ssd_backend_profile = "memory";
+    const char *skip_devices = g_getenv("UB_SIM_SKIP_DEVICES");
+    bool create_npu = !skip_devices || !strstr(skip_devices, "npu");
+    bool create_ssd = !skip_devices || !strstr(skip_devices, "ssd");
 
     qemu_fdt_setprop_u64(ms->fdt, "/chosen", "linux,ubios-information-table",
                          vms->memmap[VIRT_UBIOS_INFO_TABLE].base);
@@ -478,11 +481,11 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
         g_free(ummu_nodename);
         g_free(ubc_nodename);
 
-        /* NPU FDT node */
-    {
-        char *npu_nodename;
-        uint32_t npu_cna;
-        uint64_t npu_base = vms->memmap[VIRT_UBC_BASE_REG].base + 0x20000000ULL;
+        if (create_npu) {
+            char *npu_nodename;
+            uint32_t npu_cna;
+            uint64_t npu_base = vms->memmap[VIRT_UBC_BASE_REG].base + 0x20000000ULL;
+
             npu_nodename = g_strdup_printf("/ub-npu@%" PRIx64, npu_base);
             qemu_fdt_add_subnode(ms->fdt, npu_nodename);
             qemu_fdt_setprop_string(ms->fdt, npu_nodename, "compatible", "ub-sim,npu-v1");
@@ -497,11 +500,11 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
             g_free(npu_nodename);
         }
 
-        /* SSD FDT node */
-        {
+        if (create_ssd) {
             char *ssd_nodename;
             uint32_t ssd_cna;
             uint64_t ssd_base = vms->memmap[VIRT_UBC_BASE_REG].base + 0x20001000ULL;
+
             ssd_nodename = g_strdup_printf("/ub-ssd@%" PRIx64, ssd_base);
             qemu_fdt_add_subnode(ms->fdt, ssd_nodename);
             qemu_fdt_setprop_string(ms->fdt, ssd_nodename, "compatible", "ub-sim,ssd-v1");
