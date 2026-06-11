@@ -278,6 +278,7 @@ struct UbSsdState {
     /* Memory backend */
     GHashTable *backend;
     uint32_t backend_profile;
+    char *backend_name;
     char *backend_profile_name;
 
     /* Stats */
@@ -1464,6 +1465,7 @@ static const MemoryRegionOps ub_ssd_mmio_ops = {
 static void ub_ssd_realize(DeviceState *dev, Error **errp)
 {
     UbSsdState *s = UB_SSD(dev);
+    const char *backend_profile_name;
 
     if (!s->ubc) {
         error_setg(errp, "ub-ssd: missing 'ubc' link property");
@@ -1478,9 +1480,18 @@ static void ub_ssd_realize(DeviceState *dev, Error **errp)
                                         ub_ssd_block_key_equal,
                                         ub_ssd_block_key_free,
                                         ub_ssd_block_chain_free);
-    s->backend_profile = ub_ssd_parse_backend_profile(s->backend_profile_name);
+    if (s->backend_name && s->backend_profile_name &&
+        g_strcmp0(s->backend_name, s->backend_profile_name) != 0) {
+        error_setg(errp, "ub-ssd: backend and backend-profile differ");
+        return;
+    }
+    backend_profile_name = s->backend_profile_name ?: s->backend_name;
+    s->backend_profile = ub_ssd_parse_backend_profile(backend_profile_name);
+    if (!backend_profile_name) {
+        backend_profile_name = UB_SSD_BACKEND_PROFILE_MEMORY;
+    }
     if (!s->backend_profile_name) {
-        s->backend_profile_name = g_strdup(UB_SSD_BACKEND_PROFILE_MEMORY);
+        s->backend_profile_name = g_strdup(backend_profile_name);
     }
 
     s->status = SSD_STATUS_READY;
@@ -1523,12 +1534,17 @@ static void ub_ssd_finalize(Object *obj)
         g_hash_table_destroy(s->backend);
         s->backend = NULL;
     }
+    g_free(s->backend_name);
+    s->backend_name = NULL;
+    g_free(s->backend_profile_name);
+    s->backend_profile_name = NULL;
 }
 
 static Property ub_ssd_properties[] = {
     DEFINE_PROP_UINT32("node-id", UbSsdState, node_id, 0),
     DEFINE_PROP_UINT32("instance-id", UbSsdState, instance_id, 0),
     DEFINE_PROP_UINT32("cna", UbSsdState, device_cna, 0),
+    DEFINE_PROP_STRING("backend", UbSsdState, backend_name),
     DEFINE_PROP_STRING("backend-profile", UbSsdState, backend_profile_name),
     DEFINE_PROP_LINK("ubc", UbSsdState, ubc,
                      TYPE_BUS_CONTROLLER_DEV, BusControllerDev *),
