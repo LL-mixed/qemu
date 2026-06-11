@@ -1413,6 +1413,7 @@ static void ub_ssd_mmio_write(void *opaque, hwaddr offset,
                 s->cpl.version = 1;
                 s->cpl.status = SSD_ERR_DEVICE_BUSY;
                 s->cpl.req_id = s->cmd.req_id;
+                s->status |= SSD_STATUS_COMPLETION_VALID;
             }
             s->status |= SSD_STATUS_ERROR;
             s->error_reg = (uint32_t)(-SSD_ERR_DEVICE_BUSY);

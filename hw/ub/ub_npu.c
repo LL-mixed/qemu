@@ -797,6 +797,7 @@ static void ub_npu_mmio_write(void *opaque, hwaddr offset,
                 s->cpl.version = 1;
                 s->cpl.status = NPU_ERR_DEVICE_BUSY;
                 s->cpl.req_id = s->cmd.req_id;
+                s->status |= NPU_STATUS_COMPLETION_VALID;
             }
             s->status |= NPU_STATUS_ERROR;
             s->error_reg = (uint32_t)(-NPU_ERR_DEVICE_BUSY);
