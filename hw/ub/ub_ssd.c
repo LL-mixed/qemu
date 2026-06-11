@@ -1015,6 +1015,8 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
                               UB_SSD_DURABLE_COMMITTED, cmd->source_cna, 0);
         s->cpl.committed_ref = *ref;
         s->cpl.committed_ref.version = 1;
+        s->cpl.committed_ref.offset = 0;
+        s->cpl.committed_ref.bytes = data_len;
         s->cpl.committed_ref.checksum64 = data_csum;
     } else {
         if (!chain || !latest) {
@@ -1038,6 +1040,8 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
                               UB_SSD_DURABLE_COMMITTED, cmd->source_cna, 0);
         s->cpl.committed_ref = *ref;
         s->cpl.committed_ref.version = new_version;
+        s->cpl.committed_ref.offset = 0;
+        s->cpl.committed_ref.bytes = data_len;
         s->cpl.committed_ref.checksum64 = data_csum;
     }
 
@@ -1137,6 +1141,10 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
     s->stats.block_read++;
     s->cpl.bytes_read = read_len;
     s->cpl.checksum64 = actual_csum;
+    s->cpl.committed_ref = *ref;
+    s->cpl.committed_ref.version = target->version;
+    s->cpl.committed_ref.bytes = read_len;
+    s->cpl.committed_ref.checksum64 = actual_csum;
 
     return SSD_OK;
 }
@@ -1168,6 +1176,8 @@ static int ub_ssd_op_block_seal(UbSsdState *s, UbSsdCmdV1 *cmd)
     s->cpl.committed_ref.block_hi = ref->block_hi;
     s->cpl.committed_ref.block_lo = ref->block_lo;
     s->cpl.committed_ref.version = latest->version;
+    s->cpl.committed_ref.bytes = latest->byte_count;
+    s->cpl.committed_ref.checksum64 = latest->checksum64;
     return SSD_OK;
 }
 
@@ -1195,6 +1205,8 @@ static int ub_ssd_op_block_tombstone(UbSsdState *s, UbSsdCmdV1 *cmd)
     s->cpl.committed_ref.block_hi = ref->block_hi;
     s->cpl.committed_ref.block_lo = ref->block_lo;
     s->cpl.committed_ref.version = latest->version;
+    s->cpl.committed_ref.bytes = latest->byte_count;
+    s->cpl.committed_ref.checksum64 = latest->checksum64;
     return SSD_OK;
 }
 
