@@ -42,6 +42,8 @@
 #define SSD_OP_EXPORT_SNAPSHOT 7
 #define SSD_OP_IMPORT_SNAPSHOT 8
 
+#define SSD_CMD_INJECT_COH_TIMEOUT (1u << 0)
+
 /* ------------------------------------------------------------------ */
 /* SSD completion status codes                                         */
 /* ------------------------------------------------------------------ */
@@ -1269,6 +1271,11 @@ static void ub_ssd_execute_command(UbSsdState *s)
 
         if (cmd->version != 1) {
             ub_ssd_complete_command(s, SSD_ERR_BAD_VERSION);
+            return;
+        }
+        if (cmd->flags & SSD_CMD_INJECT_COH_TIMEOUT) {
+            s->stats.coh_timeout++;
+            ub_ssd_complete_command(s, SSD_ERR_COH_TIMEOUT);
             return;
         }
 

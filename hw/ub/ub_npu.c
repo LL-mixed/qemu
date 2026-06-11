@@ -69,6 +69,7 @@
 #define NPU_ACCESS_READ_WRITE UB_GSVA_DEVICE_ACCESS_READ_WRITE
 
 #define NPU_CMD_ALLOW_TRUNCATE (1u << 0)
+#define NPU_CMD_INJECT_COH_TIMEOUT (1u << 1)
 
 /* ------------------------------------------------------------------ */
 /* MMIO layout (4 KiB page)                                           */
@@ -662,6 +663,11 @@ static void ub_npu_execute_command(UbNpuState *s)
 
         if (cmd->version != 1) {
             ub_npu_complete_command(s, NPU_ERR_BAD_VERSION);
+            return;
+        }
+        if (cmd->flags & NPU_CMD_INJECT_COH_TIMEOUT) {
+            s->stats.coh_timeout++;
+            ub_npu_complete_command(s, NPU_ERR_COH_TIMEOUT);
             return;
         }
 
