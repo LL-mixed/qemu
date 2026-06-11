@@ -248,6 +248,27 @@ GsvaRouteEntry *gsva_route_lookup_tombstone(GsvaRouteTable *tbl,
     return NULL;
 }
 
+GsvaRouteEntry *gsva_route_lookup_home_va(GsvaRouteTable *tbl,
+                                          uint64_t va, uint64_t len)
+{
+    GsvaRouteEntry *entry;
+
+    if (!tbl) {
+        return NULL;
+    }
+
+    QTAILQ_FOREACH(entry, &tbl->routes, next) {
+        if (entry->state != GSVA_ROUTE_ACTIVE) {
+            continue;
+        }
+        if (va >= entry->key.home_va &&
+            va + len <= entry->key.home_va + entry->key.size) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
 int gsva_route_validate_token(const GsvaRouteEntry *route,
                               uint32_t requester_cna,
                               uint32_t token_id, uint32_t token_value,

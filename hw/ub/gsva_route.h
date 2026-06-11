@@ -106,6 +106,11 @@ GsvaRouteEntry *gsva_route_lookup_base(GsvaRouteTable *tbl,
 GsvaRouteEntry *gsva_route_lookup_tombstone(GsvaRouteTable *tbl,
                                             const GsvaKeyV1 *key);
 
+/* Lookup route by home_va range on the exporter (home) node.
+   Finds the local export whose key.home_va covers the given VA. */
+GsvaRouteEntry *gsva_route_lookup_home_va(GsvaRouteTable *tbl,
+                                          uint64_t va, uint64_t len);
+
 /* Validate token for a route. Returns GSVA_OK or GSVA_ERR_TOKEN_DENIED. */
 int gsva_route_validate_token(const GsvaRouteEntry *route,
                               uint32_t requester_cna,
