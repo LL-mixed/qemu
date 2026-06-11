@@ -1060,6 +1060,9 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
     const UbSsdBlockRefV1 *ref = &cmd->block_ref;
     UbSsdBlockChain *chain;
     UbSsdBlockRecord *target = NULL;
+    uint64_t read_len;
+    uint64_t actual_csum;
+    uint64_t range_csum;
     int rc;
 
     if (ref->block_hi == 0 && ref->block_lo == 0) {
@@ -1089,18 +1092,25 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
         return SSD_ERR_TOMBSTONED;
     }
 
-    uint64_t read_len = MIN(target->byte_count, buf->bytes);
-    if (ref->offset + read_len > target->byte_count) {
+    if (ref->offset > target->byte_count) {
         return SSD_ERR_BAD_BLOCK;
+    }
+    read_len = ref->bytes ? ref->bytes : target->byte_count - ref->offset;
+    if (read_len > target->byte_count - ref->offset) {
+        return SSD_ERR_BAD_BLOCK;
+    }
+    if (read_len > buf->bytes) {
+        return SSD_ERR_BAD_DESCRIPTOR;
     }
 
     /* Validate checksum */
-    uint64_t actual_csum = ub_ssd_checksum64(target->bytes, target->byte_count);
+    actual_csum = ub_ssd_checksum64(target->bytes, target->byte_count);
     if (actual_csum != target->checksum64) {
         s->stats.checksum_error++;
         return SSD_ERR_CHECKSUM;
     }
-    if (ref->checksum64 != 0 && ref->checksum64 != actual_csum) {
+    range_csum = ub_ssd_checksum64(target->bytes + ref->offset, read_len);
+    if (ref->checksum64 != 0 && ref->checksum64 != range_csum) {
         s->stats.checksum_error++;
         return SSD_ERR_CHECKSUM;
     }
@@ -1140,11 +1150,11 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
     s->stats.bytes_written_to_gsva += read_len;
     s->stats.block_read++;
     s->cpl.bytes_read = read_len;
-    s->cpl.checksum64 = actual_csum;
+    s->cpl.checksum64 = range_csum;
     s->cpl.committed_ref = *ref;
     s->cpl.committed_ref.version = target->version;
     s->cpl.committed_ref.bytes = read_len;
-    s->cpl.committed_ref.checksum64 = actual_csum;
+    s->cpl.committed_ref.checksum64 = range_csum;
 
     return SSD_OK;
 }
