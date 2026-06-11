@@ -68,6 +68,8 @@
 #define NPU_ACCESS_WRITE      UB_GSVA_DEVICE_ACCESS_WRITE
 #define NPU_ACCESS_READ_WRITE UB_GSVA_DEVICE_ACCESS_READ_WRITE
 
+#define NPU_CMD_ALLOW_TRUNCATE (1u << 0)
+
 /* ------------------------------------------------------------------ */
 /* MMIO layout (4 KiB page)                                           */
 /* ------------------------------------------------------------------ */
@@ -390,8 +392,8 @@ static int ub_npu_op_memcopy(UbNpuState *s, UbNpuCmdV1 *cmd)
     void *tmp;
     int rc;
 
-    if (cmd->desc_count < 2) {
-        qemu_log("UB_NPU_DESC: MEMCOPY desc_count=%" PRIu32 " < 2\n",
+    if (cmd->desc_count != 2) {
+        qemu_log("UB_NPU_DESC: MEMCOPY desc_count=%" PRIu32 " want 2\n",
                  cmd->desc_count);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
@@ -406,6 +408,14 @@ static int ub_npu_op_memcopy(UbNpuState *s, UbNpuCmdV1 *cmd)
     if (rc != NPU_OK) return rc;
     rc = ub_npu_validate_desc(output, NPU_ACCESS_WRITE);
     if (rc != NPU_OK) return rc;
+
+    if (input->bytes != output->bytes &&
+        !(cmd->flags & NPU_CMD_ALLOW_TRUNCATE)) {
+        qemu_log("UB_NPU_DESC: MEMCOPY size mismatch input=%#" PRIx64
+                 " output=%#" PRIx64 " flags=%#" PRIx32 "\n",
+                 input->bytes, output->bytes, cmd->flags);
+        return NPU_ERR_BAD_DESCRIPTOR;
+    }
 
     copy_len = MIN(input->bytes, output->bytes);
 
@@ -451,8 +461,8 @@ static int ub_npu_op_fill(UbNpuState *s, UbNpuCmdV1 *cmd)
     uint8_t *buf;
     int rc;
 
-    if (cmd->desc_count < 1) {
-        qemu_log("UB_NPU_DESC: FILL desc_count=%" PRIu32 " < 1\n",
+    if (cmd->desc_count != 1) {
+        qemu_log("UB_NPU_DESC: FILL desc_count=%" PRIu32 " want 1\n",
                  cmd->desc_count);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
@@ -501,8 +511,8 @@ static int ub_npu_op_vector_add_u32(UbNpuState *s, UbNpuCmdV1 *cmd)
     uint32_t *a, *b, *c;
     int rc;
 
-    if (cmd->desc_count < 3) {
-        qemu_log("UB_NPU_DESC: VECTOR_ADD desc_count=%" PRIu32 " < 3\n",
+    if (cmd->desc_count != 3) {
+        qemu_log("UB_NPU_DESC: VECTOR_ADD desc_count=%" PRIu32 " want 3\n",
                  cmd->desc_count);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
@@ -588,8 +598,8 @@ static int ub_npu_op_checksum64(UbNpuState *s, UbNpuCmdV1 *cmd)
     uint8_t *buf;
     int rc;
 
-    if (cmd->desc_count < 1) {
-        qemu_log("UB_NPU_DESC: CHECKSUM desc_count=%" PRIu32 " < 1\n",
+    if (cmd->desc_count != 1) {
+        qemu_log("UB_NPU_DESC: CHECKSUM desc_count=%" PRIu32 " want 1\n",
                  cmd->desc_count);
         return NPU_ERR_BAD_DESCRIPTOR;
     }
