@@ -774,6 +774,7 @@ static int ub_ssd_load_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV1
                                       buf->token_id, buf->token_value,
                                       &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) {
+        s->stats.token_denied++;
         return SSD_ERR_TOKEN_DENIED;
     }
     if (rc == GSVA_ERR_STALE_EPOCH) {
@@ -783,6 +784,10 @@ static int ub_ssd_load_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV1
     if (rc == GSVA_ERR_SEGMENT_RETIRED) {
         s->stats.retired_segment++;
         return SSD_ERR_SEGMENT_RETIRED;
+    }
+    if (rc == GSVA_ERR_COH_TIMEOUT) {
+        s->stats.coh_timeout++;
+        return SSD_ERR_COH_TIMEOUT;
     }
     if (rc == GSVA_ERR_COH_PENDING) {
         return SSD_INTERNAL_COH_PENDING;
@@ -809,6 +814,7 @@ static int ub_ssd_store_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV
                                        buf->token_id, buf->token_value,
                                        &s->pending_seq);
     if (rc == GSVA_ERR_TOKEN_DENIED) {
+        s->stats.token_denied++;
         return SSD_ERR_TOKEN_DENIED;
     }
     if (rc == GSVA_ERR_STALE_EPOCH) {
@@ -818,6 +824,10 @@ static int ub_ssd_store_u8_buffer_via_gsva(UbSsdState *s, const UbSsdBufferDescV
     if (rc == GSVA_ERR_SEGMENT_RETIRED) {
         s->stats.retired_segment++;
         return SSD_ERR_SEGMENT_RETIRED;
+    }
+    if (rc == GSVA_ERR_COH_TIMEOUT) {
+        s->stats.coh_timeout++;
+        return SSD_ERR_COH_TIMEOUT;
     }
     if (rc == GSVA_ERR_COH_PENDING) {
         return SSD_INTERNAL_COH_PENDING;
@@ -946,10 +956,19 @@ static void ub_ssd_complete_command(UbSsdState *s, uint32_t status)
 
     qemu_log("UB_SSD_CPL: req_id=%#" PRIx64 " status=%" PRId32
              " opcode=%s bytes_read=%#" PRIx64
-             " bytes_written=%#" PRIx64 "\n",
+             " bytes_written=%#" PRIx64
+             " token_denied=%" PRIu64
+             " stale_epoch=%" PRIu64
+             " retired_segment=%" PRIu64
+             " coh_timeout=%" PRIu64
+             " checksum_error=%" PRIu64
+             " version_conflict=%" PRIu64 "\n",
              s->cpl.req_id, status,
              ssd_opcode_name(s->cmd.opcode),
-             s->cpl.bytes_read, s->cpl.bytes_written);
+             s->cpl.bytes_read, s->cpl.bytes_written,
+             s->stats.token_denied, s->stats.stale_epoch,
+             s->stats.retired_segment, s->stats.coh_timeout,
+             s->stats.checksum_error, s->stats.version_conflict);
 }
 
 /* ------------------------------------------------------------------ */
@@ -976,7 +995,10 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
                                        UB_GSVA_DEVICE_ACCESS_READ,
                                        buf->token_id, buf->token_value,
                                        &s->pending_seq);
-    if (rc == GSVA_ERR_TOKEN_DENIED) return SSD_ERR_TOKEN_DENIED;
+    if (rc == GSVA_ERR_TOKEN_DENIED) {
+        s->stats.token_denied++;
+        return SSD_ERR_TOKEN_DENIED;
+    }
     if (rc == GSVA_ERR_STALE_EPOCH) {
         s->stats.stale_epoch++;
         return SSD_ERR_STALE_EPOCH;
@@ -1120,7 +1142,10 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
                                         UB_GSVA_DEVICE_ACCESS_WRITE,
                                         buf->token_id, buf->token_value,
                                         &s->pending_seq);
-    if (rc == GSVA_ERR_TOKEN_DENIED) return SSD_ERR_TOKEN_DENIED;
+    if (rc == GSVA_ERR_TOKEN_DENIED) {
+        s->stats.token_denied++;
+        return SSD_ERR_TOKEN_DENIED;
+    }
     if (rc == GSVA_ERR_STALE_EPOCH) {
         s->stats.stale_epoch++;
         return SSD_ERR_STALE_EPOCH;

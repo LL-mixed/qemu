@@ -251,10 +251,16 @@ static void ub_npu_complete_command(UbNpuState *s, uint32_t status)
 
     qemu_log("UB_NPU_CPL: req_id=%#" PRIx64 " status=%" PRId32
              " opcode=%s bytes_read=%#" PRIx64
-             " bytes_written=%#" PRIx64 "\n",
+             " bytes_written=%#" PRIx64
+             " token_denied=%" PRIu64
+             " stale_epoch=%" PRIu64
+             " retired_segment=%" PRIu64
+             " coh_timeout=%" PRIu64 "\n",
              s->cpl.req_id, status,
              npu_opcode_name(s->cmd.opcode),
-             s->cpl.bytes_read, s->cpl.bytes_written);
+             s->cpl.bytes_read, s->cpl.bytes_written,
+             s->stats.token_denied, s->stats.stale_epoch,
+             s->stats.retired_segment, s->stats.coh_timeout);
 }
 
 /* ------------------------------------------------------------------ */
