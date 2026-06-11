@@ -99,8 +99,8 @@ typedef enum UbSsdDurableState {
 #define SSD_CLEAR_CPL_OFF    0x514
 #define SSD_LAST_REQ_ID_OFF  0x518
 #define SSD_STATS_OFF        0x520
-#define SSD_STATS_SIZE       0x090
-#define SSD_BACKEND_PROFILE_OFF 0x5a0
+#define SSD_STATS_SIZE       0x098
+#define SSD_BACKEND_PROFILE_OFF 0x5c0
 
 /* ------------------------------------------------------------------ */
 /* SSD block ref (matches design doc ub_ssd_block_ref_v1)             */
