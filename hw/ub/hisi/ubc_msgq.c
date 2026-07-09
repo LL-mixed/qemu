@@ -876,6 +876,38 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
                 continue;
             }
             case UBC_MSG_SUB_SIM_DEC_BATCH: {
+                if (payload_len >= sizeof(uint32_t)) {
+                    uint32_t magic = 0;
+
+                    memcpy(&magic, payload, sizeof(magic));
+                    if (magic == UBC_UB_SSD_READ_REQ_MAGIC) {
+                        if (payload_len >= sizeof(UBCUbSsdReadReqPld)) {
+                            const UBCUbSsdReadReqPld *req =
+                                (const UBCUbSsdReadReqPld *)payload;
+
+                            ub_ssd_handle_remote_read_request(s->ubc_dev, req,
+                                                               header->nth.scna);
+                        }
+                        g_free(buf);
+                        continue;
+                    }
+                    if (magic == UBC_UB_SSD_READ_RESP_MAGIC) {
+                        if (payload_len >= sizeof(UBCUbSsdReadRespPldHdr)) {
+                            const UBCUbSsdReadRespPldHdr *resp =
+                                (const UBCUbSsdReadRespPldHdr *)payload;
+                            const uint8_t *rd_data = payload + sizeof(*resp);
+                            uint32_t rd_len = payload_len - sizeof(*resp);
+
+                            ubc_handle_ub_ssd_rx_read_resp(s->ubc_dev,
+                                                           resp,
+                                                           rd_data,
+                                                           rd_len,
+                                                           header->nth.scna);
+                        }
+                        g_free(buf);
+                        continue;
+                    }
+                }
                 if (payload_len >= sizeof(SimDecBatchHdr)) {
                     const SimDecBatchHdr *batch_hdr = (const SimDecBatchHdr *)payload;
                     size_t header_len = sizeof(SimDecBatchHdr) +

@@ -101,6 +101,7 @@ typedef enum UbSsdDurableState {
 #define SSD_STATS_OFF        0x520
 #define SSD_STATS_SIZE       0x098
 #define SSD_BACKEND_PROFILE_OFF 0x5c0
+#define UB_SSD_REMOTE_MSG_PAYLOAD_MAX 4095U
 
 /* ------------------------------------------------------------------ */
 /* SSD block ref (matches design doc ub_ssd_block_ref_v1)             */
@@ -250,6 +251,8 @@ static uint32_t ub_ssd_parse_backend_profile(const char *profile)
 #define TYPE_UB_SSD "ub-ssd"
 OBJECT_DECLARE_SIMPLE_TYPE(UbSsdState, UB_SSD)
 
+static GList *g_ub_ssd_devices;
+
 struct UbSsdState {
     SysBusDevice parent_obj;
 
@@ -286,6 +289,21 @@ struct UbSsdState {
     /* Stats */
     UbSsdStats stats;
 };
+
+static UbSsdState *ub_ssd_find_by_cna(uint32_t cna)
+{
+    GList *it;
+    uint32_t want = cna & 0x00ffffffU;
+
+    for (it = g_ub_ssd_devices; it; it = it->next) {
+        UbSsdState *s = it->data;
+
+        if (s && ((s->device_cna & 0x00ffffffU) == want)) {
+            return s;
+        }
+    }
+    return NULL;
+}
 
 /* ------------------------------------------------------------------ */
 /* Forward declarations                                                */
@@ -1079,18 +1097,20 @@ static int ub_ssd_op_block_write(UbSsdState *s, UbSsdCmdV1 *cmd)
     return SSD_OK;
 }
 
-static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
+static int ub_ssd_resolve_read_target(UbSsdState *s,
+                                      const UbSsdBlockRefV1 *ref,
+                                      UbSsdBlockRecord **target_out,
+                                      uint64_t *read_len_out,
+                                      uint64_t *range_csum_out)
 {
-    const UbSsdBufferDescV1 *buf = &cmd->buffer;
-    const UbSsdBlockRefV1 *ref = &cmd->block_ref;
     UbSsdBlockChain *chain;
     UbSsdBlockRecord *target = NULL;
     uint64_t read_len;
     uint64_t actual_csum;
     uint64_t range_csum;
-    int rc;
 
-    if (ref->block_hi == 0 && ref->block_lo == 0) {
+    if (!s || !ref || !target_out || !read_len_out || !range_csum_out ||
+        (ref->block_hi == 0 && ref->block_lo == 0)) {
         return SSD_ERR_BAD_BLOCK;
     }
 
@@ -1116,7 +1136,6 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
     if (target->durable_state == UB_SSD_DURABLE_TOMBSTONED) {
         return SSD_ERR_TOMBSTONED;
     }
-
     if (ref->offset > target->byte_count) {
         return SSD_ERR_BAD_BLOCK;
     }
@@ -1124,11 +1143,7 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
     if (read_len > target->byte_count - ref->offset) {
         return SSD_ERR_BAD_BLOCK;
     }
-    if (read_len > buf->bytes) {
-        return SSD_ERR_BAD_DESCRIPTOR;
-    }
 
-    /* Validate checksum */
     actual_csum = ub_ssd_checksum64(target->bytes, target->byte_count);
     if (actual_csum != target->checksum64) {
         s->stats.checksum_error++;
@@ -1138,6 +1153,148 @@ static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
     if (ref->checksum64 != 0 && ref->checksum64 != range_csum) {
         s->stats.checksum_error++;
         return SSD_ERR_CHECKSUM;
+    }
+
+    *target_out = target;
+    *read_len_out = read_len;
+    *range_csum_out = range_csum;
+    return SSD_OK;
+}
+
+static int ub_ssd_op_remote_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
+{
+    const UbSsdBufferDescV1 *buf = &cmd->buffer;
+    const UbSsdBlockRefV1 *ref = &cmd->block_ref;
+    UBCUbSsdBlockRefPld remote_ref;
+    uint8_t *data;
+    uint64_t read_len = ref->bytes;
+    uint64_t block_version = 0;
+    uint64_t block_bytes = 0;
+    uint64_t checksum64 = 0;
+    uint64_t range_csum;
+    int rc;
+
+    if (read_len == 0 || read_len > buf->bytes) {
+        return SSD_ERR_BAD_BLOCK;
+    }
+
+    memset(&remote_ref, 0, sizeof(remote_ref));
+    remote_ref.block_hi = ref->block_hi;
+    remote_ref.block_lo = ref->block_lo;
+    remote_ref.version = ref->version;
+    remote_ref.offset = ref->offset;
+    remote_ref.bytes = ref->bytes;
+    remote_ref.checksum64 = ref->checksum64;
+
+    data = g_malloc(read_len);
+    rc = ubc_ub_ssd_remote_block_read(s->ubc,
+                                      cmd->target_ssd_cna,
+                                      s->device_cna,
+                                      &remote_ref,
+                                      data,
+                                      (uint32_t)read_len,
+                                      &block_version,
+                                      &block_bytes,
+                                      &checksum64);
+    if (rc != 0) {
+        g_free(data);
+        if (rc <= SSD_ERR_BAD_VERSION && rc >= SSD_ERR_BAD_SNAPSHOT) {
+            return rc;
+        }
+        return SSD_ERR_BACKEND_IO;
+    }
+    range_csum = ub_ssd_checksum64(data, read_len);
+    if ((ref->checksum64 != 0 && range_csum != ref->checksum64) ||
+        (checksum64 != 0 && checksum64 != range_csum) ||
+        (block_bytes != 0 && block_bytes != read_len)) {
+        s->stats.checksum_error++;
+        g_free(data);
+        return SSD_ERR_CHECKSUM;
+    }
+
+    rc = ubc_gsva_device_write_acquire(s->ubc, &buf->key, s->device_cna,
+                                        buf->gsva_base, buf->bytes,
+                                        UB_GSVA_DEVICE_ACCESS_WRITE,
+                                        buf->token_id, buf->token_value,
+                                        &s->pending_seq);
+    if (rc == GSVA_ERR_TOKEN_DENIED) {
+        s->stats.token_denied++;
+        g_free(data);
+        return SSD_ERR_TOKEN_DENIED;
+    }
+    if (rc == GSVA_ERR_STALE_EPOCH) {
+        s->stats.stale_epoch++;
+        g_free(data);
+        return SSD_ERR_STALE_EPOCH;
+    }
+    if (rc == GSVA_ERR_SEGMENT_RETIRED) {
+        s->stats.retired_segment++;
+        g_free(data);
+        return SSD_ERR_SEGMENT_RETIRED;
+    }
+    if (rc == GSVA_ERR_COH_TIMEOUT) {
+        s->stats.coh_timeout++;
+        g_free(data);
+        return SSD_ERR_COH_TIMEOUT;
+    }
+    if (rc == GSVA_ERR_COH_PENDING) {
+        g_free(data);
+        return SSD_INTERNAL_COH_PENDING;
+    }
+    if (rc != GSVA_OK) {
+        g_free(data);
+        return SSD_ERR_BAD_DESCRIPTOR;
+    }
+
+    rc = ubc_gsva_device_write(s->ubc, &buf->key, s->device_cna,
+                                buf->gsva_base, data, read_len);
+    if (rc != GSVA_OK) {
+        g_free(data);
+        return SSD_ERR_BAD_DESCRIPTOR;
+    }
+    ubc_gsva_device_fence(s->ubc, &buf->key, s->device_cna,
+                          buf->gsva_base, read_len);
+
+    s->stats.bytes_read_from_backend += read_len;
+    s->stats.bytes_written_to_gsva += read_len;
+    s->stats.block_read++;
+    s->cpl.bytes_read = read_len;
+    s->cpl.checksum64 = range_csum;
+    s->cpl.committed_ref = *ref;
+    s->cpl.committed_ref.version = block_version ? block_version : ref->version;
+    s->cpl.committed_ref.bytes = read_len;
+    s->cpl.committed_ref.checksum64 = range_csum;
+    g_free(data);
+    qemu_log("UB_SSD_REMOTE: BLOCK_READ complete target=%#x block=%#" PRIx64
+             ":%#" PRIx64 " bytes=%#" PRIx64 "\n",
+             cmd->target_ssd_cna, ref->block_hi, ref->block_lo, read_len);
+    return SSD_OK;
+}
+
+static int ub_ssd_op_block_read(UbSsdState *s, UbSsdCmdV1 *cmd)
+{
+    const UbSsdBufferDescV1 *buf = &cmd->buffer;
+    const UbSsdBlockRefV1 *ref = &cmd->block_ref;
+    UbSsdBlockRecord *target = NULL;
+    uint64_t read_len;
+    uint64_t range_csum;
+    int rc;
+
+    if (ref->block_hi == 0 && ref->block_lo == 0) {
+        return SSD_ERR_BAD_BLOCK;
+    }
+    if (cmd->target_ssd_cna != 0 &&
+        ((cmd->target_ssd_cna & 0x00ffffffU) !=
+         (s->device_cna & 0x00ffffffU))) {
+        return ub_ssd_op_remote_block_read(s, cmd);
+    }
+
+    rc = ub_ssd_resolve_read_target(s, ref, &target, &read_len, &range_csum);
+    if (rc != SSD_OK) {
+        return rc;
+    }
+    if (read_len > buf->bytes) {
+        return SSD_ERR_BAD_DESCRIPTOR;
     }
 
     rc = ubc_gsva_device_write_acquire(s->ubc, &buf->key, s->device_cna,
@@ -1246,6 +1403,81 @@ static int ub_ssd_op_block_tombstone(UbSsdState *s, UbSsdCmdV1 *cmd)
     s->cpl.committed_ref.bytes = latest->byte_count;
     s->cpl.committed_ref.checksum64 = latest->checksum64;
     return SSD_OK;
+}
+
+void ub_ssd_handle_remote_read_request(BusControllerDev *ubc_dev,
+                                       const UBCUbSsdReadReqPld *req,
+                                       uint32_t requester_cna)
+{
+    UBCUbSsdReadRespPldHdr resp = { 0 };
+    UbSsdState *target_ssd;
+    UbSsdBlockRefV1 ref;
+    UbSsdBlockRecord *target = NULL;
+    uint64_t read_len = 0;
+    uint64_t range_csum = 0;
+    uint64_t chunk_offset;
+    int rc;
+
+    if (!ubc_dev || !req) {
+        return;
+    }
+
+    resp.req_id = req->req_id;
+    resp.magic = UBC_UB_SSD_READ_RESP_MAGIC;
+    resp.status = SSD_ERR_BAD_BLOCK;
+    target_ssd = ub_ssd_find_by_cna(req->target_ssd_cna);
+    if (!target_ssd) {
+        qemu_log("UB_SSD_REMOTE: read_req target missing target=%#x"
+                 " requester=%#x\n",
+                 req->target_ssd_cna, requester_cna);
+        (void)ubc_ub_ssd_send_read_resp(ubc_dev, requester_cna,
+                                        &resp, NULL, 0);
+        return;
+    }
+
+    memset(&ref, 0, sizeof(ref));
+    ref.block_hi = req->block_ref.block_hi;
+    ref.block_lo = req->block_ref.block_lo;
+    ref.version = req->block_ref.version;
+    ref.offset = req->block_ref.offset;
+    ref.bytes = req->block_ref.bytes;
+    ref.checksum64 = req->block_ref.checksum64;
+
+    rc = ub_ssd_resolve_read_target(target_ssd, &ref, &target,
+                                    &read_len, &range_csum);
+    if (rc != SSD_OK) {
+        resp.status = rc;
+        qemu_log("UB_SSD_REMOTE: read_req resolve failed target=%#x"
+                 " block=%#" PRIx64 ":%#" PRIx64 " status=%d\n",
+                 req->target_ssd_cna, ref.block_hi, ref.block_lo, rc);
+        (void)ubc_ub_ssd_send_read_resp(target_ssd->ubc, requester_cna,
+                                        &resp, NULL, 0);
+        return;
+    }
+    if (req->read_len == 0 || req->read_offset > read_len ||
+        req->read_len > read_len - req->read_offset ||
+        req->read_len > UB_SSD_REMOTE_MSG_PAYLOAD_MAX - sizeof(resp)) {
+        resp.status = SSD_ERR_BAD_BLOCK;
+        (void)ubc_ub_ssd_send_read_resp(target_ssd->ubc, requester_cna,
+                                        &resp, NULL, 0);
+        return;
+    }
+
+    chunk_offset = ref.offset + req->read_offset;
+    resp.status = SSD_OK;
+    resp.data_len = req->read_len;
+    resp.block_version = target->version;
+    resp.block_bytes = read_len;
+    resp.checksum64 = range_csum;
+    qemu_log("UB_SSD_REMOTE: read_req ok target=%#x requester=%#x"
+             " block=%#" PRIx64 ":%#" PRIx64 " offset=%#" PRIx64
+             " len=%u version=%#" PRIx64 "\n",
+             req->target_ssd_cna, requester_cna, ref.block_hi, ref.block_lo,
+             req->read_offset, req->read_len, target->version);
+    (void)ubc_ub_ssd_send_read_resp(target_ssd->ubc, requester_cna,
+                                    &resp,
+                                    target->bytes + chunk_offset,
+                                    req->read_len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1506,6 +1738,9 @@ static void ub_ssd_realize(DeviceState *dev, Error **errp)
     memset(&s->cmd, 0, sizeof(s->cmd));
     memset(&s->cpl, 0, sizeof(s->cpl));
     memset(&s->stats, 0, sizeof(s->stats));
+    if (!g_list_find(g_ub_ssd_devices, s)) {
+        g_ub_ssd_devices = g_list_append(g_ub_ssd_devices, s);
+    }
 
     qemu_log("UB_SSD: realized cna=%#" PRIx32 " node_id=%" PRIu32
              " instance=%" PRIu32 " backend=memory\n",

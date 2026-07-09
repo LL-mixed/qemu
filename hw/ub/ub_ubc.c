@@ -4982,6 +4982,34 @@ static void ubc_fill_remote_dcna_from_link(UBDevice *ub_dev,
     }
 }
 
+static uint32_t ubc_remote_cna_from_link(UBDevice *ub_dev, UBLinkState *link)
+{
+    if (!ub_dev || !link) {
+        return 0;
+    }
+    if (link->a.device == ub_dev && link->b.device) {
+        return link->b.device->cna;
+    }
+    if (link->b.device == ub_dev && link->a.device) {
+        return link->a.device->cna;
+    }
+    if (link->a.device && link->a.device != ub_dev) {
+        return link->a.device->cna;
+    }
+    if (link->b.device && link->b.device != ub_dev) {
+        return link->b.device->cna;
+    }
+    return 0;
+}
+
+static uint32_t ubc_primary_cna_from_ub_ssd_cna(uint32_t ssd_cna)
+{
+    if ((ssd_cna & 0xf0002000U) != 0x10002000U) {
+        return 0;
+    }
+    return ((ssd_cna & 0x0fff0000U) >> 12) | 0x2U;
+}
+
 static uint8_t ubc_node_ip_suffix_from_id(const char *node_id)
 {
     if (!node_id) {
@@ -5825,6 +5853,208 @@ void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
     ubc_dev->sim_dec_sync_read.status = hdr->status ? -EIO : 0;
     ubc_dev->sim_dec_sync_read.pending = false;
     ubc_dev->sim_dec_sync_read.peer_cna = 0;
+}
+
+int ubc_ub_ssd_send_read_resp(BusControllerDev *ubc_dev, uint32_t dcna,
+                              const UBCUbSsdReadRespPldHdr *hdr,
+                              const uint8_t *data, uint32_t data_len)
+{
+    UBLinkState *link;
+    uint8_t *payload;
+    uint32_t payload_len;
+    int rc;
+
+    if (!ubc_dev || !hdr || (data_len > 0 && !data) ||
+        data_len > UBC_SIM_DEC_MAX_MSG_PAYLOAD - sizeof(*hdr)) {
+        return -EINVAL;
+    }
+    if (hdr->magic != UBC_UB_SSD_READ_RESP_MAGIC) {
+        return -EINVAL;
+    }
+    link = ubc_find_active_link(ubc_dev, &dcna);
+    if (!link) {
+        qemu_log("UB_SSD_REMOTE: read_resp no active link dcna=%#x\n", dcna);
+        return -ENODEV;
+    }
+    payload_len = sizeof(*hdr) + data_len;
+    payload = g_malloc0(payload_len);
+    memcpy(payload, hdr, sizeof(*hdr));
+    if (data_len > 0) {
+        memcpy(payload + sizeof(*hdr), data, data_len);
+    }
+    rc = ubc_send_msg_over_link(ubc_dev, link, dcna,
+                                UBC_MSG_SUB_UB_SSD_READ_RESP,
+                                payload, payload_len);
+    g_free(payload);
+    return rc;
+}
+
+void ubc_handle_ub_ssd_rx_read_resp(BusControllerDev *ubc_dev,
+                                    const UBCUbSsdReadRespPldHdr *hdr,
+                                    const uint8_t *data,
+                                    uint32_t data_len,
+                                    uint32_t peer_cna)
+{
+    uint32_t copy_len;
+
+    if (!ubc_dev || !hdr) {
+        return;
+    }
+    if (!ubc_dev->sim_dec_sync_read.pending ||
+        ubc_dev->sim_dec_sync_read.req_id != hdr->req_id ||
+        ubc_dev->sim_dec_sync_read.peer_cna != peer_cna) {
+        qemu_log("UB_SSD_REMOTE: stale read_resp req=%u peer=%#x"
+                 " pending=%u cur=%u cur_peer=%#x\n",
+                 hdr->req_id, peer_cna, ubc_dev->sim_dec_sync_read.pending,
+                 ubc_dev->sim_dec_sync_read.req_id,
+                 ubc_dev->sim_dec_sync_read.peer_cna);
+        return;
+    }
+
+    copy_len = MIN(hdr->data_len, ubc_dev->sim_dec_sync_read.expect_len);
+    copy_len = MIN(copy_len, data_len);
+    if (copy_len > 0 && ubc_dev->sim_dec_sync_read.buf) {
+        memcpy(ubc_dev->sim_dec_sync_read.buf, data, copy_len);
+    }
+    ubc_dev->sim_dec_sync_read.actual_len = copy_len;
+    ubc_dev->sim_dec_sync_read.status = hdr->status;
+    ubc_dev->sim_dec_sync_read.block_version = hdr->block_version;
+    ubc_dev->sim_dec_sync_read.block_bytes = hdr->block_bytes;
+    ubc_dev->sim_dec_sync_read.checksum64 = hdr->checksum64;
+    ubc_dev->sim_dec_sync_read.pending = false;
+    ubc_dev->sim_dec_sync_read.peer_cna = 0;
+}
+
+int ubc_ub_ssd_remote_block_read(BusControllerDev *ubc_dev,
+                                 uint32_t target_ssd_cna,
+                                 uint32_t source_cna,
+                                 const UBCUbSsdBlockRefPld *block_ref,
+                                 uint8_t *data,
+                                 uint32_t len,
+                                 uint64_t *block_version,
+                                 uint64_t *block_bytes,
+                                 uint64_t *checksum64)
+{
+    UBLinkState *link;
+    BusControllerState *bcs;
+    uint32_t owner_cna = ubc_primary_cna_from_ub_ssd_cna(target_ssd_cna);
+    uint32_t dcna = owner_cna ? owner_cna : target_ssd_cna;
+    uint32_t response_peer_cna;
+    uint32_t done = 0;
+
+    if (!ubc_dev || !block_ref || !data || len == 0 || target_ssd_cna == 0) {
+        return -EINVAL;
+    }
+    link = ubc_find_active_link(ubc_dev, &dcna);
+    if (!link) {
+        qemu_log("UB_SSD_REMOTE: read no active link target_ssd_cna=%#x\n",
+                 target_ssd_cna);
+        return -ENODEV;
+    }
+    bcs = container_of_ubbus(ub_get_bus(&ubc_dev->parent));
+    if (!bcs) {
+        return -ENODEV;
+    }
+    response_peer_cna = owner_cna;
+    if (response_peer_cna == 0) {
+        response_peer_cna = ubc_remote_cna_from_link(&ubc_dev->parent, link);
+    }
+    if (response_peer_cna == 0) {
+        response_peer_cna = dcna;
+    }
+
+    while (done < len) {
+        UBCUbSsdReadReqPld req = { 0 };
+        uint32_t chunk = MIN(len - done,
+                             UBC_SIM_DEC_MAX_MSG_PAYLOAD -
+                             (uint32_t)sizeof(UBCUbSsdReadRespPldHdr));
+        int rc;
+        int loop;
+
+        if (ubc_dev->sim_dec_sync_read.pending) {
+            qemu_log("UB_SSD_REMOTE: another sync read pending req=%u\n",
+                     ubc_dev->sim_dec_sync_read.req_id);
+            return -EBUSY;
+        }
+        ubc_dev->sim_dec_sync_read.pending = true;
+        ubc_dev->sim_dec_sync_read.req_id = ++ubc_dev->next_sim_dec_read_req_id;
+        if (ubc_dev->sim_dec_sync_read.req_id == 0) {
+            ubc_dev->sim_dec_sync_read.req_id =
+                ++ubc_dev->next_sim_dec_read_req_id;
+        }
+        ubc_dev->sim_dec_sync_read.peer_cna = response_peer_cna;
+        ubc_dev->sim_dec_sync_read.expect_len = chunk;
+        ubc_dev->sim_dec_sync_read.actual_len = 0;
+        ubc_dev->sim_dec_sync_read.status = -ETIMEDOUT;
+        ubc_dev->sim_dec_sync_read.block_version = 0;
+        ubc_dev->sim_dec_sync_read.block_bytes = 0;
+        ubc_dev->sim_dec_sync_read.checksum64 = 0;
+        ubc_dev->sim_dec_sync_read.buf = data + done;
+
+        req.magic = UBC_UB_SSD_READ_REQ_MAGIC;
+        req.req_id = ubc_dev->sim_dec_sync_read.req_id;
+        req.target_ssd_cna = target_ssd_cna;
+        req.source_cna = source_cna;
+        req.read_offset = done;
+        req.read_len = chunk;
+        req.block_ref = *block_ref;
+
+        rc = ubc_send_msg_over_link(ubc_dev, link, dcna,
+                                    UBC_MSG_SUB_UB_SSD_READ_REQ,
+                                    &req, sizeof(req));
+        if (rc < 0) {
+            ubc_dev->sim_dec_sync_read.pending = false;
+            return rc;
+        }
+
+        for (loop = 0; loop < UBC_SIM_DEC_READ_WAIT_LOOPS; loop++) {
+            if (!ubc_dev->sim_dec_sync_read.pending) {
+                break;
+            }
+            ub_fm_poll_rx_links_now();
+            if (!ubc_dev->sim_dec_sync_read.pending) {
+                break;
+            }
+            ubc_sim_dec_process_wait_links(bcs, ubc_dev, link);
+            if (!ubc_dev->sim_dec_sync_read.pending) {
+                break;
+            }
+            g_usleep(link->shmem_ready ? UBC_SIM_DEC_SHM_READ_WAIT_USEC :
+                                         UBC_SIM_DEC_READ_WAIT_USEC);
+        }
+
+        if (ubc_dev->sim_dec_sync_read.pending) {
+            qemu_log("UB_SSD_REMOTE: read timeout req=%u target=%#x"
+                     " offset=%u len=%u\n",
+                     req.req_id, target_ssd_cna, done, chunk);
+            ubc_dev->sim_dec_sync_read.pending = false;
+            ubc_dev->sim_dec_sync_read.peer_cna = 0;
+            return -ETIMEDOUT;
+        }
+        if (ubc_dev->sim_dec_sync_read.status != 0 ||
+            ubc_dev->sim_dec_sync_read.actual_len != chunk) {
+            qemu_log("UB_SSD_REMOTE: bad read_resp req=%u status=%d"
+                     " actual=%u expect=%u\n",
+                     req.req_id, ubc_dev->sim_dec_sync_read.status,
+                     ubc_dev->sim_dec_sync_read.actual_len, chunk);
+            return ubc_dev->sim_dec_sync_read.status ?
+                ubc_dev->sim_dec_sync_read.status : -EIO;
+        }
+        if (block_version) {
+            *block_version = ubc_dev->sim_dec_sync_read.block_version;
+        }
+        if (block_bytes) {
+            *block_bytes = ubc_dev->sim_dec_sync_read.block_bytes;
+        }
+        if (checksum64) {
+            *checksum64 = ubc_dev->sim_dec_sync_read.checksum64;
+        }
+        done += chunk;
+    }
+    qemu_log("UB_SSD_REMOTE: read ok target=%#x block=%#" PRIx64
+             ":%#" PRIx64 " bytes=%u\n",
+             target_ssd_cna, block_ref->block_hi, block_ref->block_lo, len);
+    return 0;
 }
 
 MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
@@ -8513,6 +8743,10 @@ static void obmm_export_register(const SimDecObmmBootstrapRecord *record)
     QTAILQ_INSERT_TAIL(&g_obmm_exports, entry, next);
 }
 
+static void sim_dec_register_obmm_gsva_route(
+    const SimDecObmmBootstrapRecord *record);
+
+
 static ObmmExportEntry *obmm_export_lookup(uint64_t uba, uint64_t len)
 {
     ObmmExportEntry *entry;
@@ -10142,6 +10376,7 @@ static int sim_dec_handle_obmm_bootstrap_publish(
              record->backing_uba, record->token_id, record->size);
 
     obmm_export_register(record);
+    sim_dec_register_obmm_gsva_route(record);
 
     return SIM_DEC_STATUS_SUCCESS;
 }
@@ -10495,6 +10730,74 @@ static void gsva_tables_init(void)
         g_gsva_initialized = true;
     }
 }
+
+static void sim_dec_register_obmm_gsva_route(
+    const SimDecObmmBootstrapRecord *record)
+{
+    GsvaKeyV1 key = { 0 };
+    uint64_t map_id = 0;
+    int rc;
+    int coh_rc;
+
+    if (!record || record->export_mem_id == 0 || record->remote_uba == 0 ||
+        record->backing_uba == 0 || record->size == 0 ||
+        record->export_cna == 0 || record->token_id == 0) {
+        return;
+    }
+
+    gsva_tables_init();
+
+    key.version = 1;
+    key.segment_id = record->export_mem_id;
+    key.home_va = record->remote_uba;
+    key.size = record->size;
+    key.p_tag = record->export_cna & 0x00ffffffu;
+    key.cache_policy = 4;
+    key.epoch = 1;
+
+    if (gsva_route_lookup_base(&g_gsva_routes, &key)) {
+        return;
+    }
+
+    rc = gsva_route_map(&g_gsva_routes,
+                        &key,
+                        record->backing_uba,
+                        record->remote_uba,
+                        record->remote_uba,
+                        SIM_DEC_MAP_SOURCE_LEGACY_OBMM,
+                        GSVA_ADDRESS_PROFILE_STRICT_GSVA,
+                        record->export_cna,
+                        record->token_id,
+                        record->token_id,
+                        UB_GSVA_DEVICE_ACCESS_READ_WRITE,
+                        &map_id);
+    if (rc != GSVA_OK) {
+        qemu_log("GSVA_MAP: obmm bootstrap route failed segment=%#" PRIx64
+                 " home_va=%#" PRIx64 " backing=%#" PRIx64
+                 " size=%#" PRIx64 " rc=%d\n",
+                 key.segment_id, key.home_va, record->backing_uba,
+                 key.size, rc);
+        return;
+    }
+
+    coh_rc = gsva_coh_object_create(&g_gsva_coh, &key, 0, map_id);
+    if (coh_rc != GSVA_OK) {
+        qemu_log("GSVA_MAP: obmm bootstrap coh create failed segment=%#"
+                 PRIx64 " rc=%d\n",
+                 key.segment_id, coh_rc);
+        gsva_route_unmap(&g_gsva_routes, map_id, true);
+        return;
+    }
+
+    gsva_stats_map(&g_gsva_stats, true);
+    qemu_log("GSVA_MAP: obmm bootstrap route segment=%#" PRIx64
+             " home_va=%#" PRIx64 " backing=%#" PRIx64
+             " size=%#" PRIx64 " token=%" PRIu32
+             " map_id=%#" PRIx64 "\n",
+             key.segment_id, key.home_va, record->backing_uba,
+             key.size, record->token_id, map_id);
+}
+
 /* Helper for sim_dec_gva_tcg_translate to look up GSVA routes.
  * Defined here after g_gsva_routes/g_gsva_initialized are declared. */
 static unsigned gsva_tlb_stable_index(uint64_t va)
@@ -10599,9 +10902,11 @@ int gsva_arm_mmu_translate_full(uint64_t va, bool is_write,
     if (!route) {
         return 0;
     }
+    if (route->source != SIM_DEC_MAP_SOURCE_GVA_MANAGER) {
+        return 0;
+    }
 
     identity_route =
-        route->source == SIM_DEC_MAP_SOURCE_GVA_MANAGER &&
         route->local_va == route->key.home_va &&
         route->remote_uba == route->key.home_va &&
         (route->address_profile == GSVA_ADDRESS_PROFILE_STRICT_GSVA ||
@@ -11358,6 +11663,118 @@ static bool ubc_gsva_device_access_allows(uint32_t access_flags,
     return (access_flags & required_access) == required_access;
 }
 
+static MemTxResult ubc_gsva_route_backing_read(BusControllerDev *ubc,
+                                               GsvaRouteEntry *route,
+                                               uint64_t gsva,
+                                               uint64_t pa,
+                                               void *dst,
+                                               uint64_t len)
+{
+    ObmmExportEntry *exp;
+    bool restore_cpu_window;
+    MemTxResult ret;
+
+    if (route && route->home_cna == ubc->parent.cna) {
+        ret = ubc_dma_read_local_data_tid_strict(
+            ubc, gsva, dst, len, ubc_tid_or_auto(route->token.token_id));
+        if (ret == MEMTX_OK) {
+            return ret;
+        }
+    } else if (route && route->home_cna != 0) {
+        ret = ubc_sim_dec_remote_read(ubc, gsva, route->token.token_id,
+                                      route->home_cna, dst, (uint32_t)len);
+        if (ret == MEMTX_OK) {
+            return ret;
+        }
+    }
+
+    exp = obmm_export_lookup(gsva, len);
+    if (exp && exp->backing_uba) {
+        uint64_t offset = gsva - exp->remote_uba;
+        uint64_t backing_addr = exp->backing_uba + offset;
+
+        ret = ubc_dma_read_local_data_tid_strict(ubc, backing_addr, dst, len,
+                                                 UBC_DMA_TID_AUTO);
+        if (ret == MEMTX_OK) {
+            return ret;
+        }
+        ret = address_space_read(&address_space_memory, backing_addr,
+                                 MEMTXATTRS_UNSPECIFIED, dst, len);
+        if (ret == MEMTX_OK) {
+            return ret;
+        }
+    }
+
+    restore_cpu_window = route && route->cpu_window_mapped;
+    if (restore_cpu_window) {
+        memory_region_del_subregion(get_system_memory(), &route->cpu_window);
+    }
+    ret = address_space_read(&address_space_memory, pa,
+                             MEMTXATTRS_UNSPECIFIED, dst, len);
+    if (restore_cpu_window) {
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            route->local_pa,
+                                            &route->cpu_window, 10);
+    }
+    return ret;
+}
+
+static MemTxResult ubc_gsva_route_backing_write(BusControllerDev *ubc,
+                                                GsvaRouteEntry *route,
+                                                uint64_t gsva,
+                                                uint64_t pa,
+                                                const void *src,
+                                                uint64_t len)
+{
+    ObmmExportEntry *exp;
+    bool restore_cpu_window;
+    MemTxResult ret;
+
+    if (route && route->home_cna == ubc->parent.cna) {
+        ret = ubc_dma_write_local_data_tid_strict(
+            ubc, gsva, src, len, ubc_tid_or_auto(route->token.token_id));
+        if (ret == MEMTX_OK) {
+            return ret;
+        }
+    } else if (route && route->home_cna != 0) {
+        ret = ubc_sim_dec_remote_write(ubc, gsva, route->token.token_id,
+                                       route->home_cna, src, (uint32_t)len);
+        if (ret == MEMTX_OK) {
+            return ret;
+        }
+    }
+
+    exp = obmm_export_lookup(gsva, len);
+    if (exp && exp->backing_uba) {
+        uint64_t offset = gsva - exp->remote_uba;
+        uint64_t backing_addr = exp->backing_uba + offset;
+
+        ret = ubc_dma_write_local_data_tid_strict(ubc, backing_addr, src, len,
+                                                  UBC_DMA_TID_AUTO);
+        if (ret == MEMTX_OK) {
+            return ret;
+        }
+        ret = address_space_write(&address_space_memory, backing_addr,
+                                  MEMTXATTRS_UNSPECIFIED, src, len);
+        if (ret == MEMTX_OK) {
+            return ret;
+        }
+    }
+
+    restore_cpu_window = route && route->cpu_window_mapped;
+    if (restore_cpu_window) {
+        memory_region_del_subregion(get_system_memory(), &route->cpu_window);
+    }
+    ret = address_space_write(&address_space_memory, pa,
+                              MEMTXATTRS_UNSPECIFIED, src, len);
+    if (restore_cpu_window) {
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            route->local_pa,
+                                            &route->cpu_window, 10);
+    }
+    return ret;
+}
+
 int ubc_gsva_device_read_acquire(BusControllerDev *ubc,
                                  const GsvaKeyV1 *key,
                                  uint32_t requester_cna,
@@ -11537,8 +11954,7 @@ int ubc_gsva_device_read(BusControllerDev *ubc,
     offset = gsva - route->local_va;
     pa = route->local_pa + offset;
 
-    ret = address_space_read(&address_space_memory, pa,
-                             MEMTXATTRS_UNSPECIFIED, dst, len);
+    ret = ubc_gsva_route_backing_read(ubc, route, gsva, pa, dst, len);
     if (ret != MEMTX_OK) {
         qemu_log("UB_DEV_GSVA: read failed pa=%#" PRIx64 " len=%#" PRIx64
                  " ret=%d\n", pa, len, ret);
@@ -11579,8 +11995,7 @@ int ubc_gsva_device_write(BusControllerDev *ubc,
     offset = gsva - route->local_va;
     pa = route->local_pa + offset;
 
-    ret = address_space_write(&address_space_memory, pa,
-                              MEMTXATTRS_UNSPECIFIED, src, len);
+    ret = ubc_gsva_route_backing_write(ubc, route, gsva, pa, src, len);
     if (ret != MEMTX_OK) {
         qemu_log("UB_DEV_GSVA: write failed pa=%#" PRIx64 " len=%#" PRIx64
                  " ret=%d\n", pa, len, ret);

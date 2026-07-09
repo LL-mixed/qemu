@@ -218,6 +218,9 @@ typedef struct BusControllerDev {
         uint32_t expect_len;
         uint32_t actual_len;
         int status;
+        uint64_t block_version;
+        uint64_t block_bytes;
+        uint64_t checksum64;
         uint8_t *buf;
     } sim_dec_sync_read;
 
@@ -382,6 +385,10 @@ void ubc_handle_read_response(BusControllerDev *ubc_dev, const UBCReadRespPld *r
 #define UBC_MSG_SUB_SIM_DEC_READ_REQ  2
 #define UBC_MSG_SUB_SIM_DEC_READ_RESP 3
 #define UBC_MSG_SUB_SIM_DEC_BATCH     4
+#define UBC_MSG_SUB_UB_SSD_READ_REQ   UBC_MSG_SUB_SIM_DEC_BATCH
+#define UBC_MSG_SUB_UB_SSD_READ_RESP  UBC_MSG_SUB_SIM_DEC_BATCH
+#define UBC_UB_SSD_READ_REQ_MAGIC     0x53534452U
+#define UBC_UB_SSD_READ_RESP_MAGIC    0x53534472U
 
 /* OBMM coherence protocol messages (msg_code=7, sub_msg_code 5+). */
 #define UBC_MSG_SUB_COH_GETS          5
@@ -505,6 +512,37 @@ typedef struct QEMU_PACKED UBCSimDecReadRespPldHdr {
     /* data follows */
 } UBCSimDecReadRespPldHdr;
 
+typedef struct QEMU_PACKED UBCUbSsdBlockRefPld {
+    uint64_t block_hi;
+    uint64_t block_lo;
+    uint64_t version;
+    uint64_t offset;
+    uint64_t bytes;
+    uint64_t checksum64;
+} UBCUbSsdBlockRefPld;
+
+typedef struct QEMU_PACKED UBCUbSsdReadReqPld {
+    uint32_t magic;
+    uint32_t req_id;
+    uint32_t target_ssd_cna;
+    uint32_t source_cna;
+    uint32_t read_len;
+    uint64_t read_offset;
+    UBCUbSsdBlockRefPld block_ref;
+} UBCUbSsdReadReqPld;
+
+typedef struct QEMU_PACKED UBCUbSsdReadRespPldHdr {
+    uint32_t magic;
+    uint32_t req_id;
+    int32_t status;
+    uint32_t data_len;
+    uint32_t rsvd;
+    uint64_t block_version;
+    uint64_t block_bytes;
+    uint64_t checksum64;
+    /* data follows */
+} UBCUbSsdReadRespPldHdr;
+
 void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
                                  const UBCSimDecWritePldHdr *hdr,
                                  const uint8_t *data, uint32_t data_len);
@@ -515,6 +553,26 @@ void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
                                      const UBCSimDecReadRespPldHdr *hdr,
                                      const uint8_t *data, uint32_t data_len,
                                      uint32_t peer_cna);
+int ubc_ub_ssd_remote_block_read(BusControllerDev *ubc_dev,
+                                 uint32_t target_ssd_cna,
+                                 uint32_t source_cna,
+                                 const UBCUbSsdBlockRefPld *block_ref,
+                                 uint8_t *data,
+                                 uint32_t len,
+                                 uint64_t *block_version,
+                                 uint64_t *block_bytes,
+                                 uint64_t *checksum64);
+int ubc_ub_ssd_send_read_resp(BusControllerDev *ubc_dev, uint32_t dcna,
+                              const UBCUbSsdReadRespPldHdr *hdr,
+                              const uint8_t *data, uint32_t data_len);
+void ubc_handle_ub_ssd_rx_read_resp(BusControllerDev *ubc_dev,
+                                    const UBCUbSsdReadRespPldHdr *hdr,
+                                    const uint8_t *data,
+                                    uint32_t data_len,
+                                    uint32_t peer_cna);
+void ub_ssd_handle_remote_read_request(BusControllerDev *ubc_dev,
+                                       const UBCUbSsdReadReqPld *req,
+                                       uint32_t requester_cna);
 
 /* SIM Decoder (SIM_DEC) protocol for cross-node memory access */
 int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
