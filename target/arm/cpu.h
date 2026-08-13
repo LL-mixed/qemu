@@ -262,6 +262,9 @@ typedef struct CPUArchState {
     /* Cached TBFLAGS state.  See below for which bits are included.  */
     CPUARMTBFlags hflags;
 
+    /* Experimental EL0 scheduler-core TB specialization gate. */
+    bool obmm_scc_active;
+
     /* Frequently accessed CPSR bits are stored separately for efficiency.
        This contains all the other bits.  Use cpsr_{read,write} to access
        the whole CPSR.  */

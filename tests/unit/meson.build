@@ -52,6 +52,15 @@ tests = {
   'test-interval-tree': [],
   'test-xs-node': [qom],
   'test-virtio-dmabuf': [meson.project_source_root() / 'hw/display/virtio-dmabuf.c'],
+  'test-ub-obmm-remote-model': [
+    meson.project_source_root() / 'hw/ub/ub_obmm_remote_model.c'
+  ],
+  'test-ub-obmm-remote': [
+    meson.project_source_root() / 'hw/ub/ub_obmm_remote.c'
+  ],
+  'test-ub-scc': [
+    meson.project_source_root() / 'hw/ub/ub_scc.c'
+  ],
 }
 
 if have_system or have_tools

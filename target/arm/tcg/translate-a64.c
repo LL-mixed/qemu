@@ -27,6 +27,8 @@
 #include "semihosting/semihost.h"
 #include "cpregs.h"
 
+#define OBMM_SCC_RESUME_IMM 0x5343
+
 static TCGv_i64 cpu_X[32];
 static TCGv_i64 cpu_pc;
 
@@ -1016,6 +1018,20 @@ static void do_gpr_ld(DisasContext *s, TCGv_i64 dest, TCGv_i64 tcg_addr,
 {
     do_gpr_ld_memidx(s, dest, tcg_addr, memop, extend, get_mem_index(s),
                      iss_valid, iss_srt, iss_sf, iss_ar);
+}
+
+static void gen_obmm_scc_remote_load(DisasContext *s,
+                                     TCGv_i64 tcg_addr, MemOp memop,
+                                     uint32_t rt, int memidx)
+{
+    if (!s->obmm_scc_active || s->current_el != 0 ||
+        (memop & MO_SIGN) || (memop & MO_SIZE) > MO_64) {
+        return;
+    }
+    gen_helper_obmm_scc_remote_load(
+        tcg_env, tcg_addr, tcg_constant_i32(memop),
+        tcg_constant_i32(rt), tcg_constant_i32(memidx),
+        tcg_constant_tl(s->pc_curr));
 }
 
 /*
@@ -2400,7 +2416,12 @@ static bool trans_HLT(DisasContext *s, arg_i *a)
      * it is required for halting debug disabled: it will UNDEF.
      * Secondly, "HLT 0xf000" is the A64 semihosting syscall instruction.
      */
-    if (semihosting_enabled(s->current_el == 0) && a->imm == 0xf000) {
+    if (s->obmm_scc_active && s->current_el == 0 &&
+        a->imm == OBMM_SCC_RESUME_IMM) {
+        gen_helper_obmm_scc_resume(tcg_env, cpu_reg(s, 0));
+        s->base.is_jmp = DISAS_NORETURN;
+    } else if (semihosting_enabled(s->current_el == 0) &&
+               a->imm == 0xf000) {
         gen_exception_internal_insn(s, EXCP_SEMIHOST);
     } else {
         unallocated_encoding(s);
@@ -3114,6 +3135,9 @@ static bool trans_LDR_i(DisasContext *s, arg_ldst_imm *a)
     tcg_rt = cpu_reg(s, a->rt);
     iss_sf = ldst_iss_sf(a->sz, a->sign, a->ext);
 
+    if (!a->w && !a->sign) {
+        gen_obmm_scc_remote_load(s, clean_addr, mop, a->rt, memidx);
+    }
     do_gpr_ld_memidx(s, tcg_rt, clean_addr, mop,
                      a->ext, memidx, iss_valid, a->rt, iss_sf, false);
     op_addr_ldst_imm_post(s, a, dirty_addr, a->imm);
@@ -3181,6 +3205,10 @@ static bool trans_LDR(DisasContext *s, arg_ldst *a)
     memop = finalize_memop(s, a->sz + a->sign * MO_SIGN);
     op_addr_ldst_pre(s, a, &clean_addr, &dirty_addr, false, memop);
     tcg_rt = cpu_reg(s, a->rt);
+    if (!a->sign) {
+        gen_obmm_scc_remote_load(s, clean_addr, memop, a->rt,
+                                 get_mem_index(s));
+    }
     do_gpr_ld(s, tcg_rt, clean_addr, memop,
               a->ext, true, a->rt, iss_sf, false);
     return true;
@@ -13963,6 +13991,7 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->condjmp = 0;
     dc->pc_save = dc->base.pc_first;
     dc->aarch64 = true;
+    dc->obmm_scc_active = env->obmm_scc_active;
     dc->thumb = false;
     dc->sctlr_b = 0;
     dc->be_data = EX_TBFLAG_ANY(tb_flags, BE_DATA) ? MO_BE : MO_LE;
@@ -14044,6 +14073,11 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
 
 static void aarch64_tr_tb_start(DisasContextBase *db, CPUState *cpu)
 {
+    DisasContext *dc = container_of(db, DisasContext, base);
+
+    if (dc->obmm_scc_active && dc->current_el == 0) {
+        gen_helper_obmm_scc_boundary(tcg_env);
+    }
 }
 
 static void aarch64_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)

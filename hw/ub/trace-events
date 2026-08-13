@@ -1,5 +1,23 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# ub_ubc.c OBMM remote-memory model (disabled unless explicitly traced)
+ub_obmm_model_accept(uint64_t operation_key, uint32_t req_id, uint64_t model_ns) "operation_key=%016" PRIx64 " req_id=%u model_ns=%" PRIu64
+ub_obmm_model_due(uint64_t operation_key, uint32_t req_id, const char *outcome, uint64_t model_accept_ns, uint64_t model_due_ns) "operation_key=%016" PRIx64 " req_id=%u outcome=%s accept_ns=%" PRIu64 " due_ns=%" PRIu64
+ub_obmm_model_publish(uint64_t operation_key, uint32_t req_id, bool duplicate, uint64_t model_accept_ns, uint64_t model_due_ns, uint64_t model_publish_ns) "operation_key=%016" PRIx64 " req_id=%u duplicate=%u accept_ns=%" PRIu64 " due_ns=%" PRIu64 " publish_ns=%" PRIu64
+ub_obmm_model_capacity(uint32_t req_id, uint64_t model_ns) "req_id=%u model_ns=%" PRIu64
+ub_obmm_p1_late(uint32_t req_id, const char *source, uint64_t operation_key) "req_id=%u source=%s operation_key=%016" PRIx64
+
+# ub_scc_device.c
+scc_load_inline(uint32_t owner_generation, uint64_t context_id, uint32_t plt_generation, uint16_t plt_slot, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " plt=%u:%u cycle=%" PRIu64
+scc_load_pending(uint32_t owner_generation, uint64_t context_id, uint32_t plt_generation, uint16_t plt_slot, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " plt=%u:%u cycle=%" PRIu64
+scc_context_save(uint32_t owner_generation, uint64_t context_id, uint32_t plt_generation, uint16_t plt_slot, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " plt=%u:%u cycle=%" PRIu64
+scc_context_restore(uint32_t owner_generation, uint64_t context_id, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " cycle=%" PRIu64
+scc_load_complete(uint32_t owner_generation, uint64_t context_id, uint32_t plt_generation, uint16_t plt_slot, uint32_t status, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " plt=%u:%u status=%u cycle=%" PRIu64
+scc_load_commit(uint32_t owner_generation, uint64_t context_id, uint32_t plt_generation, uint16_t plt_slot, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " plt=%u:%u cycle=%" PRIu64
+scc_load_fault(uint32_t owner_generation, uint64_t context_id, uint32_t plt_generation, uint16_t plt_slot, uint32_t status, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " plt=%u:%u status=%u cycle=%" PRIu64
+scc_stale_completion(uint32_t owner_generation, uint32_t plt_generation, uint16_t plt_slot, uint64_t guest_cycle) "owner=%u plt=%u:%u cycle=%" PRIu64
+scc_capacity_stall(uint32_t owner_generation, uint64_t context_id, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " cycle=%" PRIu64
+
 # ub_ummu.c
 ummu_mcmdq_reg_writel(uint32_t idx, uint32_t prod, uint32_t cons) "mcmdq process: idx(%u), prod(%u), cons(%u)"
 mcmdq_process_task(uint32_t mcmdq_idx, const char *cmd) "mcmdq_idx: %u, cmd: %s"

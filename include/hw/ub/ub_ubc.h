@@ -24,6 +24,9 @@
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_link.h"
 #include "hw/ub/gsva_key.h"
+#include "hw/ub/ub_obmm_remote.h"
+#include "hw/ub/ub_obmm_remote_model.h"
+#include "hw/ub/ub_scc_device.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
 
@@ -142,6 +145,13 @@ typedef struct BusControllerDev {
 
     /* Multi-entity support */
     uint32_t entity_count;  /* Number of entities (FEs), default=1 */
+    char *remote_memory_model_manifest;
+    char *scheduler_core_model;
+    UbObmmRemoteModelState remote_memory_model;
+    QEMUTimer *remote_memory_model_timer;
+    struct UbcObmmAsyncChild *obmm_async_children;
+    struct UbObmmAsyncState *obmm_async;
+    struct UbSccDeviceState *obmm_scc;
     UBEntityDesc entities[UB_MAX_ENTITIES]; /* per-entity descriptor table */
     UBEntityCfgSpace entity_cfg_spaces[UB_MAX_ENTITIES]; /* per-entity cfg spaces */
 
@@ -213,6 +223,7 @@ typedef struct BusControllerDev {
     uint32_t next_read_req_id;
     struct {
         bool pending;
+        bool model_queued;
         uint32_t req_id;
         uint32_t peer_cna;
         uint32_t expect_len;
@@ -221,6 +232,10 @@ typedef struct BusControllerDev {
         uint64_t block_version;
         uint64_t block_bytes;
         uint64_t checksum64;
+        uint64_t map_id;
+        uint64_t map_generation;
+        uint64_t remote_offset;
+        uint64_t per_range_ordinal;
         uint8_t *buf;
     } sim_dec_sync_read;
 
@@ -260,6 +275,20 @@ typedef struct BusControllerDev {
     uint32_t next_sim_dec_read_req_id;
     uint32_t next_tp_id;
 } BusControllerDev;
+
+typedef struct UbcObmmResolvedMap {
+    uint64_t map_id;
+    uint64_t map_generation;
+    uint64_t remote_uba;
+    uint64_t length;
+    uint32_t token_id;
+    uint32_t peer_cna;
+} UbcObmmResolvedMap;
+
+typedef void (*UbcObmmAsyncReadCompleteFn)(
+    void *opaque, ObmmRemoteToken token, uint16_t child_index,
+    ObmmRemoteStatus status, const void *payload, uint32_t bytes_done,
+    uint64_t model_publish_ns);
 
 struct BusControllerDevClass {
     UBDeviceClass parent_class;
@@ -336,6 +365,18 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
                                     uint32_t dcna,
                                     uint8_t *data,
                                     uint32_t len);
+bool ubc_obmm_resolve_async_map(BusControllerDev *ubc_dev,
+                                uint64_t local_pa, uint64_t length,
+                                UbcObmmResolvedMap *resolved);
+bool ubc_sim_dec_remote_read_async_submit(
+    BusControllerDev *ubc_dev, const UbcObmmResolvedMap *map,
+    uint64_t remote_offset, uint32_t length,
+    const UbObmmRemoteOperation *operation, ObmmRemoteToken token,
+    uint16_t child_index, UbcObmmAsyncReadCompleteFn complete,
+    void *opaque);
+void ubc_sim_dec_remote_read_async_cancel(BusControllerDev *ubc_dev,
+                                          ObmmRemoteToken token);
+void ubc_obmm_async_irq_notify(BusControllerDev *ubc_dev);
 
 /* Coherence message send helper (obmm_coherence.c uses these) */
 int obmm_coh_send_ub_link_msg(BusControllerDev *ubc_dev, uint32_t dcna,

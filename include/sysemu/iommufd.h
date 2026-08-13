@@ -63,6 +63,26 @@ struct iommu_hwpt_ummu {
     uint64_t tecte[2];
 };
 
+#define IOMMU_HWPT_ALLOC_NEST_PARENT 1U
+#define IOMMU_HWPT_DATA_NONE 0U
+#define IOMMU_HWPT_DATA_ARM_SMMUV3 1U
+#define IOMMU_HWPT_DATA_UMMU 2U
+#define IOMMU_VIOMMU_TYPE_ARM_SMMUV3 1U
+#define IOMMU_VIOMMU_TYPE_UMMU 2U
+#define IOMMU_VIOMMU_INVALIDATE_DATA_ARM_SMMUV3 2U
+#define IOMMU_VIOMMU_INVALIDATE_DATA_UMMU 1U
+#define IOMMU_HWPT_FAULT_ID_VALID (1U << 0)
+#define IOMMU_PGFAULT_FLAGS_PASID_VALID (1U << 0)
+#define IOMMU_PGFAULT_PERM_READ (1U << 0)
+#define IOMMU_PGFAULT_PERM_PRIV (1U << 1)
+#define IOMMU_PGFAULT_PERM_EXEC (1U << 2)
+#define IOMMUFD_PAGE_RESP_INVALID 0U
+#define IOMMUFD_PAGE_RESP_SUCCESS 1U
+#endif
+
+#ifdef CONFIG_LINUX_IO_URING
+#include <liburing.h>
+#else
 struct io_uring {
     int dummy;
 };
@@ -80,22 +100,6 @@ struct __kernel_timespec {
     int64_t tv_sec;
     int64_t tv_nsec;
 };
-
-#define IOMMU_HWPT_ALLOC_NEST_PARENT 1U
-#define IOMMU_HWPT_DATA_NONE 0U
-#define IOMMU_HWPT_DATA_ARM_SMMUV3 1U
-#define IOMMU_HWPT_DATA_UMMU 2U
-#define IOMMU_VIOMMU_TYPE_ARM_SMMUV3 1U
-#define IOMMU_VIOMMU_TYPE_UMMU 2U
-#define IOMMU_VIOMMU_INVALIDATE_DATA_ARM_SMMUV3 2U
-#define IOMMU_VIOMMU_INVALIDATE_DATA_UMMU 1U
-#define IOMMU_HWPT_FAULT_ID_VALID (1U << 0)
-#define IOMMU_PGFAULT_FLAGS_PASID_VALID (1U << 0)
-#define IOMMU_PGFAULT_PERM_READ (1U << 0)
-#define IOMMU_PGFAULT_PERM_PRIV (1U << 1)
-#define IOMMU_PGFAULT_PERM_EXEC (1U << 2)
-#define IOMMUFD_PAGE_RESP_INVALID 0U
-#define IOMMUFD_PAGE_RESP_SUCCESS 1U
 
 static inline struct io_uring_sqe *io_uring_get_sqe(struct io_uring *ring)
 {

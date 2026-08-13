@@ -16,6 +16,7 @@
 #include "io/channel-socket.h"
 #include "qapi/error.h"
 #include "qemu/atomic.h"
+#include "qemu/lockable.h"
 #include "qemu/main-loop.h"
 #include "qom/object.h"
 #include "sysemu/sysemu.h"
@@ -789,7 +790,11 @@ static int ub_link_shm_write_message(UBLinkState *s,
             return -1;
         }
         s->write_retries++;
-        aio_poll(qemu_get_aio_context(), false);
+        /*
+         * A remote process advances tail.  Do not poll local AIO while the
+         * tx_lock is held: an RX callback can send a response on this link
+         * and recursively enter the same message writer.
+         */
         g_usleep(UB_LINK_SHM_WAIT_USEC);
     }
 }
@@ -845,11 +850,17 @@ int ub_link_write_message(UBLinkState *s, const void *buf, size_t len, Error **e
     Error *local_err = NULL;
     int ret;
 
-    if (s && s->shmem_ready) {
+    if (!s) {
+        error_setg(errp, "ub_link: link is not configured");
+        return -1;
+    }
+    QEMU_LOCK_GUARD(&s->tx_lock);
+
+    if (s->shmem_ready) {
         return ub_link_shm_write_message(s, buf, len, errp);
     }
 
-    if (!s || !s->ioc) {
+    if (!s->ioc) {
         error_setg(errp, "ub_link: socket is not connected");
         return -1;
     }
@@ -929,7 +940,7 @@ static int ub_link_write_all_bounded(UBLinkState *s, const char *buf, size_t len
                            done, len);
                 return -1;
             }
-            aio_poll(qemu_get_aio_context(), false);
+            /* The remote peer drains the socket; local AIO is not required. */
             g_usleep(UB_LINK_WRITE_WAIT_USEC);
             continue;
         }
@@ -1437,6 +1448,7 @@ static void ub_link_finalize(Object *obj)
     g_free(s->shmem_rx_path);
     g_free(s->shmem_tx_notify_path);
     g_free(s->shmem_rx_notify_path);
+    qemu_mutex_destroy(&s->tx_lock);
 }
 
 void ub_link_configure(UBLinkState *s, const char *a_device_id, uint32_t a_port_idx,
@@ -1543,6 +1555,7 @@ static void ub_link_instance_init(Object *obj)
 {
     UBLinkState *s = UB_LINK(obj);
 
+    qemu_mutex_init(&s->tx_lock);
     s->shmem_tx_fd = -1;
     s->shmem_rx_fd = -1;
     s->shmem_tx_notify_fd = -1;

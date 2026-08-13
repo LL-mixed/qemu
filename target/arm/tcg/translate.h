@@ -90,6 +90,7 @@ typedef struct DisasContext {
     uint64_t features; /* CPU features bits */
     bool aarch64;
     bool thumb;
+    bool obmm_scc_active;
     bool lse2;
     /*
      * Because unallocated encodings generate different exception syndrome

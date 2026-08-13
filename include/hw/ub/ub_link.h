@@ -14,6 +14,7 @@
 #include "io/channel.h"
 #include "io/net-listener.h"
 #include "qapi/error.h"
+#include "qemu/thread.h"
 
 typedef struct UBDevice UBDevice;
 
@@ -80,7 +81,12 @@ struct UBLinkState {
     QIONetListener *lioc; /* Listener, for server side */
     char *socket_path;
 
-    /* Shared-memory SPSC data path: one tx ring and one rx ring per link. */
+    /*
+     * Shared-memory data path: one tx ring and one rx ring per link.  The
+     * wire rings are SPSC across processes, but multiple QEMU threads can
+     * produce packets for the local tx ring, so serialize local writers.
+     */
+    QemuMutex tx_lock;
     bool shmem_ready;
     int shmem_tx_fd;
     int shmem_rx_fd;

@@ -443,6 +443,7 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
     MachineState *ms = MACHINE(vms);
     char *ubc_nodename;
     char *ummu_nodename;
+    char *linqu_nodename;
     const char *ssd_backend_profile = "memory";
     const char *skip_devices = g_getenv("UB_SIM_SKIP_DEVICES");
     bool create_npu = !skip_devices || !strstr(skip_devices, "npu");
@@ -465,6 +466,16 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
                            vms->irqmap[VIRT_PLATFORM_BUS],
                            GIC_FDT_IRQ_FLAGS_LEVEL_HI);
     qemu_fdt_setprop_cell(ms->fdt, ubc_nodename, "index", 0);
+    linqu_nodename = g_strdup_printf("/linqu-ub@%" PRIx64,
+                                     (uint64_t)(ub_ers_phys_base() +
+                                                0x200000ULL));
+    qemu_fdt_add_subnode(ms->fdt, linqu_nodename);
+    qemu_fdt_setprop_string(ms->fdt, linqu_nodename,
+                            "compatible", "linqu,ub");
+    qemu_fdt_setprop_sized_cells(ms->fdt, linqu_nodename, "reg",
+                                 2, ub_ers_phys_base() + 0x200000ULL,
+                                 2, UBC_ERS2_SPACE_SIZE * 4096ULL);
+    g_free(linqu_nodename);
     {
         uint32_t ubc_phandle = qemu_fdt_alloc_phandle(ms->fdt);
         qemu_fdt_setprop_cell(ms->fdt, ubc_nodename, "phandle", ubc_phandle);

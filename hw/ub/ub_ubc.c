@@ -35,6 +35,8 @@
 #include "hw/ub/gsva_coherence.h"
 #include "hw/ub/gsva_stats.h"
 #include "hw/ub/obmm_coherence.h"
+#include "hw/ub/ub_obmm_async.h"
+#include "hw/ub/ub_scc_device.h"
 #include "hw/ub/ub_ummu.h"
 #include "hw/ub/ub_config.h"
 #include "hw/ub/ub_usi.h"
@@ -49,6 +51,7 @@
 #include "hw/ub/ub_common.h"
 #include "hw/ub/ubus_instance.h"
 #include "hw/ub/ub_pool_msg.h"
+#include "trace.h"
 
 void tlb_flush_all_cpus_synced(CPUState *src_cpu);
 
@@ -476,6 +479,7 @@ typedef struct SimDecMapEntry {
     uint64_t home_va;
     uint64_t pte_offset;
     uint64_t gva_id;
+    uint64_t remote_read_ordinal;
     SimDecRouteState state;
     int last_error;
     bool     gva_ownership_registered;
@@ -1602,6 +1606,21 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define UBC_SIM_DEC_READ_WAIT_USEC  1000
 #define UBC_SIM_DEC_SHM_READ_WAIT_USEC 50
 #define UBC_SIM_DEC_READ_WAIT_LOOPS 30000
+#define UBC_OBMM_ASYNC_CHILD_CAPACITY \
+    (OBMM_REMOTE_PARENT_CAPACITY * OBMM_REMOTE_MAX_CHILDREN)
+
+typedef struct UbcObmmAsyncChild {
+    bool active;
+    bool model_queued;
+    uint32_t req_id;
+    uint32_t peer_cna;
+    uint32_t expected_len;
+    ObmmRemoteToken token;
+    uint16_t child_index;
+    UbObmmRemoteOperation operation;
+    UbcObmmAsyncReadCompleteFn complete;
+    void *opaque;
+} UbcObmmAsyncChild;
 
 /* Doorbell/MMIO region constants (matches UAPI) */
 #define UDMA_JETTY_DSQE_OFFSET   0x1000
@@ -4899,6 +4918,8 @@ static uint64_t ub_ers_region_read(void *opaque, hwaddr addr, unsigned len)
     typeof(((BusControllerDev *)0)->ers[0]) *ers = opaque;
     BusControllerDev *ubc_dev = ers->owner;
     uint32_t entity_idx = 0;
+    hwaddr obmm_async_reg;
+    hwaddr obmm_scc_reg;
     hwaddr linqu_reg;
 
     if (ers->idx == 1 && len >= DWORD_SIZE &&
@@ -4907,6 +4928,16 @@ static uint64_t ub_ers_region_read(void *opaque, hwaddr addr, unsigned len)
     }
 
     if (ers->idx == 2 && len >= DWORD_SIZE) {
+        if (ubc_dev->obmm_async &&
+            ub_obmm_async_decode(addr, &obmm_async_reg)) {
+            return ub_obmm_async_read(ubc_dev->obmm_async,
+                                      obmm_async_reg, len);
+        }
+        if (ubc_dev->obmm_scc &&
+            ub_scc_device_decode(addr, &obmm_scc_reg)) {
+            return ub_scc_device_read(ubc_dev->obmm_scc,
+                                      obmm_scc_reg, len);
+        }
         if (addr < sizeof(uint64_t)) {
             return linqu_uapi_reg_read(ubc_dev, addr, len);
         }
@@ -5598,6 +5629,7 @@ MemTxResult obmm_coh_local_write(BusControllerDev *ubc_dev, uint64_t uba,
 /* Forward declarations for GSVA route fallback in SIM_DEC handlers. */
 static GsvaRouteTable g_gsva_routes;
 static void gsva_tables_init(void);
+static SimDecMapEntry *sim_dec_find_entry_by_pa(uint64_t pa);
 static SimDecMapEntry *sim_dec_find_entry_by_uba(uint64_t uba, uint64_t len);
 
 typedef struct ObmmExportEntry {
@@ -5818,10 +5850,42 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
     g_free(payload);
 }
 
-void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
-                                     const UBCSimDecReadRespPldHdr *hdr,
-                                     const uint8_t *data, uint32_t data_len,
-                                     uint32_t peer_cna)
+typedef struct UbcSimDecModeledReadResponse {
+    BusControllerDev *ubc_dev;
+    UBCSimDecReadRespPldHdr header;
+    uint32_t peer_cna;
+    uint32_t data_len;
+    uint8_t data[];
+} UbcSimDecModeledReadResponse;
+
+typedef struct UbcSimDecModeledAsyncResponse {
+    BusControllerDev *ubc_dev;
+    uint32_t child_slot;
+    uint32_t req_id;
+    UBCSimDecReadRespPldHdr header;
+    uint32_t data_len;
+    uint8_t data[];
+} UbcSimDecModeledAsyncResponse;
+
+static const char *ubc_obmm_remote_outcome_name(UbObmmRemoteOutcome outcome)
+{
+    switch (outcome) {
+    case UB_OBMM_REMOTE_SUCCESS:
+        return "success";
+    case UB_OBMM_REMOTE_ERROR:
+        return "error";
+    case UB_OBMM_REMOTE_DROP:
+        return "drop";
+    default:
+        return "invalid";
+    }
+}
+
+static void ubc_deliver_sim_dec_read_resp(BusControllerDev *ubc_dev,
+                                          const UBCSimDecReadRespPldHdr *hdr,
+                                          const uint8_t *data,
+                                          uint32_t data_len,
+                                          uint32_t peer_cna)
 {
     uint32_t copy_len;
 
@@ -5853,6 +5917,252 @@ void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
     ubc_dev->sim_dec_sync_read.status = hdr->status ? -EIO : 0;
     ubc_dev->sim_dec_sync_read.pending = false;
     ubc_dev->sim_dec_sync_read.peer_cna = 0;
+}
+
+static void ubc_obmm_remote_model_due(
+    void *opaque, const UbObmmRemoteDecision *decision,
+    uint64_t model_accept_ns, uint64_t model_due_ns)
+{
+    UbcSimDecModeledReadResponse *response = opaque;
+
+    trace_ub_obmm_model_due(
+        decision->operation_key, response->header.req_id,
+        ubc_obmm_remote_outcome_name(decision->outcome),
+        model_accept_ns, model_due_ns);
+}
+
+static void ubc_obmm_remote_model_publish(
+    void *opaque, const UbObmmRemoteDecision *decision, bool duplicate,
+    uint64_t model_accept_ns, uint64_t model_due_ns,
+    uint64_t model_publish_ns)
+{
+    UbcSimDecModeledReadResponse *response = opaque;
+    UBCSimDecReadRespPldHdr header = response->header;
+    const uint8_t *data = response->data;
+    uint32_t data_len = response->data_len;
+
+    if (decision->outcome == UB_OBMM_REMOTE_ERROR) {
+        header.status = 1;
+        header.data_len = 0;
+        data = NULL;
+        data_len = 0;
+    }
+    trace_ub_obmm_model_publish(
+        decision->operation_key, header.req_id, duplicate,
+        model_accept_ns, model_due_ns, model_publish_ns);
+    ubc_deliver_sim_dec_read_resp(response->ubc_dev, &header, data,
+                                  data_len, response->peer_cna);
+}
+
+static void ubc_obmm_remote_model_arm(BusControllerDev *ubc_dev)
+{
+    uint64_t next_due;
+
+    if (!ubc_dev->remote_memory_model_timer) {
+        return;
+    }
+    next_due = ub_obmm_remote_model_next_due_ns(
+        &ubc_dev->remote_memory_model);
+    if (next_due == UINT64_MAX) {
+        timer_del(ubc_dev->remote_memory_model_timer);
+    } else {
+        timer_mod_ns(ubc_dev->remote_memory_model_timer, next_due);
+    }
+}
+
+static void ubc_obmm_remote_model_timer(void *opaque)
+{
+    BusControllerDev *ubc_dev = opaque;
+    uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    ub_obmm_remote_model_run_due(&ubc_dev->remote_memory_model, now_ns);
+    ubc_obmm_remote_model_arm(ubc_dev);
+}
+
+static void ubc_obmm_async_model_due(
+    void *opaque, const UbObmmRemoteDecision *decision,
+    uint64_t model_accept_ns, uint64_t model_due_ns)
+{
+    UbcSimDecModeledAsyncResponse *response = opaque;
+
+    trace_ub_obmm_model_due(
+        decision->operation_key, response->req_id,
+        ubc_obmm_remote_outcome_name(decision->outcome),
+        model_accept_ns, model_due_ns);
+}
+
+static void ubc_obmm_async_model_publish(
+    void *opaque, const UbObmmRemoteDecision *decision, bool duplicate,
+    uint64_t model_accept_ns, uint64_t model_due_ns,
+    uint64_t model_publish_ns)
+{
+    UbcSimDecModeledAsyncResponse *response = opaque;
+    UbcObmmAsyncChild *child;
+    ObmmRemoteStatus status;
+    uint32_t bytes_done;
+
+    child = &response->ubc_dev->obmm_async_children[response->child_slot];
+    if (!child->active || child->req_id != response->req_id) {
+        trace_ub_obmm_p1_late(
+            response->req_id, "model-duplicate",
+            decision->operation_key);
+        return;
+    }
+    status = response->header.status == 0 &&
+        decision->outcome == UB_OBMM_REMOTE_SUCCESS ?
+        OBMM_REMOTE_STATUS_SUCCESS : OBMM_REMOTE_STATUS_REMOTE_IO;
+    bytes_done = status == OBMM_REMOTE_STATUS_SUCCESS ?
+        MIN(response->header.data_len, response->data_len) : 0;
+    trace_ub_obmm_model_publish(
+        decision->operation_key, response->req_id, duplicate,
+        model_accept_ns, model_due_ns, model_publish_ns);
+    child->complete(child->opaque, child->token, child->child_index,
+                    status, response->data, bytes_done, model_publish_ns);
+    memset(child, 0, sizeof(*child));
+}
+
+static bool ubc_handle_sim_dec_async_read_resp(
+    BusControllerDev *ubc_dev, const UBCSimDecReadRespPldHdr *header,
+    const uint8_t *data, uint32_t data_len, uint32_t peer_cna)
+{
+    UbcObmmAsyncChild *child = NULL;
+    UbcSimDecModeledAsyncResponse *response;
+    UbObmmRemoteDecision decision;
+    uint64_t now_ns;
+    uint32_t child_slot;
+
+    if (!ubc_dev || !ubc_dev->obmm_async_children) {
+        return false;
+    }
+    for (child_slot = 0; child_slot < UBC_OBMM_ASYNC_CHILD_CAPACITY;
+         child_slot++) {
+        UbcObmmAsyncChild *candidate =
+            &ubc_dev->obmm_async_children[child_slot];
+
+        if (candidate->active && candidate->req_id == header->req_id &&
+            candidate->peer_cna == peer_cna) {
+            child = candidate;
+            break;
+        }
+    }
+    if (!child) {
+        return false;
+    }
+    if (child->model_queued) {
+        trace_ub_obmm_p1_late(header->req_id, "wire-duplicate", 0);
+        return true;
+    }
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (!ubc_dev->remote_memory_model.loaded || header->status != 0) {
+        ObmmRemoteStatus status = header->status == 0 ?
+            OBMM_REMOTE_STATUS_SUCCESS : OBMM_REMOTE_STATUS_REMOTE_IO;
+        uint32_t bytes_done = status == OBMM_REMOTE_STATUS_SUCCESS ?
+            MIN(header->data_len, data_len) : 0;
+
+        child->complete(child->opaque, child->token, child->child_index,
+                        status, data, bytes_done, now_ns);
+        memset(child, 0, sizeof(*child));
+        return true;
+    }
+
+    response = g_malloc0(sizeof(*response) + data_len);
+    response->ubc_dev = ubc_dev;
+    response->child_slot = child_slot;
+    response->req_id = header->req_id;
+    response->header = *header;
+    response->data_len = data_len;
+    if (data_len > 0) {
+        memcpy(response->data, data, data_len);
+    }
+    if (!ub_obmm_remote_model_enqueue(
+            &ubc_dev->remote_memory_model, &child->operation, now_ns,
+            ubc_obmm_async_model_due, ubc_obmm_async_model_publish,
+            g_free, response, &decision)) {
+        g_free(response);
+        child->complete(child->opaque, child->token, child->child_index,
+                        OBMM_REMOTE_STATUS_CAPACITY, NULL, 0, now_ns);
+        memset(child, 0, sizeof(*child));
+        return true;
+    }
+    child->model_queued = true;
+    trace_ub_obmm_model_accept(
+        decision.operation_key, header->req_id, now_ns);
+    if (ub_obmm_remote_model_next_due_ns(
+            &ubc_dev->remote_memory_model) <= now_ns) {
+        ub_obmm_remote_model_run_due(&ubc_dev->remote_memory_model, now_ns);
+    }
+    ubc_obmm_remote_model_arm(ubc_dev);
+    return true;
+}
+
+void ubc_handle_sim_dec_rx_read_resp(BusControllerDev *ubc_dev,
+                                     const UBCSimDecReadRespPldHdr *hdr,
+                                     const uint8_t *data, uint32_t data_len,
+                                     uint32_t peer_cna)
+{
+    UbcSimDecModeledReadResponse *response;
+    UbObmmRemoteOperation operation;
+    UbObmmRemoteDecision decision;
+    uint64_t now_ns;
+
+    if (!ubc_dev || !hdr) {
+        return;
+    }
+    if (ubc_handle_sim_dec_async_read_resp(ubc_dev, hdr, data, data_len,
+                                            peer_cna)) {
+        return;
+    }
+    if (!ubc_dev->remote_memory_model.loaded || hdr->status != 0) {
+        ubc_deliver_sim_dec_read_resp(ubc_dev, hdr, data, data_len,
+                                      peer_cna);
+        return;
+    }
+    if (!ubc_dev->sim_dec_sync_read.pending ||
+        ubc_dev->sim_dec_sync_read.req_id != hdr->req_id ||
+        ubc_dev->sim_dec_sync_read.peer_cna != peer_cna ||
+        ubc_dev->sim_dec_sync_read.model_queued) {
+        ubc_deliver_sim_dec_read_resp(ubc_dev, hdr, data, data_len,
+                                      peer_cna);
+        return;
+    }
+
+    response = g_malloc0(sizeof(*response) + data_len);
+    response->ubc_dev = ubc_dev;
+    response->header = *hdr;
+    response->peer_cna = peer_cna;
+    response->data_len = data_len;
+    if (data_len > 0) {
+        memcpy(response->data, data, data_len);
+    }
+    operation = (UbObmmRemoteOperation) {
+        .map_id = ubc_dev->sim_dec_sync_read.map_id,
+        .map_generation = ubc_dev->sim_dec_sync_read.map_generation,
+        .remote_offset = ubc_dev->sim_dec_sync_read.remote_offset,
+        .length = ubc_dev->sim_dec_sync_read.expect_len,
+        .per_range_ordinal =
+            ubc_dev->sim_dec_sync_read.per_range_ordinal,
+    };
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (!ub_obmm_remote_model_enqueue(
+            &ubc_dev->remote_memory_model, &operation, now_ns,
+            ubc_obmm_remote_model_due, ubc_obmm_remote_model_publish,
+            g_free, response, &decision)) {
+        g_free(response);
+        ubc_dev->sim_dec_sync_read.status = -EAGAIN;
+        ubc_dev->sim_dec_sync_read.actual_len = 0;
+        ubc_dev->sim_dec_sync_read.pending = false;
+        ubc_dev->sim_dec_sync_read.peer_cna = 0;
+        trace_ub_obmm_model_capacity(hdr->req_id, now_ns);
+        return;
+    }
+    ubc_dev->sim_dec_sync_read.model_queued = true;
+    trace_ub_obmm_model_accept(decision.operation_key, hdr->req_id,
+                               now_ns);
+    if (ub_obmm_remote_model_next_due_ns(
+            &ubc_dev->remote_memory_model) <= now_ns) {
+        ub_obmm_remote_model_run_due(&ubc_dev->remote_memory_model, now_ns);
+    }
+    ubc_obmm_remote_model_arm(ubc_dev);
 }
 
 int ubc_ub_ssd_send_read_resp(BusControllerDev *ubc_dev, uint32_t dcna,
@@ -6105,6 +6415,130 @@ MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
     return MEMTX_OK;
 }
 
+bool ubc_obmm_resolve_async_map(BusControllerDev *ubc_dev,
+                                uint64_t local_pa, uint64_t length,
+                                UbcObmmResolvedMap *resolved)
+{
+    SimDecMapEntry *entry;
+    uint64_t offset;
+
+    if (!ubc_dev || !resolved || length == 0 ||
+        local_pa > UINT64_MAX - length) {
+        return false;
+    }
+    entry = sim_dec_find_entry_by_pa(local_pa);
+    if (!entry || !entry->active || local_pa < entry->local_pa) {
+        return false;
+    }
+    offset = local_pa - entry->local_pa;
+    if (offset > entry->size || length > entry->size - offset) {
+        return false;
+    }
+    *resolved = (UbcObmmResolvedMap) {
+        .map_id = entry->map_id,
+        .map_generation = entry->gva_id ? entry->gva_id : entry->map_id,
+        .remote_uba = entry->remote_uba + offset,
+        .length = length,
+        .token_id = entry->token_id,
+        .peer_cna = entry->dcna,
+    };
+    return true;
+}
+
+bool ubc_sim_dec_remote_read_async_submit(
+    BusControllerDev *ubc_dev, const UbcObmmResolvedMap *map,
+    uint64_t remote_offset, uint32_t length,
+    const UbObmmRemoteOperation *operation, ObmmRemoteToken token,
+    uint16_t child_index, UbcObmmAsyncReadCompleteFn complete,
+    void *opaque)
+{
+    UbcObmmAsyncChild *child = NULL;
+    UBCSimDecReadReqPld request = { 0 };
+    UBLinkState *link;
+    uint32_t peer_cna;
+    uint32_t index;
+    int rc;
+
+    if (!ubc_dev || !map || !operation || !complete || length == 0 ||
+        remote_offset > map->length || length > map->length - remote_offset) {
+        return false;
+    }
+    peer_cna = map->peer_cna;
+    link = ubc_find_active_link(ubc_dev, &peer_cna);
+    if (!link) {
+        return false;
+    }
+    for (index = 0; index < UBC_OBMM_ASYNC_CHILD_CAPACITY; index++) {
+        if (!ubc_dev->obmm_async_children[index].active) {
+            child = &ubc_dev->obmm_async_children[index];
+            break;
+        }
+    }
+    if (!child) {
+        return false;
+    }
+    request.req_id = ++ubc_dev->next_sim_dec_read_req_id;
+    if (request.req_id == 0) {
+        request.req_id = ++ubc_dev->next_sim_dec_read_req_id;
+    }
+    request.token_id = map->token_id;
+    request.remote_uba = map->remote_uba + remote_offset;
+    request.read_len = length;
+    *child = (UbcObmmAsyncChild) {
+        .active = true,
+        .req_id = request.req_id,
+        .peer_cna = peer_cna,
+        .expected_len = length,
+        .token = token,
+        .child_index = child_index,
+        .operation = *operation,
+        .complete = complete,
+        .opaque = opaque,
+    };
+    rc = ubc_send_msg_over_link(ubc_dev, link, peer_cna,
+                                UBC_MSG_SUB_SIM_DEC_READ_REQ,
+                                &request, sizeof(request));
+    if (rc < 0) {
+        memset(child, 0, sizeof(*child));
+        return false;
+    }
+    return true;
+}
+
+void ubc_sim_dec_remote_read_async_cancel(BusControllerDev *ubc_dev,
+                                          ObmmRemoteToken token)
+{
+    uint32_t index;
+
+    if (!ubc_dev || !ubc_dev->obmm_async_children) {
+        return;
+    }
+    for (index = 0; index < UBC_OBMM_ASYNC_CHILD_CAPACITY; index++) {
+        UbcObmmAsyncChild *child = &ubc_dev->obmm_async_children[index];
+
+        if (child->active && child->token.owner_id == token.owner_id &&
+            child->token.slot == token.slot &&
+            child->token.generation == token.generation) {
+            memset(child, 0, sizeof(*child));
+        }
+    }
+}
+
+void ubc_obmm_async_irq_notify(BusControllerDev *ubc_dev)
+{
+    BusControllerState *bcs;
+
+    if (!ubc_dev) {
+        return;
+    }
+    bcs = container_of_ubbus(ub_get_bus(&ubc_dev->parent));
+    if (!bcs) {
+        return;
+    }
+    qemu_set_irq(bcs->irq, 1);
+    qemu_set_irq(bcs->irq, 0);
+}
+
 MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
                                     uint64_t remote_uba,
                                     uint32_t token_id,
@@ -6131,6 +6565,7 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
 
     while (done < len) {
         UBCSimDecReadReqPld req = { 0 };
+        SimDecMapEntry *model_entry;
         uint32_t chunk = MIN(len - done, UBC_SIM_DEC_READ_CHUNK_MAX);
         int rc;
         int loop;
@@ -6141,6 +6576,7 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
         }
 
         ubc_dev->sim_dec_sync_read.pending = true;
+        ubc_dev->sim_dec_sync_read.model_queued = false;
         ubc_dev->sim_dec_sync_read.req_id = ++ubc_dev->next_sim_dec_read_req_id;
         if (ubc_dev->sim_dec_sync_read.req_id == 0) {
             ubc_dev->sim_dec_sync_read.req_id = ++ubc_dev->next_sim_dec_read_req_id;
@@ -6150,6 +6586,23 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
         ubc_dev->sim_dec_sync_read.actual_len = 0;
         ubc_dev->sim_dec_sync_read.status = -ETIMEDOUT;
         ubc_dev->sim_dec_sync_read.buf = data + done;
+        model_entry = sim_dec_find_entry_by_uba(remote_uba + done, chunk);
+        if (model_entry) {
+            ubc_dev->sim_dec_sync_read.map_id = model_entry->map_id;
+            ubc_dev->sim_dec_sync_read.map_generation =
+                model_entry->gva_id ? model_entry->gva_id :
+                model_entry->map_id;
+            ubc_dev->sim_dec_sync_read.remote_offset =
+                remote_uba + done - model_entry->remote_uba;
+            ubc_dev->sim_dec_sync_read.per_range_ordinal =
+                model_entry->remote_read_ordinal++;
+        } else {
+            ubc_dev->sim_dec_sync_read.map_id = token_id;
+            ubc_dev->sim_dec_sync_read.map_generation = 1;
+            ubc_dev->sim_dec_sync_read.remote_offset = remote_uba + done;
+            ubc_dev->sim_dec_sync_read.per_range_ordinal =
+                ubc_dev->next_sim_dec_read_req_id;
+        }
 
         req.req_id = ubc_dev->sim_dec_sync_read.req_id;
         req.token_id = token_id;
@@ -6178,6 +6631,10 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
                 break;
             }
             ubc_sim_dec_process_wait_links(bcs, ubc_dev, link);
+            if (!ubc_dev->sim_dec_sync_read.pending) {
+                break;
+            }
+            qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
             if (!ubc_dev->sim_dec_sync_read.pending) {
                 break;
             }
@@ -7434,9 +7891,23 @@ static void ub_ers_region_write(void *opaque, hwaddr addr, uint64_t val, unsigne
     typeof(((BusControllerDev *)0)->ers[0]) *ers = opaque;
     BusControllerDev *ubc_dev = ers->owner;
     uint32_t entity_idx = 0;
+    hwaddr obmm_async_reg;
+    hwaddr obmm_scc_reg;
     hwaddr linqu_reg;
 
     if (ers->idx == 2 && len >= DWORD_SIZE) {
+        if (ubc_dev->obmm_async &&
+            ub_obmm_async_decode(addr, &obmm_async_reg) &&
+            ub_obmm_async_write(ubc_dev->obmm_async, obmm_async_reg,
+                                val, len)) {
+            return;
+        }
+        if (ubc_dev->obmm_scc &&
+            ub_scc_device_decode(addr, &obmm_scc_reg) &&
+            ub_scc_device_write(ubc_dev->obmm_scc, obmm_scc_reg,
+                                val, len)) {
+            return;
+        }
         if (linqu_uapi_decode_endpoint(addr, &linqu_reg) &&
             linqu_uapi_reg_write(ubc_dev, linqu_reg, val, len)) {
             return;
@@ -7534,6 +8005,14 @@ static const MemoryRegionOps ub_ers_region_ops = {
     .read = ub_ers_region_read,
     .write = ub_ers_region_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = sizeof(uint64_t),
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = sizeof(uint64_t),
+    },
 };
 
 static void ub_bus_controller_init_ers_regions(UBDevice *dev)
@@ -8470,6 +8949,41 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
 
     vms->ub_bus = bus;
 
+    ub_obmm_remote_model_init(&BUS_CONTROLLER_DEV(dev)->remote_memory_model);
+    if (BUS_CONTROLLER_DEV(dev)->remote_memory_model_manifest &&
+        !ub_obmm_remote_model_load(
+            &BUS_CONTROLLER_DEV(dev)->remote_memory_model,
+            BUS_CONTROLLER_DEV(dev)->remote_memory_model_manifest, errp)) {
+        return;
+    }
+    BUS_CONTROLLER_DEV(dev)->remote_memory_model_timer = timer_new_ns(
+        QEMU_CLOCK_VIRTUAL, ubc_obmm_remote_model_timer,
+        BUS_CONTROLLER_DEV(dev));
+    BUS_CONTROLLER_DEV(dev)->obmm_async_children = g_new0(
+        UbcObmmAsyncChild, UBC_OBMM_ASYNC_CHILD_CAPACITY);
+    BUS_CONTROLLER_DEV(dev)->obmm_async = ub_obmm_async_new(
+        BUS_CONTROLLER_DEV(dev));
+    if (!BUS_CONTROLLER_DEV(dev)->obmm_async) {
+        error_setg(errp, "failed to create OBMM asynchronous endpoint");
+        return;
+    }
+    BUS_CONTROLLER_DEV(dev)->obmm_scc = ub_scc_device_new(
+        BUS_CONTROLLER_DEV(dev),
+        BUS_CONTROLLER_DEV(dev)->scheduler_core_model, errp);
+    if (!BUS_CONTROLLER_DEV(dev)->obmm_scc) {
+        if (!errp || !*errp) {
+            error_setg(errp,
+                       "failed to create OBMM scheduler-core endpoint");
+        }
+        return;
+    }
+    if (BUS_CONTROLLER_DEV(dev)->remote_memory_model.loaded) {
+        qemu_log("OBMM_REMOTE_MODEL: loaded manifest=%s manifest_hash=%s enabled=%u\n",
+                 BUS_CONTROLLER_DEV(dev)->remote_memory_model_manifest,
+                 BUS_CONTROLLER_DEV(dev)->remote_memory_model.manifest_hash,
+                 BUS_CONTROLLER_DEV(dev)->remote_memory_model.config.enabled);
+    }
+
     if (!ub_ubc_is_empty(bus)) {
         qemu_log("ubc realize repetitively\n");
         error_setg(errp, "ubc realize repetitively");
@@ -8539,6 +9053,10 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
 static Property ub_bus_controller_dev_properties[] = {
     DEFINE_PROP_UB_DEV_GUID("bus_instance_guid", BusControllerDev, bus_instance_guid),
     DEFINE_PROP_UINT32("entity_count", BusControllerDev, entity_count, 1),
+    DEFINE_PROP_STRING("remote-memory-model-manifest", BusControllerDev,
+                       remote_memory_model_manifest),
+    DEFINE_PROP_STRING("scheduler-core-model", BusControllerDev,
+                       scheduler_core_model),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -8552,10 +9070,28 @@ static void ub_bus_controller_dev_class_init(ObjectClass *class, void *data)
     dc->vmsd = &vmstate_ub_bus_controller_dev;
 }
 
+static void ub_bus_controller_dev_finalize(Object *object)
+{
+    BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(object);
+
+    if (ubc_dev->remote_memory_model_timer) {
+        timer_free(ubc_dev->remote_memory_model_timer);
+        ubc_dev->remote_memory_model_timer = NULL;
+    }
+    ub_obmm_async_free(ubc_dev->obmm_async);
+    ubc_dev->obmm_async = NULL;
+    ub_scc_device_free(ubc_dev->obmm_scc);
+    ubc_dev->obmm_scc = NULL;
+    ub_obmm_remote_model_cleanup(&ubc_dev->remote_memory_model);
+    g_free(ubc_dev->obmm_async_children);
+    ubc_dev->obmm_async_children = NULL;
+}
+
 static const TypeInfo ub_bus_controller_dev_type_info = {
     .name = TYPE_BUS_CONTROLLER_DEV,
     .parent = TYPE_UB_DEVICE,
     .instance_size = sizeof(BusControllerDev),
+    .instance_finalize = ub_bus_controller_dev_finalize,
     .class_size = sizeof(BusControllerDevClass),
     .class_init = ub_bus_controller_dev_class_init,
 };
@@ -10294,7 +10830,8 @@ static char *sim_dec_obmm_bootstrap_dir(void)
     return g_build_filename(shared_dir, "obmm_bootstrap", NULL);
 }
 
-static char *sim_dec_obmm_bootstrap_path(uint32_t node_id)
+static char *sim_dec_obmm_bootstrap_path(uint32_t node_id,
+                                         uint64_t generation)
 {
     g_autofree char *dir = sim_dec_obmm_bootstrap_dir();
     g_autofree char *name = NULL;
@@ -10302,7 +10839,8 @@ static char *sim_dec_obmm_bootstrap_path(uint32_t node_id)
     if (!dir) {
         return NULL;
     }
-    name = g_strdup_printf("node%u.ini", node_id);
+    name = g_strdup_printf("node%u-generation%" PRIu64 ".ini",
+                           node_id, generation);
     return g_build_filename(dir, name, NULL);
 }
 
@@ -10327,7 +10865,8 @@ static int sim_dec_handle_obmm_bootstrap_publish(
     }
 
     dir = sim_dec_obmm_bootstrap_dir();
-    path = sim_dec_obmm_bootstrap_path(record->node_id);
+    path = sim_dec_obmm_bootstrap_path(record->node_id,
+                                       record->generation);
     if (!dir || !path) {
         qemu_log("SIM_DEC: OBMM bootstrap publish requires UB_FM_SHARED_DIR\n");
         return SIM_DEC_STATUS_NOT_SUPPORTED;
@@ -10364,6 +10903,10 @@ static int sim_dec_handle_obmm_bootstrap_publish(
         g_clear_error(&err);
         return SIM_DEC_STATUS_BACKEND_ERROR;
     }
+
+    /* Make the local payload resolvable before publishing peer visibility. */
+    obmm_export_register(record);
+    sim_dec_register_obmm_gsva_route(record);
     if (g_rename(tmp_path, path) != 0) {
         qemu_log("SIM_DEC: OBMM bootstrap publish rename failed: %s\n",
                  g_strerror(errno));
@@ -10375,9 +10918,6 @@ static int sim_dec_handle_obmm_bootstrap_publish(
              record->node_id, record->export_cna, record->remote_uba,
              record->backing_uba, record->token_id, record->size);
 
-    obmm_export_register(record);
-    sim_dec_register_obmm_gsva_route(record);
-
     return SIM_DEC_STATUS_SUCCESS;
 }
 
@@ -10385,7 +10925,8 @@ static bool sim_dec_obmm_bootstrap_load(uint32_t node_id, uint32_t node_count,
                                         uint64_t generation,
                                         SimDecObmmBootstrapRecord *record)
 {
-    g_autofree char *path = sim_dec_obmm_bootstrap_path(node_id);
+    g_autofree char *path = sim_dec_obmm_bootstrap_path(node_id,
+                                                        generation);
     g_autoptr(GKeyFile) keyfile = NULL;
     GError *err = NULL;
 
