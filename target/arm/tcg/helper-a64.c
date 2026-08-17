@@ -179,6 +179,7 @@ void arm_obmm_scc_set_active(CPUState *cs, bool active)
         qemu_mutex_lock_iothread();
     }
     env->obmm_scc_active = active;
+    env->obmm_scc_replay_valid = false;
     tb_flush(cs);
     cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
     if (need_lock) {
@@ -213,10 +214,10 @@ void HELPER(obmm_scc_boundary)(CPUARMState *env)
     cpu_loop_exit_noexc(cs);
 }
 
-void HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
-                                  uint32_t memop, uint32_t rt,
-                                  uint32_t mmu_index,
-                                  target_ulong fault_pc)
+uint64_t HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
+                                      uint32_t memop, uint32_t rt,
+                                      uint32_t mmu_index,
+                                      target_ulong fault_pc)
 {
     CPUState *cs = env_cpu(env);
     ObmmSccLoadDesc load;
@@ -225,12 +226,20 @@ void HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
     uint8_t bytes = 1U << (memop & MO_SIZE);
     bool need_lock;
     uintptr_t retaddr = GETPC();
+    uint64_t replay_value = 0;
 
+    env->obmm_scc_replay_valid = false;
     if (!ub_scc_cpu_enabled(cs) || !is_a64(env) ||
         !ub_scc_cpu_owner_matches(cs, env->cp15.ttbr0_el[1]) ||
-        arm_current_el(env) != 0 ||
-        !ub_scc_cpu_address_is_remote(cs, va, bytes)) {
-        return;
+        arm_current_el(env) != 0) {
+        return 0;
+    }
+    if (!ub_scc_cpu_address_is_remote(cs, va, bytes)) {
+        if (ub_scc_cpu_replay_expected(cs)) {
+            ub_scc_cpu_fail_stop(cs);
+            cpu_abort(cs, "OBMM replayed LDR no longer matches a remote map");
+        }
+        return 0;
     }
     obmm_scc_probe_access_range(env, va, bytes, MMU_DATA_LOAD, mmu_index,
                                 retaddr);
@@ -248,7 +257,7 @@ void HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
     if (need_lock) {
         qemu_mutex_lock_iothread();
     }
-    result = ub_scc_cpu_remote_load(cs, &load);
+    result = ub_scc_cpu_remote_load(cs, &load, &replay_value);
     if (result == UB_SCC_LOAD_PENDING) {
         if (!ub_scc_cpu_take_upcall(cs, fault_pc, &upcall_entry)) {
             result = UB_SCC_LOAD_FAIL_STOP;
@@ -259,7 +268,11 @@ void HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
     }
     if (result == UB_SCC_LOAD_NOT_REMOTE ||
         result == UB_SCC_LOAD_SYNC_STALL) {
-        return;
+        return 0;
+    }
+    if (result == UB_SCC_LOAD_REPLAYED) {
+        env->obmm_scc_replay_valid = true;
+        return replay_value;
     }
     if (result == UB_SCC_LOAD_PENDING) {
         env->pc = upcall_entry;
@@ -313,10 +326,10 @@ void HELPER(obmm_scc_boundary)(CPUARMState *env)
     (void)env;
 }
 
-void HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
-                                  uint32_t memop, uint32_t rt,
-                                  uint32_t mmu_index,
-                                  target_ulong fault_pc)
+uint64_t HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
+                                      uint32_t memop, uint32_t rt,
+                                      uint32_t mmu_index,
+                                      target_ulong fault_pc)
 {
     (void)env;
     (void)va;
@@ -324,6 +337,8 @@ void HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
     (void)rt;
     (void)mmu_index;
     (void)fault_pc;
+    env->obmm_scc_replay_valid = false;
+    return 0;
 }
 
 void HELPER(obmm_scc_resume)(CPUARMState *env,

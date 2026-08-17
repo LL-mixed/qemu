@@ -320,7 +320,8 @@ ObmmSccCompletionResult obmm_scc_load_complete(
     return OBMM_SCC_COMPLETION_ACCEPTED;
 }
 
-bool obmm_scc_event_pop(ObmmScc *scc, ObmmSccEvent *event)
+bool obmm_scc_event_pop(ObmmScc *scc, ObmmSccEvent *event,
+                        bool replay_retire)
 {
     ObmmSccPltEntry *entry;
 
@@ -346,6 +347,22 @@ bool obmm_scc_event_pop(ObmmScc *scc, ObmmSccEvent *event)
         }
         if (event->kind == OBMM_SCC_EVENT_COMPLETE) {
             scc->stats.completion_events_delivered++;
+            if (replay_retire) {
+                uint16_t slot;
+                uint16_t replay_ready = 0;
+
+                entry->state = OBMM_SCC_PLT_REPLAY_READY;
+                event->flags |= OBMM_SCC_EVENT_FLAG_REPLAY_RETIRE;
+                for (slot = 0;
+                     slot < scc->config.pending_load_entries; slot++) {
+                    replay_ready +=
+                        scc->plt[slot].state ==
+                        OBMM_SCC_PLT_REPLAY_READY;
+                }
+                scc->stats.replay_ready_high_water = MAX(
+                    scc->stats.replay_ready_high_water, replay_ready);
+                return true;
+            }
         }
         obmm_scc_recycle_plt(scc, entry);
     }
@@ -355,6 +372,75 @@ bool obmm_scc_event_pop(ObmmScc *scc, ObmmSccEvent *event)
 bool obmm_scc_event_pending(const ObmmScc *scc)
 {
     return scc && scc->event_count;
+}
+
+bool obmm_scc_replay_expected(const ObmmScc *scc,
+                              uint64_t context_id)
+{
+    uint16_t slot;
+
+    if (!scc || !context_id) {
+        return false;
+    }
+    for (slot = 0; slot < scc->config.pending_load_entries; slot++) {
+        const ObmmSccPltEntry *entry = &scc->plt[slot];
+
+        if (entry->state == OBMM_SCC_PLT_REPLAY_READY &&
+            entry->context_id == context_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool obmm_scc_replay_load_matches(
+    const ObmmSccLoadDesc *expected, const ObmmSccLoadDesc *actual)
+{
+    return expected->fault_pc == actual->fault_pc &&
+        expected->effective_va == actual->effective_va &&
+        expected->map_id == actual->map_id &&
+        expected->map_generation == actual->map_generation &&
+        expected->remote_offset == actual->remote_offset &&
+        expected->rt == actual->rt &&
+        expected->access_bytes == actual->access_bytes &&
+        expected->mmu_index == actual->mmu_index &&
+        expected->sign_extend == actual->sign_extend &&
+        expected->big_endian == actual->big_endian;
+}
+
+ObmmSccReplayResult obmm_scc_replay_consume(
+    ObmmScc *scc, uint64_t context_id, const ObmmSccLoadDesc *load,
+    uint64_t *value)
+{
+    ObmmSccPltEntry *entry = NULL;
+    uint16_t slot;
+
+    if (!scc || !context_id || !load || !value || scc->fail_stop) {
+        return OBMM_SCC_REPLAY_NONE;
+    }
+    for (slot = 0; slot < scc->config.pending_load_entries; slot++) {
+        if (scc->plt[slot].state == OBMM_SCC_PLT_REPLAY_READY &&
+            scc->plt[slot].context_id == context_id) {
+            if (entry) {
+                scc->stats.replay_mismatch++;
+                scc->fail_stop = true;
+                return OBMM_SCC_REPLAY_MISMATCH;
+            }
+            entry = &scc->plt[slot];
+        }
+    }
+    if (!entry) {
+        return OBMM_SCC_REPLAY_NONE;
+    }
+    if (!obmm_scc_replay_load_matches(&entry->load, load)) {
+        scc->stats.replay_mismatch++;
+        scc->fail_stop = true;
+        return OBMM_SCC_REPLAY_MISMATCH;
+    }
+    *value = obmm_scc_load_value(entry);
+    scc->stats.replay_consumed++;
+    obmm_scc_recycle_plt(scc, entry);
+    return OBMM_SCC_REPLAY_CONSUMED;
 }
 
 void obmm_scc_record_direct_upcall(ObmmScc *scc)

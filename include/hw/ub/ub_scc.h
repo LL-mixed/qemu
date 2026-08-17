@@ -13,6 +13,7 @@
 #define OBMM_SCC_MAX_CONTEXTS 64
 #define OBMM_SCC_MAX_PENDING_LOADS 64
 #define OBMM_SCC_MAX_EVENTS 128
+#define OBMM_SCC_EVENT_FLAG_REPLAY_RETIRE (1U << 1)
 
 typedef struct ObmmScc ObmmScc;
 
@@ -20,6 +21,7 @@ typedef enum ObmmSccPltState {
     OBMM_SCC_PLT_FREE,
     OBMM_SCC_PLT_PENDING,
     OBMM_SCC_PLT_COMPLETE,
+    OBMM_SCC_PLT_REPLAY_READY,
     OBMM_SCC_PLT_FAULTED,
 } ObmmSccPltState;
 
@@ -41,6 +43,12 @@ typedef enum ObmmSccCompletionResult {
     OBMM_SCC_COMPLETION_STALE,
     OBMM_SCC_COMPLETION_DUPLICATE,
 } ObmmSccCompletionResult;
+
+typedef enum ObmmSccReplayResult {
+    OBMM_SCC_REPLAY_NONE,
+    OBMM_SCC_REPLAY_CONSUMED,
+    OBMM_SCC_REPLAY_MISMATCH,
+} ObmmSccReplayResult;
 
 typedef enum ObmmSccLoadStatus {
     OBMM_SCC_LOAD_SUCCESS,
@@ -115,6 +123,9 @@ typedef struct ObmmSccStats {
     uint16_t pending_high_water;
     uint16_t ready_high_water;
     uint16_t event_high_water;
+    uint64_t replay_consumed;
+    uint64_t replay_mismatch;
+    uint16_t replay_ready_high_water;
 } ObmmSccStats;
 
 bool obmm_scc_config_parse(const char *spec, bool *enabled,
@@ -132,8 +143,14 @@ ObmmSccCompletionResult obmm_scc_load_complete(
     ObmmScc *scc, ObmmSccPltToken plt_token, ObmmSccLoadStatus status,
     const void *payload, uint8_t bytes_done, uint64_t complete_cycle);
 
-bool obmm_scc_event_pop(ObmmScc *scc, ObmmSccEvent *event);
+bool obmm_scc_event_pop(ObmmScc *scc, ObmmSccEvent *event,
+                        bool replay_retire);
 bool obmm_scc_event_pending(const ObmmScc *scc);
+bool obmm_scc_replay_expected(const ObmmScc *scc,
+                              uint64_t context_id);
+ObmmSccReplayResult obmm_scc_replay_consume(
+    ObmmScc *scc, uint64_t context_id, const ObmmSccLoadDesc *load,
+    uint64_t *value);
 void obmm_scc_record_direct_upcall(ObmmScc *scc);
 void obmm_scc_mark_fail_stop(ObmmScc *scc);
 bool obmm_scc_fail_stop(const ObmmScc *scc);

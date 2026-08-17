@@ -43,7 +43,11 @@
 #define SCC_REG_EVENT_KIND_STATUS 0x170
 #define SCC_REG_EVENT_META 0x178
 #define SCC_REG_EVENT_COMMAND 0x180
+#define SCC_REG_SCHEDULER_COMMAND 0x188
+#define SCC_REG_SESSION_FLAGS 0x190
+#define SCC_REG_CAPABILITIES 0x198
 #define SCC_REG_STATS_BASE 0x200
+#define SCC_REG_REPLAY_STATS_BASE 0x400
 
 #define SCC_STATUS_ACTIVE BIT(0)
 #define SCC_STATUS_FAIL_STOP BIT(1)
@@ -105,6 +109,7 @@ struct UbSccDeviceState {
     uint64_t load_timeout_ns;
     uint64_t owner_ttbr0;
     uint64_t upcall_entry;
+    uint64_t session_flags;
     uint64_t active_context_id;
     uint16_t logical_context_count;
     uint64_t context_next_ordinal[OBMM_SCC_MAX_CONTEXTS];
@@ -336,6 +341,7 @@ static bool ub_scc_reset(UbSccDeviceState *state)
     state->active_context_id = 0;
     state->logical_context_count = 0;
     state->upcall_entry = 0;
+    state->session_flags = 0;
     state->load_timeout_ns = 0;
     state->owner_ttbr0 = 0;
     state->last_error = 0;
@@ -476,6 +482,19 @@ uint64_t ub_scc_device_read(UbSccDeviceState *state, hwaddr reg,
     }
     stats = obmm_scc_stats(state->model);
     event = &state->delivered_event;
+    if ((reg & ~7ULL) >= SCC_REG_REPLAY_STATS_BASE &&
+        (reg & ~7ULL) < SCC_REG_REPLAY_STATS_BASE + 4 * 8) {
+        uint32_t index = ((reg & ~7ULL) -
+                          SCC_REG_REPLAY_STATS_BASE) / 8;
+
+        switch (index) {
+        case 0: value = stats->replay_consumed; break;
+        case 1: value = stats->replay_mismatch; break;
+        case 2: value = stats->replay_ready_high_water; break;
+        default: value = 0; break;
+        }
+        return ub_scc_access_extract(value, reg, size);
+    }
     if ((reg & ~7ULL) >= SCC_REG_STATS_BASE) {
         uint32_t index = ((reg & ~7ULL) - SCC_REG_STATS_BASE) / 8;
 
@@ -491,6 +510,15 @@ uint64_t ub_scc_device_read(UbSccDeviceState *state, hwaddr reg,
             ((uint64_t)state->config.event_queue_depth << 48);
         break;
     case SCC_REG_STATUS:
+        /*
+         * GET_EVENT(WAIT) polls this register from the guest vCPU.  Progress
+         * ready completions and deadlines here as well as from the BH so a
+         * busy MTTCG vCPU cannot starve the main-loop delivery path.
+         */
+        obmm_remote_run_deadlines(
+            state->backend, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        obmm_remote_deliver_ready(state->backend);
+        ub_scc_arm_deadline(state);
         value = (state->session_active ? SCC_STATUS_ACTIVE : 0) |
             (state->enabled ? SCC_STATUS_ENABLED : 0) |
             (obmm_scc_fail_stop(state->model) ? SCC_STATUS_FAIL_STOP : 0) |
@@ -532,6 +560,12 @@ uint64_t ub_scc_device_read(UbSccDeviceState *state, hwaddr reg,
         break;
     case SCC_REG_LOGICAL_CONTEXTS:
         value = state->logical_context_count;
+        break;
+    case SCC_REG_SESSION_FLAGS:
+        value = state->session_flags;
+        break;
+    case SCC_REG_CAPABILITIES:
+        value = UB_SCC_CAP_REPLAY_RETIRE;
         break;
     case SCC_REG_ACTIVE_CONTEXT_ID:
         value = state->active_context_id;
@@ -664,8 +698,9 @@ static void ub_scc_event_command(UbSccDeviceState *state,
         state->delivered_event_valid = false;
     } else if (command == 2) {
         if (!state->session_active || state->delivered_event_valid ||
-            !obmm_scc_event_pop(state->model,
-                                &state->delivered_event)) {
+            !obmm_scc_event_pop(
+                state->model, &state->delivered_event,
+                state->session_flags & UB_SCC_START_REPLAY_RETIRE)) {
             state->last_error = UB_SCC_ERROR_BUSY;
             return;
         }
@@ -674,6 +709,26 @@ static void ub_scc_event_command(UbSccDeviceState *state,
     } else {
         state->last_error = UB_SCC_ERROR_INVALID;
     }
+}
+
+static void ub_scc_scheduler_command(UbSccDeviceState *state,
+                                     uint64_t command)
+{
+    state->last_error = UB_SCC_ERROR_NONE;
+    if (command != 1 || !state->session_active || !current_cpu ||
+        state->home_cpu != current_cpu || state->upcall_active ||
+        state->delivered_event_valid || !state->active_context_id) {
+        state->last_error = UB_SCC_ERROR_BUSY;
+        return;
+    }
+    /*
+     * A logical context returned normally and EL0 now owns scheduling.
+     * Suppress boundary upcalls until HLT #0x5343 atomically resumes the
+     * selected context; otherwise the scheduler's registers could be saved
+     * into that context at the resume assembly TB boundary.
+     */
+    state->active_context_id = 0;
+    state->upcall_active = true;
 }
 
 bool ub_scc_device_write(UbSccDeviceState *state, hwaddr reg,
@@ -748,8 +803,20 @@ bool ub_scc_device_write(UbSccDeviceState *state, hwaddr reg,
             state->logical_context_count = value;
         }
         return true;
+    case SCC_REG_SESSION_FLAGS:
+        if (state->session_active ||
+            value & ~UB_SCC_START_REPLAY_RETIRE) {
+            state->last_error = UB_SCC_ERROR_INVALID;
+        } else {
+            state->session_flags = value;
+            state->last_error = UB_SCC_ERROR_NONE;
+        }
+        return true;
     case SCC_REG_EVENT_COMMAND:
         ub_scc_event_command(state, value);
+        return true;
+    case SCC_REG_SCHEDULER_COMMAND:
+        ub_scc_scheduler_command(state, value);
         return true;
     default:
         return false;
@@ -812,6 +879,17 @@ bool ub_scc_cpu_address_is_remote(CPUState *cpu, uint64_t va,
         ub_scc_find_map(state, va, bytes, &remote_offset, &map_id);
 }
 
+bool ub_scc_cpu_replay_expected(CPUState *cpu)
+{
+    UbSccDeviceState *state = ub_scc_global;
+
+    return state && state->session_active && state->home_cpu == cpu &&
+        !state->upcall_active &&
+        state->session_flags & UB_SCC_START_REPLAY_RETIRE &&
+        obmm_scc_replay_expected(state->model,
+                                 state->active_context_id);
+}
+
 bool ub_scc_cpu_take_upcall(CPUState *cpu, uint64_t interrupted_pc,
                             uint64_t *upcall_entry)
 {
@@ -820,7 +898,9 @@ bool ub_scc_cpu_take_upcall(CPUState *cpu, uint64_t interrupted_pc,
     if (!state || !upcall_entry || !state->session_active ||
         state->home_cpu != cpu || state->upcall_active ||
         state->delivered_event_valid ||
-        !obmm_scc_event_pop(state->model, &state->delivered_event)) {
+        !obmm_scc_event_pop(
+            state->model, &state->delivered_event,
+            state->session_flags & UB_SCC_START_REPLAY_RETIRE)) {
         return false;
     }
     state->delivered_event.interrupted_pc = interrupted_pc;
@@ -927,7 +1007,7 @@ static void ub_scc_load_complete(void *opaque,
 }
 
 UbSccLoadTryResult ub_scc_cpu_remote_load(
-    CPUState *cpu, const ObmmSccLoadDesc *load)
+    CPUState *cpu, const ObmmSccLoadDesc *load, uint64_t *replay_value)
 {
     UbSccDeviceState *state = ub_scc_global;
     ObmmSccLoadDesc resolved_load;
@@ -945,6 +1025,7 @@ UbSccLoadTryResult ub_scc_cpu_remote_load(
     uint64_t operation_ordinal;
     uint64_t now_ns;
     uint16_t context_slot;
+    ObmmSccReplayResult replay;
 
     if (!state || !load || !state->session_active ||
         state->home_cpu != cpu || !state->active_context_id ||
@@ -954,7 +1035,26 @@ UbSccLoadTryResult ub_scc_cpu_remote_load(
     map = ub_scc_find_map(state, load->effective_va,
                           load->access_bytes, &remote_offset, &map_id);
     if (!map) {
-        return UB_SCC_LOAD_NOT_REMOTE;
+        return ub_scc_cpu_replay_expected(cpu) ?
+            UB_SCC_LOAD_FAIL_STOP : UB_SCC_LOAD_NOT_REMOTE;
+    }
+    resolved_load = *load;
+    resolved_load.map_id = map_id;
+    resolved_load.map_generation = map->generation;
+    resolved_load.remote_offset = remote_offset;
+    if (state->session_flags & UB_SCC_START_REPLAY_RETIRE) {
+        replay = obmm_scc_replay_consume(
+            state->model, state->active_context_id,
+            &resolved_load, replay_value);
+        if (replay == OBMM_SCC_REPLAY_CONSUMED) {
+            trace_scc_load_replay(
+                state->owner_generation, state->active_context_id,
+                load->fault_pc, load->effective_va, *replay_value);
+            return UB_SCC_LOAD_REPLAYED;
+        }
+        if (replay == OBMM_SCC_REPLAY_MISMATCH) {
+            return UB_SCC_LOAD_FAIL_STOP;
+        }
     }
     context_slot = obmm_scc_context_id_slot(state->active_context_id);
     if (context_slot >= state->logical_context_count ||
@@ -965,10 +1065,6 @@ UbSccLoadTryResult ub_scc_cpu_remote_load(
         return UB_SCC_LOAD_FAIL_STOP;
     }
     now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    resolved_load = *load;
-    resolved_load.map_id = map_id;
-    resolved_load.map_generation = map->generation;
-    resolved_load.remote_offset = remote_offset;
     if (state->load_timeout_ns) {
         uint64_t deadline_ns = now_ns >
             UINT64_MAX - state->load_timeout_ns ? UINT64_MAX :

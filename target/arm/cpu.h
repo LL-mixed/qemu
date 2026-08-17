@@ -264,6 +264,8 @@ typedef struct CPUArchState {
 
     /* Experimental EL0 scheduler-core TB specialization gate. */
     bool obmm_scc_active;
+    /* Set by the remote-load helper for one replayed LDR translation. */
+    bool obmm_scc_replay_valid;
 
     /* Frequently accessed CPSR bits are stored separately for efficiency.
        This contains all the other bits.  Use cpsr_{read,write} to access

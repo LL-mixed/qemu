@@ -1020,18 +1020,26 @@ static void do_gpr_ld(DisasContext *s, TCGv_i64 dest, TCGv_i64 tcg_addr,
                      iss_valid, iss_srt, iss_sf, iss_ar);
 }
 
-static void gen_obmm_scc_remote_load(DisasContext *s,
+static bool gen_obmm_scc_remote_load(DisasContext *s,
                                      TCGv_i64 tcg_addr, MemOp memop,
-                                     uint32_t rt, int memidx)
+                                     uint32_t rt, int memidx,
+                                     TCGv_i64 *replay_value,
+                                     TCGv_i32 *replay_valid)
 {
     if (!s->obmm_scc_active || s->current_el != 0 ||
         (memop & MO_SIGN) || (memop & MO_SIZE) > MO_64) {
-        return;
+        return false;
     }
+    *replay_value = tcg_temp_new_i64();
+    *replay_valid = tcg_temp_new_i32();
     gen_helper_obmm_scc_remote_load(
-        tcg_env, tcg_addr, tcg_constant_i32(memop),
+        *replay_value, tcg_env, tcg_addr, tcg_constant_i32(memop),
         tcg_constant_i32(rt), tcg_constant_i32(memidx),
         tcg_constant_tl(s->pc_curr));
+    tcg_gen_ld8u_i32(
+        *replay_valid, tcg_env,
+        offsetof(CPUARMState, obmm_scc_replay_valid));
+    return true;
 }
 
 /*
@@ -3136,10 +3144,36 @@ static bool trans_LDR_i(DisasContext *s, arg_ldst_imm *a)
     iss_sf = ldst_iss_sf(a->sz, a->sign, a->ext);
 
     if (!a->w && !a->sign) {
-        gen_obmm_scc_remote_load(s, clean_addr, mop, a->rt, memidx);
+        TCGv_i64 replay_value;
+        TCGv_i32 replay_valid;
+
+        if (gen_obmm_scc_remote_load(
+                s, clean_addr, mop, a->rt, memidx,
+                &replay_value, &replay_valid)) {
+            TCGLabel *normal_load = gen_new_label();
+            TCGLabel *load_done = gen_new_label();
+
+            tcg_gen_brcondi_i32(
+                TCG_COND_EQ, replay_valid, 0, normal_load);
+            if (a->rt != 31) {
+                tcg_gen_mov_i64(tcg_rt, replay_value);
+            }
+            tcg_gen_br(load_done);
+            gen_set_label(normal_load);
+            do_gpr_ld_memidx(s, tcg_rt, clean_addr, mop,
+                             a->ext, memidx, iss_valid, a->rt,
+                             iss_sf, false);
+            gen_set_label(load_done);
+        } else {
+            do_gpr_ld_memidx(s, tcg_rt, clean_addr, mop,
+                             a->ext, memidx, iss_valid, a->rt,
+                             iss_sf, false);
+        }
+    } else {
+        do_gpr_ld_memidx(s, tcg_rt, clean_addr, mop,
+                         a->ext, memidx, iss_valid, a->rt,
+                         iss_sf, false);
     }
-    do_gpr_ld_memidx(s, tcg_rt, clean_addr, mop,
-                     a->ext, memidx, iss_valid, a->rt, iss_sf, false);
     op_addr_ldst_imm_post(s, a, dirty_addr, a->imm);
     return true;
 }
@@ -3206,11 +3240,33 @@ static bool trans_LDR(DisasContext *s, arg_ldst *a)
     op_addr_ldst_pre(s, a, &clean_addr, &dirty_addr, false, memop);
     tcg_rt = cpu_reg(s, a->rt);
     if (!a->sign) {
-        gen_obmm_scc_remote_load(s, clean_addr, memop, a->rt,
-                                 get_mem_index(s));
+        TCGv_i64 replay_value;
+        TCGv_i32 replay_valid;
+
+        if (gen_obmm_scc_remote_load(
+                s, clean_addr, memop, a->rt, get_mem_index(s),
+                &replay_value, &replay_valid)) {
+            TCGLabel *normal_load = gen_new_label();
+            TCGLabel *load_done = gen_new_label();
+
+            tcg_gen_brcondi_i32(
+                TCG_COND_EQ, replay_valid, 0, normal_load);
+            if (a->rt != 31) {
+                tcg_gen_mov_i64(tcg_rt, replay_value);
+            }
+            tcg_gen_br(load_done);
+            gen_set_label(normal_load);
+            do_gpr_ld(s, tcg_rt, clean_addr, memop,
+                      a->ext, true, a->rt, iss_sf, false);
+            gen_set_label(load_done);
+        } else {
+            do_gpr_ld(s, tcg_rt, clean_addr, memop,
+                      a->ext, true, a->rt, iss_sf, false);
+        }
+    } else {
+        do_gpr_ld(s, tcg_rt, clean_addr, memop,
+                  a->ext, true, a->rt, iss_sf, false);
     }
-    do_gpr_ld(s, tcg_rt, clean_addr, memop,
-              a->ext, true, a->rt, iss_sf, false);
     return true;
 }
 

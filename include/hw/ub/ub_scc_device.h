@@ -14,6 +14,8 @@
 #define UB_SCC_ENDPOINT_BYTES 0x1000
 #define UB_SCC_ABI_VERSION 2
 #define UB_SCC_RESUME_IMM 0x5343
+#define UB_SCC_CAP_REPLAY_RETIRE (1ULL << 8)
+#define UB_SCC_START_REPLAY_RETIRE (1ULL << 0)
 
 typedef struct BusControllerDev BusControllerDev;
 typedef struct UbSccDeviceState UbSccDeviceState;
@@ -22,6 +24,7 @@ typedef enum UbSccLoadTryResult {
     UB_SCC_LOAD_NOT_REMOTE,
     UB_SCC_LOAD_SYNC_STALL,
     UB_SCC_LOAD_PENDING,
+    UB_SCC_LOAD_REPLAYED,
     UB_SCC_LOAD_FAIL_STOP,
 } UbSccLoadTryResult;
 
@@ -40,12 +43,13 @@ bool ub_scc_cpu_owner_matches(CPUState *cpu, uint64_t ttbr0_el1);
 uint64_t ub_scc_cpu_cycle(CPUState *cpu);
 bool ub_scc_cpu_address_is_remote(CPUState *cpu, uint64_t va,
                                   uint8_t bytes);
+bool ub_scc_cpu_replay_expected(CPUState *cpu);
 bool ub_scc_cpu_take_upcall(CPUState *cpu, uint64_t interrupted_pc,
                             uint64_t *upcall_entry);
 bool ub_scc_cpu_resume(CPUState *cpu, uint64_t context_id);
 void ub_scc_cpu_fail_stop(CPUState *cpu);
 UbSccLoadTryResult ub_scc_cpu_remote_load(
-    CPUState *cpu, const ObmmSccLoadDesc *load);
+    CPUState *cpu, const ObmmSccLoadDesc *load, uint64_t *replay_value);
 
 /* Implemented by target/arm: controls TB specialization and invalidation. */
 void arm_obmm_scc_set_active(CPUState *cpu, bool active);

@@ -13,6 +13,7 @@ scc_load_pending(uint32_t owner_generation, uint64_t context_id, uint32_t plt_ge
 scc_context_save(uint32_t owner_generation, uint64_t context_id, uint32_t plt_generation, uint16_t plt_slot, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " plt=%u:%u cycle=%" PRIu64
 scc_context_restore(uint32_t owner_generation, uint64_t context_id, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " cycle=%" PRIu64
 scc_load_complete(uint32_t owner_generation, uint64_t context_id, uint32_t plt_generation, uint16_t plt_slot, uint32_t status, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " plt=%u:%u status=%u cycle=%" PRIu64
+scc_load_replay(uint32_t owner_generation, uint64_t context_id, uint64_t fault_pc, uint64_t effective_va, uint64_t value) "owner=%u context=%" PRIu64 " pc=0x%" PRIx64 " va=0x%" PRIx64 " value=0x%" PRIx64
 scc_load_commit(uint32_t owner_generation, uint64_t context_id, uint32_t plt_generation, uint16_t plt_slot, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " plt=%u:%u cycle=%" PRIu64
 scc_load_fault(uint32_t owner_generation, uint64_t context_id, uint32_t plt_generation, uint16_t plt_slot, uint32_t status, uint64_t guest_cycle) "owner=%u context=%" PRIu64 " plt=%u:%u status=%u cycle=%" PRIu64
 scc_stale_completion(uint32_t owner_generation, uint32_t plt_generation, uint16_t plt_slot, uint64_t guest_cycle) "owner=%u plt=%u:%u cycle=%" PRIu64

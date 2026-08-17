@@ -105,7 +105,7 @@ DEF_HELPER_FLAGS_2(rebuild_hflags_a64, TCG_CALL_NO_RWG, void, env, int)
 
 DEF_HELPER_FLAGS_5(probe_access, TCG_CALL_NO_WG, void, env, tl, i32, i32, i32)
 DEF_HELPER_1(obmm_scc_boundary, void, env)
-DEF_HELPER_6(obmm_scc_remote_load, void, env, tl, i32, i32, i32, tl)
+DEF_HELPER_6(obmm_scc_remote_load, i64, env, tl, i32, i32, i32, tl)
 DEF_HELPER_2(obmm_scc_resume, void, env, tl)
 
 DEF_HELPER_1(vfp_get_fpscr, i32, env)
