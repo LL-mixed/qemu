@@ -26,7 +26,7 @@
 #include "hw/ub/gsva_key.h"
 #include "hw/ub/ub_obmm_remote.h"
 #include "hw/ub/ub_obmm_remote_model.h"
-#include "hw/ub/ub_scc_device.h"
+#include "hw/ub/ub_async_load_device.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
 
@@ -146,12 +146,12 @@ typedef struct BusControllerDev {
     /* Multi-entity support */
     uint32_t entity_count;  /* Number of entities (FEs), default=1 */
     char *remote_memory_model_manifest;
-    char *scheduler_core_model;
+    char *async_load_model;
     UbObmmRemoteModelState remote_memory_model;
     QEMUTimer *remote_memory_model_timer;
     struct UbcObmmAsyncChild *obmm_async_children;
     struct UbObmmAsyncState *obmm_async;
-    struct UbSccDeviceState *obmm_scc;
+    struct UbAsyncLoadDeviceState *ub_async_load;
     UBEntityDesc entities[UB_MAX_ENTITIES]; /* per-entity descriptor table */
     UBEntityCfgSpace entity_cfg_spaces[UB_MAX_ENTITIES]; /* per-entity cfg spaces */
 

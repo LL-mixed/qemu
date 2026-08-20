@@ -40,7 +40,7 @@ typedef enum ObmmRemoteStatus {
 typedef enum ObmmRemoteSinkKind {
     OBMM_REMOTE_SINK_TEST,
     OBMM_REMOTE_SINK_P2A,
-    OBMM_REMOTE_SINK_P2B,
+    OBMM_REMOTE_SINK_ASYNC_LOAD,
 } ObmmRemoteSinkKind;
 
 typedef struct ObmmRemoteResult ObmmRemoteResult;

@@ -37,21 +37,21 @@
 #include <zlib.h> /* For crc32 */
 
 #ifndef CONFIG_USER_ONLY
-#include "hw/ub/ub_scc_device.h"
+#include "hw/ub/ub_async_load_device.h"
 #include "qemu/timer.h"
 
-#define OBMM_SCC_CONTEXT_BYTES 832
-#define OBMM_SCC_CONTEXT_ID_OFFSET 0
-#define OBMM_SCC_CONTEXT_XREGS_OFFSET 16
-#define OBMM_SCC_CONTEXT_SP_OFFSET 264
-#define OBMM_SCC_CONTEXT_PC_OFFSET 272
-#define OBMM_SCC_CONTEXT_NZCV_OFFSET 280
-#define OBMM_SCC_CONTEXT_QREGS_OFFSET 288
-#define OBMM_SCC_CONTEXT_FPCR_OFFSET 800
-#define OBMM_SCC_CONTEXT_FPSR_OFFSET 808
-#define OBMM_SCC_CONTEXT_TPIDR_OFFSET 816
+#define UB_ASYNC_LOAD_CONTEXT_BYTES 832
+#define UB_ASYNC_LOAD_CONTEXT_ID_OFFSET 0
+#define UB_ASYNC_LOAD_CONTEXT_XREGS_OFFSET 16
+#define UB_ASYNC_LOAD_CONTEXT_SP_OFFSET 264
+#define UB_ASYNC_LOAD_CONTEXT_PC_OFFSET 272
+#define UB_ASYNC_LOAD_CONTEXT_NZCV_OFFSET 280
+#define UB_ASYNC_LOAD_CONTEXT_QREGS_OFFSET 288
+#define UB_ASYNC_LOAD_CONTEXT_FPCR_OFFSET 800
+#define UB_ASYNC_LOAD_CONTEXT_FPSR_OFFSET 808
+#define UB_ASYNC_LOAD_CONTEXT_TPIDR_OFFSET 816
 
-typedef struct ObmmSccEl0Context {
+typedef struct UbAsyncLoadEl0Context {
     uint64_t context_id;
     uint64_t flags;
     uint64_t xregs[31];
@@ -63,26 +63,26 @@ typedef struct ObmmSccEl0Context {
     uint64_t fpsr;
     uint64_t tpidr_el0;
     uint64_t reserved;
-} ObmmSccEl0Context;
+} UbAsyncLoadEl0Context;
 
-QEMU_BUILD_BUG_ON(sizeof(ObmmSccEl0Context) != OBMM_SCC_CONTEXT_BYTES);
-QEMU_BUILD_BUG_ON(offsetof(ObmmSccEl0Context, xregs) !=
-                  OBMM_SCC_CONTEXT_XREGS_OFFSET);
-QEMU_BUILD_BUG_ON(offsetof(ObmmSccEl0Context, sp) !=
-                  OBMM_SCC_CONTEXT_SP_OFFSET);
-QEMU_BUILD_BUG_ON(offsetof(ObmmSccEl0Context, pc) !=
-                  OBMM_SCC_CONTEXT_PC_OFFSET);
-QEMU_BUILD_BUG_ON(offsetof(ObmmSccEl0Context, qregs) !=
-                  OBMM_SCC_CONTEXT_QREGS_OFFSET);
+QEMU_BUILD_BUG_ON(sizeof(UbAsyncLoadEl0Context) != UB_ASYNC_LOAD_CONTEXT_BYTES);
+QEMU_BUILD_BUG_ON(offsetof(UbAsyncLoadEl0Context, xregs) !=
+                  UB_ASYNC_LOAD_CONTEXT_XREGS_OFFSET);
+QEMU_BUILD_BUG_ON(offsetof(UbAsyncLoadEl0Context, sp) !=
+                  UB_ASYNC_LOAD_CONTEXT_SP_OFFSET);
+QEMU_BUILD_BUG_ON(offsetof(UbAsyncLoadEl0Context, pc) !=
+                  UB_ASYNC_LOAD_CONTEXT_PC_OFFSET);
+QEMU_BUILD_BUG_ON(offsetof(UbAsyncLoadEl0Context, qregs) !=
+                  UB_ASYNC_LOAD_CONTEXT_QREGS_OFFSET);
 
-static uint64_t obmm_scc_context_ldq(CPUARMState *env,
+static uint64_t async_load_context_ldq(CPUARMState *env,
                                      target_ulong address,
                                      uintptr_t retaddr)
 {
     return cpu_ldq_data_ra(env, address, retaddr);
 }
 
-static void obmm_scc_probe_access_range(CPUARMState *env,
+static void async_load_probe_access_range(CPUARMState *env,
                                         target_ulong address,
                                         uint32_t bytes,
                                         MMUAccessType access_type,
@@ -99,47 +99,47 @@ static void obmm_scc_probe_access_range(CPUARMState *env,
     }
 }
 
-static void obmm_scc_context_load(CPUARMState *env, target_ulong address,
-                                  ObmmSccEl0Context *context,
+static void async_load_context_load(CPUARMState *env, target_ulong address,
+                                  UbAsyncLoadEl0Context *context,
                                   uintptr_t retaddr)
 {
     uint32_t index;
 
-    obmm_scc_probe_access_range(env, address, OBMM_SCC_CONTEXT_BYTES,
+    async_load_probe_access_range(env, address, UB_ASYNC_LOAD_CONTEXT_BYTES,
                                 MMU_DATA_LOAD, cpu_mmu_index(env, false),
                                 retaddr);
-    context->context_id = obmm_scc_context_ldq(
-        env, address + OBMM_SCC_CONTEXT_ID_OFFSET, retaddr);
-    context->flags = obmm_scc_context_ldq(env, address + 8, retaddr);
+    context->context_id = async_load_context_ldq(
+        env, address + UB_ASYNC_LOAD_CONTEXT_ID_OFFSET, retaddr);
+    context->flags = async_load_context_ldq(env, address + 8, retaddr);
     for (index = 0; index < G_N_ELEMENTS(context->xregs); index++) {
-        context->xregs[index] = obmm_scc_context_ldq(
-            env, address + OBMM_SCC_CONTEXT_XREGS_OFFSET + index * 8,
+        context->xregs[index] = async_load_context_ldq(
+            env, address + UB_ASYNC_LOAD_CONTEXT_XREGS_OFFSET + index * 8,
             retaddr);
     }
-    context->sp = obmm_scc_context_ldq(
-        env, address + OBMM_SCC_CONTEXT_SP_OFFSET, retaddr);
-    context->pc = obmm_scc_context_ldq(
-        env, address + OBMM_SCC_CONTEXT_PC_OFFSET, retaddr);
-    context->nzcv = obmm_scc_context_ldq(
-        env, address + OBMM_SCC_CONTEXT_NZCV_OFFSET, retaddr);
+    context->sp = async_load_context_ldq(
+        env, address + UB_ASYNC_LOAD_CONTEXT_SP_OFFSET, retaddr);
+    context->pc = async_load_context_ldq(
+        env, address + UB_ASYNC_LOAD_CONTEXT_PC_OFFSET, retaddr);
+    context->nzcv = async_load_context_ldq(
+        env, address + UB_ASYNC_LOAD_CONTEXT_NZCV_OFFSET, retaddr);
     for (index = 0; index < G_N_ELEMENTS(context->qregs); index++) {
-        context->qregs[index][0] = obmm_scc_context_ldq(
-            env, address + OBMM_SCC_CONTEXT_QREGS_OFFSET + index * 16,
+        context->qregs[index][0] = async_load_context_ldq(
+            env, address + UB_ASYNC_LOAD_CONTEXT_QREGS_OFFSET + index * 16,
             retaddr);
-        context->qregs[index][1] = obmm_scc_context_ldq(
-            env, address + OBMM_SCC_CONTEXT_QREGS_OFFSET + index * 16 + 8,
+        context->qregs[index][1] = async_load_context_ldq(
+            env, address + UB_ASYNC_LOAD_CONTEXT_QREGS_OFFSET + index * 16 + 8,
             retaddr);
     }
-    context->fpcr = obmm_scc_context_ldq(
-        env, address + OBMM_SCC_CONTEXT_FPCR_OFFSET, retaddr);
-    context->fpsr = obmm_scc_context_ldq(
-        env, address + OBMM_SCC_CONTEXT_FPSR_OFFSET, retaddr);
-    context->tpidr_el0 = obmm_scc_context_ldq(
-        env, address + OBMM_SCC_CONTEXT_TPIDR_OFFSET, retaddr);
+    context->fpcr = async_load_context_ldq(
+        env, address + UB_ASYNC_LOAD_CONTEXT_FPCR_OFFSET, retaddr);
+    context->fpsr = async_load_context_ldq(
+        env, address + UB_ASYNC_LOAD_CONTEXT_FPSR_OFFSET, retaddr);
+    context->tpidr_el0 = async_load_context_ldq(
+        env, address + UB_ASYNC_LOAD_CONTEXT_TPIDR_OFFSET, retaddr);
 }
 
-static void obmm_scc_context_install(CPUARMState *env,
-                                     const ObmmSccEl0Context *context)
+static void async_load_context_install(CPUARMState *env,
+                                     const UbAsyncLoadEl0Context *context)
 {
     uint32_t index;
     uint32_t pstate;
@@ -162,7 +162,7 @@ static void obmm_scc_context_install(CPUARMState *env,
     arm_rebuild_hflags(env);
 }
 
-void arm_obmm_scc_set_active(CPUState *cs, bool active)
+void arm_async_load_set_active(CPUState *cs, bool active)
 {
     CPUARMState *env;
     bool need_lock;
@@ -171,15 +171,15 @@ void arm_obmm_scc_set_active(CPUState *cs, bool active)
         return;
     }
     env = cpu_env(cs);
-    if (env->obmm_scc_active == active) {
+    if (env->async_load_active == active) {
         return;
     }
     need_lock = !qemu_mutex_iothread_locked();
     if (need_lock) {
         qemu_mutex_lock_iothread();
     }
-    env->obmm_scc_active = active;
-    env->obmm_scc_replay_valid = false;
+    env->async_load_active = active;
+    env->async_load_replay_valid = false;
     tb_flush(cs);
     cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
     if (need_lock) {
@@ -187,15 +187,15 @@ void arm_obmm_scc_set_active(CPUState *cs, bool active)
     }
 }
 
-void HELPER(obmm_scc_boundary)(CPUARMState *env)
+void HELPER(async_load_boundary)(CPUARMState *env)
 {
     CPUState *cs = env_cpu(env);
     uint64_t upcall_entry;
     bool deliver;
     bool need_lock;
 
-    if (!ub_scc_cpu_enabled(cs) || !is_a64(env) ||
-        !ub_scc_cpu_owner_matches(cs, env->cp15.ttbr0_el[1]) ||
+    if (!ub_async_load_cpu_enabled(cs) || !is_a64(env) ||
+        !ub_async_load_cpu_owner_matches(cs, env->cp15.ttbr0_el[1]) ||
         arm_current_el(env) != 0) {
         return;
     }
@@ -203,7 +203,7 @@ void HELPER(obmm_scc_boundary)(CPUARMState *env)
     if (need_lock) {
         qemu_mutex_lock_iothread();
     }
-    deliver = ub_scc_cpu_take_upcall(cs, env->pc, &upcall_entry);
+    deliver = ub_async_load_cpu_take_upcall(cs, env->pc, &upcall_entry);
     if (need_lock) {
         qemu_mutex_unlock_iothread();
     }
@@ -214,39 +214,39 @@ void HELPER(obmm_scc_boundary)(CPUARMState *env)
     cpu_loop_exit_noexc(cs);
 }
 
-uint64_t HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
+uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
                                       uint32_t memop, uint32_t rt,
                                       uint32_t mmu_index,
                                       target_ulong fault_pc)
 {
     CPUState *cs = env_cpu(env);
-    ObmmSccLoadDesc load;
-    UbSccLoadTryResult result;
+    UbAsyncLoadDesc load;
+    UbAsyncLoadTryResult result;
     uint64_t upcall_entry;
     uint8_t bytes = 1U << (memop & MO_SIZE);
     bool need_lock;
     uintptr_t retaddr = GETPC();
     uint64_t replay_value = 0;
 
-    env->obmm_scc_replay_valid = false;
-    if (!ub_scc_cpu_enabled(cs) || !is_a64(env) ||
-        !ub_scc_cpu_owner_matches(cs, env->cp15.ttbr0_el[1]) ||
+    env->async_load_replay_valid = false;
+    if (!ub_async_load_cpu_enabled(cs) || !is_a64(env) ||
+        !ub_async_load_cpu_owner_matches(cs, env->cp15.ttbr0_el[1]) ||
         arm_current_el(env) != 0) {
         return 0;
     }
-    if (!ub_scc_cpu_address_is_remote(cs, va, bytes)) {
-        if (ub_scc_cpu_replay_expected(cs)) {
-            ub_scc_cpu_fail_stop(cs);
+    if (!ub_async_load_cpu_address_is_remote(cs, va, bytes)) {
+        if (ub_async_load_cpu_replay_expected(cs)) {
+            ub_async_load_cpu_fail_stop(cs);
             cpu_abort(cs, "OBMM replayed LDR no longer matches a remote map");
         }
         return 0;
     }
-    obmm_scc_probe_access_range(env, va, bytes, MMU_DATA_LOAD, mmu_index,
+    async_load_probe_access_range(env, va, bytes, MMU_DATA_LOAD, mmu_index,
                                 retaddr);
-    load = (ObmmSccLoadDesc) {
+    load = (UbAsyncLoadDesc) {
         .fault_pc = fault_pc,
         .effective_va = va,
-        .submit_cycle = ub_scc_cpu_cycle(cs),
+        .submit_cycle = ub_async_load_cpu_cycle(cs),
         .rt = rt,
         .access_bytes = bytes,
         .mmu_index = mmu_index,
@@ -257,76 +257,76 @@ uint64_t HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
     if (need_lock) {
         qemu_mutex_lock_iothread();
     }
-    result = ub_scc_cpu_remote_load(cs, &load, &replay_value);
-    if (result == UB_SCC_LOAD_PENDING) {
-        if (!ub_scc_cpu_take_upcall(cs, fault_pc, &upcall_entry)) {
-            result = UB_SCC_LOAD_FAIL_STOP;
+    result = ub_async_load_cpu_remote_load(cs, &load, &replay_value);
+    if (result == UB_ASYNC_LOAD_TRY_PENDING) {
+        if (!ub_async_load_cpu_take_upcall(cs, fault_pc, &upcall_entry)) {
+            result = UB_ASYNC_LOAD_TRY_FAIL_STOP;
         }
     }
     if (need_lock) {
         qemu_mutex_unlock_iothread();
     }
-    if (result == UB_SCC_LOAD_NOT_REMOTE ||
-        result == UB_SCC_LOAD_SYNC_STALL) {
+    if (result == UB_ASYNC_LOAD_TRY_NOT_REMOTE ||
+        result == UB_ASYNC_LOAD_TRY_SYNC_STALL) {
         return 0;
     }
-    if (result == UB_SCC_LOAD_REPLAYED) {
-        env->obmm_scc_replay_valid = true;
+    if (result == UB_ASYNC_LOAD_TRY_REPLAYED) {
+        env->async_load_replay_valid = true;
         return replay_value;
     }
-    if (result == UB_SCC_LOAD_PENDING) {
+    if (result == UB_ASYNC_LOAD_TRY_PENDING) {
         env->pc = upcall_entry;
         cpu_loop_exit_noexc(cs);
     }
-    ub_scc_cpu_fail_stop(cs);
+    ub_async_load_cpu_fail_stop(cs);
     cpu_abort(cs, "OBMM EL0 upcall delivery entered fail-stop");
 }
 
-void HELPER(obmm_scc_resume)(CPUARMState *env, target_ulong context_address)
+void HELPER(async_load_resume)(CPUARMState *env, target_ulong context_address)
 {
     CPUState *cs = env_cpu(env);
-    ObmmSccEl0Context context;
+    UbAsyncLoadEl0Context context;
     bool accepted;
     bool need_lock;
     uintptr_t retaddr = GETPC();
 
-    if (!ub_scc_cpu_enabled(cs) || !is_a64(env) ||
-        !ub_scc_cpu_owner_matches(cs, env->cp15.ttbr0_el[1]) ||
+    if (!ub_async_load_cpu_enabled(cs) || !is_a64(env) ||
+        !ub_async_load_cpu_owner_matches(cs, env->cp15.ttbr0_el[1]) ||
         arm_current_el(env) != 0 ||
         (context_address & 0xf)) {
         cpu_abort(cs, "invalid OBMM EL0 resume instruction");
     }
     memset(&context, 0, sizeof(context));
-    obmm_scc_context_load(env, context_address, &context, retaddr);
+    async_load_context_load(env, context_address, &context, retaddr);
     if (!context.context_id || !context.pc || !context.sp ||
         (context.sp & 0xf)) {
-        ub_scc_cpu_fail_stop(cs);
+        ub_async_load_cpu_fail_stop(cs);
         cpu_abort(cs, "invalid OBMM EL0 context image");
     }
     need_lock = !qemu_mutex_iothread_locked();
     if (need_lock) {
         qemu_mutex_lock_iothread();
     }
-    accepted = ub_scc_cpu_resume(cs, context.context_id);
+    accepted = ub_async_load_cpu_resume(cs, context.context_id);
     if (need_lock) {
         qemu_mutex_unlock_iothread();
     }
     if (!accepted) {
-        ub_scc_cpu_fail_stop(cs);
+        ub_async_load_cpu_fail_stop(cs);
         cpu_abort(cs, "OBMM EL0 scheduler submitted an invalid context");
     }
-    obmm_scc_context_install(env, &context);
+    async_load_context_install(env, &context);
     cpu_loop_exit_noexc(cs);
 }
 
 #else
 
-void HELPER(obmm_scc_boundary)(CPUARMState *env)
+void HELPER(async_load_boundary)(CPUARMState *env)
 {
     (void)env;
 }
 
-uint64_t HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
+uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
                                       uint32_t memop, uint32_t rt,
                                       uint32_t mmu_index,
                                       target_ulong fault_pc)
@@ -337,11 +337,11 @@ uint64_t HELPER(obmm_scc_remote_load)(CPUARMState *env, target_ulong va,
     (void)rt;
     (void)mmu_index;
     (void)fault_pc;
-    env->obmm_scc_replay_valid = false;
+    env->async_load_replay_valid = false;
     return 0;
 }
 
-void HELPER(obmm_scc_resume)(CPUARMState *env,
+void HELPER(async_load_resume)(CPUARMState *env,
                              target_ulong context_address)
 {
     (void)env;

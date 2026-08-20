@@ -27,7 +27,7 @@
 #include "semihosting/semihost.h"
 #include "cpregs.h"
 
-#define OBMM_SCC_RESUME_IMM 0x5343
+#define UB_ASYNC_LOAD_RESUME_IMM 0x5343
 
 static TCGv_i64 cpu_X[32];
 static TCGv_i64 cpu_pc;
@@ -1020,25 +1020,25 @@ static void do_gpr_ld(DisasContext *s, TCGv_i64 dest, TCGv_i64 tcg_addr,
                      iss_valid, iss_srt, iss_sf, iss_ar);
 }
 
-static bool gen_obmm_scc_remote_load(DisasContext *s,
+static bool gen_async_load_remote_load(DisasContext *s,
                                      TCGv_i64 tcg_addr, MemOp memop,
                                      uint32_t rt, int memidx,
                                      TCGv_i64 *replay_value,
                                      TCGv_i32 *replay_valid)
 {
-    if (!s->obmm_scc_active || s->current_el != 0 ||
+    if (!s->async_load_active || s->current_el != 0 ||
         (memop & MO_SIGN) || (memop & MO_SIZE) > MO_64) {
         return false;
     }
     *replay_value = tcg_temp_new_i64();
     *replay_valid = tcg_temp_new_i32();
-    gen_helper_obmm_scc_remote_load(
+    gen_helper_async_load_remote_load(
         *replay_value, tcg_env, tcg_addr, tcg_constant_i32(memop),
         tcg_constant_i32(rt), tcg_constant_i32(memidx),
         tcg_constant_tl(s->pc_curr));
     tcg_gen_ld8u_i32(
         *replay_valid, tcg_env,
-        offsetof(CPUARMState, obmm_scc_replay_valid));
+        offsetof(CPUARMState, async_load_replay_valid));
     return true;
 }
 
@@ -2424,9 +2424,9 @@ static bool trans_HLT(DisasContext *s, arg_i *a)
      * it is required for halting debug disabled: it will UNDEF.
      * Secondly, "HLT 0xf000" is the A64 semihosting syscall instruction.
      */
-    if (s->obmm_scc_active && s->current_el == 0 &&
-        a->imm == OBMM_SCC_RESUME_IMM) {
-        gen_helper_obmm_scc_resume(tcg_env, cpu_reg(s, 0));
+    if (s->async_load_active && s->current_el == 0 &&
+        a->imm == UB_ASYNC_LOAD_RESUME_IMM) {
+        gen_helper_async_load_resume(tcg_env, cpu_reg(s, 0));
         s->base.is_jmp = DISAS_NORETURN;
     } else if (semihosting_enabled(s->current_el == 0) &&
                a->imm == 0xf000) {
@@ -3147,7 +3147,7 @@ static bool trans_LDR_i(DisasContext *s, arg_ldst_imm *a)
         TCGv_i64 replay_value;
         TCGv_i32 replay_valid;
 
-        if (gen_obmm_scc_remote_load(
+        if (gen_async_load_remote_load(
                 s, clean_addr, mop, a->rt, memidx,
                 &replay_value, &replay_valid)) {
             TCGLabel *normal_load = gen_new_label();
@@ -3243,7 +3243,7 @@ static bool trans_LDR(DisasContext *s, arg_ldst *a)
         TCGv_i64 replay_value;
         TCGv_i32 replay_valid;
 
-        if (gen_obmm_scc_remote_load(
+        if (gen_async_load_remote_load(
                 s, clean_addr, memop, a->rt, get_mem_index(s),
                 &replay_value, &replay_valid)) {
             TCGLabel *normal_load = gen_new_label();
@@ -14047,7 +14047,7 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->condjmp = 0;
     dc->pc_save = dc->base.pc_first;
     dc->aarch64 = true;
-    dc->obmm_scc_active = env->obmm_scc_active;
+    dc->async_load_active = env->async_load_active;
     dc->thumb = false;
     dc->sctlr_b = 0;
     dc->be_data = EX_TBFLAG_ANY(tb_flags, BE_DATA) ? MO_BE : MO_LE;
@@ -14131,8 +14131,8 @@ static void aarch64_tr_tb_start(DisasContextBase *db, CPUState *cpu)
 {
     DisasContext *dc = container_of(db, DisasContext, base);
 
-    if (dc->obmm_scc_active && dc->current_el == 0) {
-        gen_helper_obmm_scc_boundary(tcg_env);
+    if (dc->async_load_active && dc->current_el == 0) {
+        gen_helper_async_load_boundary(tcg_env);
     }
 }
 

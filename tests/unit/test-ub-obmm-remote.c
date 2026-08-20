@@ -157,8 +157,8 @@ static bool test_parse_sink(const char *name, ObmmRemoteSinkKind *kind)
         *kind = OBMM_REMOTE_SINK_TEST;
     } else if (g_str_equal(name, "p2a")) {
         *kind = OBMM_REMOTE_SINK_P2A;
-    } else if (g_str_equal(name, "p2b")) {
-        *kind = OBMM_REMOTE_SINK_P2B;
+    } else if (g_str_equal(name, "async-load")) {
+        *kind = OBMM_REMOTE_SINK_ASYNC_LOAD;
     } else {
         return false;
     }
@@ -188,7 +188,7 @@ static int test_run_conformance(const char *sink_name,
 
     if (!test_parse_sink(sink_name, &sink_kind) || !access_bytes ||
         access_bytes > OBMM_REMOTE_MAX_BYTES ||
-        (sink_kind == OBMM_REMOTE_SINK_P2B && access_bytes > 8)) {
+        (sink_kind == OBMM_REMOTE_SINK_ASYNC_LOAD && access_bytes > 8)) {
         return 2;
     }
     if (g_str_equal(case_name, "inflight64") ||

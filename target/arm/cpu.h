@@ -262,10 +262,10 @@ typedef struct CPUArchState {
     /* Cached TBFLAGS state.  See below for which bits are included.  */
     CPUARMTBFlags hflags;
 
-    /* Experimental EL0 scheduler-core TB specialization gate. */
-    bool obmm_scc_active;
+    /* Experimental async-load TB specialization gate. */
+    bool async_load_active;
     /* Set by the remote-load helper for one replayed LDR translation. */
-    bool obmm_scc_replay_valid;
+    bool async_load_replay_valid;
 
     /* Frequently accessed CPSR bits are stored separately for efficiency.
        This contains all the other bits.  Use cpsr_{read,write} to access
@@ -1535,7 +1535,7 @@ FIELD(CPTR_EL3, TCPAC, 31, 1)
 #define MDCR_MTPME    (1U << 28)
 #define MDCR_TDCC     (1U << 27)
 #define MDCR_HLP      (1U << 26)  /* MDCR_EL2 */
-#define MDCR_SCCD     (1U << 23)  /* MDCR_EL3 */
+#define MDCR_ASYNC_LOADD     (1U << 23)  /* MDCR_EL3 */
 #define MDCR_HCCD     (1U << 23)  /* MDCR_EL2 */
 #define MDCR_EPMAD    (1U << 21)
 #define MDCR_EDAD     (1U << 20)
@@ -1555,7 +1555,7 @@ FIELD(CPTR_EL3, TCPAC, 31, 1)
 #define MDCR_HPMN     (0x1fU)
 
 /* Not all of the MDCR_EL3 bits are present in the 32-bit SDCR */
-#define SDCR_VALID_MASK (MDCR_MTPME | MDCR_TDCC | MDCR_SCCD | \
+#define SDCR_VALID_MASK (MDCR_MTPME | MDCR_TDCC | MDCR_ASYNC_LOADD | \
                          MDCR_EPMAD | MDCR_EDAD | MDCR_TTRF | \
                          MDCR_STE | MDCR_SPME | MDCR_SPD)
 

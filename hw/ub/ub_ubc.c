@@ -36,7 +36,7 @@
 #include "hw/ub/gsva_stats.h"
 #include "hw/ub/obmm_coherence.h"
 #include "hw/ub/ub_obmm_async.h"
-#include "hw/ub/ub_scc_device.h"
+#include "hw/ub/ub_async_load_device.h"
 #include "hw/ub/ub_ummu.h"
 #include "hw/ub/ub_config.h"
 #include "hw/ub/ub_usi.h"
@@ -4919,7 +4919,7 @@ static uint64_t ub_ers_region_read(void *opaque, hwaddr addr, unsigned len)
     BusControllerDev *ubc_dev = ers->owner;
     uint32_t entity_idx = 0;
     hwaddr obmm_async_reg;
-    hwaddr obmm_scc_reg;
+    hwaddr ub_async_load_reg;
     hwaddr linqu_reg;
 
     if (ers->idx == 1 && len >= DWORD_SIZE &&
@@ -4933,10 +4933,10 @@ static uint64_t ub_ers_region_read(void *opaque, hwaddr addr, unsigned len)
             return ub_obmm_async_read(ubc_dev->obmm_async,
                                       obmm_async_reg, len);
         }
-        if (ubc_dev->obmm_scc &&
-            ub_scc_device_decode(addr, &obmm_scc_reg)) {
-            return ub_scc_device_read(ubc_dev->obmm_scc,
-                                      obmm_scc_reg, len);
+        if (ubc_dev->ub_async_load &&
+            ub_async_load_device_decode(addr, &ub_async_load_reg)) {
+            return ub_async_load_device_read(ubc_dev->ub_async_load,
+                                      ub_async_load_reg, len);
         }
         if (addr < sizeof(uint64_t)) {
             return linqu_uapi_reg_read(ubc_dev, addr, len);
@@ -5643,6 +5643,15 @@ typedef struct ObmmExportEntry {
 static QTAILQ_HEAD(, ObmmExportEntry) g_obmm_exports = QTAILQ_HEAD_INITIALIZER(g_obmm_exports);
 static ObmmExportEntry *obmm_export_lookup(uint64_t uba, uint64_t len);
 
+static bool ubc_cpu_window_detach(MemoryRegion *cpu_window)
+{
+    if (!cpu_window || !memory_region_is_mapped(cpu_window)) {
+        return false;
+    }
+    memory_region_del_subregion(cpu_window->container, cpu_window);
+    return true;
+}
+
 void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
                                  const UBCSimDecWritePldHdr *hdr,
                                  const uint8_t *data, uint32_t data_len)
@@ -5667,30 +5676,34 @@ void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
         GsvaRouteEntry *route = gsva_route_lookup_home_va(
             &g_gsva_routes, hdr->remote_uba, data_len);
         if (route && route->local_pa) {
+            bool restore_cpu_window;
             uint64_t offset = hdr->remote_uba - route->key.home_va;
             uint64_t pa = route->local_pa + offset;
-            memory_region_del_subregion(get_system_memory(),
-                                        &route->cpu_window);
+            restore_cpu_window = ubc_cpu_window_detach(&route->cpu_window);
             ret = address_space_write(&address_space_memory, pa,
                                       MEMTXATTRS_UNSPECIFIED,
                                       data, data_len);
-            memory_region_add_subregion_overlap(get_system_memory(),
-                                                route->local_pa,
-                                                &route->cpu_window, 10);
+            if (restore_cpu_window) {
+                memory_region_add_subregion_overlap(get_system_memory(),
+                                                    route->local_pa,
+                                                    &route->cpu_window, 10);
+            }
         } else {
             SimDecMapEntry *me = sim_dec_find_entry_by_uba(
                 hdr->remote_uba, data_len);
             if (me && me->local_pa) {
+                bool restore_cpu_window;
                 uint64_t offset = hdr->remote_uba - me->remote_uba;
                 uint64_t pa = me->local_pa + offset;
-                memory_region_del_subregion(get_system_memory(),
-                                            &me->cpu_window);
+                restore_cpu_window = ubc_cpu_window_detach(&me->cpu_window);
                 ret = address_space_write(&address_space_memory, pa,
                                           MEMTXATTRS_UNSPECIFIED,
                                           data, data_len);
-                memory_region_add_subregion_overlap(get_system_memory(),
-                                                    me->local_pa,
-                                                    &me->cpu_window, 10);
+                if (restore_cpu_window) {
+                    memory_region_add_subregion_overlap(get_system_memory(),
+                                                        me->local_pa,
+                                                        &me->cpu_window, 10);
+                }
             }
         }
         if (ret != MEMTX_OK) {
@@ -5771,32 +5784,36 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
         GsvaRouteEntry *route = gsva_route_lookup_home_va(
             &g_gsva_routes, req->remote_uba, req->read_len);
         if (route && route->local_pa) {
+            bool restore_cpu_window;
             uint64_t offset = req->remote_uba - route->key.home_va;
             uint64_t pa = route->local_pa + offset;
-            memory_region_del_subregion(get_system_memory(),
-                                        &route->cpu_window);
+            restore_cpu_window = ubc_cpu_window_detach(&route->cpu_window);
             ret = address_space_read(&address_space_memory, pa,
                                      MEMTXATTRS_UNSPECIFIED,
                                      payload + sizeof(*resp),
                                      req->read_len);
-            memory_region_add_subregion_overlap(get_system_memory(),
-                                                route->local_pa,
-                                                &route->cpu_window, 10);
+            if (restore_cpu_window) {
+                memory_region_add_subregion_overlap(get_system_memory(),
+                                                    route->local_pa,
+                                                    &route->cpu_window, 10);
+            }
         } else {
             SimDecMapEntry *me = sim_dec_find_entry_by_uba(
                 req->remote_uba, req->read_len);
             if (me && me->local_pa) {
+                bool restore_cpu_window;
                 uint64_t offset = req->remote_uba - me->remote_uba;
                 uint64_t pa = me->local_pa + offset;
-                memory_region_del_subregion(get_system_memory(),
-                                            &me->cpu_window);
+                restore_cpu_window = ubc_cpu_window_detach(&me->cpu_window);
                 ret = address_space_read(&address_space_memory, pa,
                                          MEMTXATTRS_UNSPECIFIED,
                                          payload + sizeof(*resp),
                                          req->read_len);
-                memory_region_add_subregion_overlap(get_system_memory(),
-                                                    me->local_pa,
-                                                    &me->cpu_window, 10);
+                if (restore_cpu_window) {
+                    memory_region_add_subregion_overlap(get_system_memory(),
+                                                        me->local_pa,
+                                                        &me->cpu_window, 10);
+                }
             }
         }
         if (ret != MEMTX_OK) {
@@ -7892,7 +7909,7 @@ static void ub_ers_region_write(void *opaque, hwaddr addr, uint64_t val, unsigne
     BusControllerDev *ubc_dev = ers->owner;
     uint32_t entity_idx = 0;
     hwaddr obmm_async_reg;
-    hwaddr obmm_scc_reg;
+    hwaddr ub_async_load_reg;
     hwaddr linqu_reg;
 
     if (ers->idx == 2 && len >= DWORD_SIZE) {
@@ -7902,9 +7919,9 @@ static void ub_ers_region_write(void *opaque, hwaddr addr, uint64_t val, unsigne
                                 val, len)) {
             return;
         }
-        if (ubc_dev->obmm_scc &&
-            ub_scc_device_decode(addr, &obmm_scc_reg) &&
-            ub_scc_device_write(ubc_dev->obmm_scc, obmm_scc_reg,
+        if (ubc_dev->ub_async_load &&
+            ub_async_load_device_decode(addr, &ub_async_load_reg) &&
+            ub_async_load_device_write(ubc_dev->ub_async_load, ub_async_load_reg,
                                 val, len)) {
             return;
         }
@@ -8967,13 +8984,13 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
         error_setg(errp, "failed to create OBMM asynchronous endpoint");
         return;
     }
-    BUS_CONTROLLER_DEV(dev)->obmm_scc = ub_scc_device_new(
+    BUS_CONTROLLER_DEV(dev)->ub_async_load = ub_async_load_device_new(
         BUS_CONTROLLER_DEV(dev),
-        BUS_CONTROLLER_DEV(dev)->scheduler_core_model, errp);
-    if (!BUS_CONTROLLER_DEV(dev)->obmm_scc) {
+        BUS_CONTROLLER_DEV(dev)->async_load_model, errp);
+    if (!BUS_CONTROLLER_DEV(dev)->ub_async_load) {
         if (!errp || !*errp) {
             error_setg(errp,
-                       "failed to create OBMM scheduler-core endpoint");
+                       "failed to create OBMM async-load endpoint");
         }
         return;
     }
@@ -9055,8 +9072,8 @@ static Property ub_bus_controller_dev_properties[] = {
     DEFINE_PROP_UINT32("entity_count", BusControllerDev, entity_count, 1),
     DEFINE_PROP_STRING("remote-memory-model-manifest", BusControllerDev,
                        remote_memory_model_manifest),
-    DEFINE_PROP_STRING("scheduler-core-model", BusControllerDev,
-                       scheduler_core_model),
+    DEFINE_PROP_STRING("async-load-model", BusControllerDev,
+                       async_load_model),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -9080,8 +9097,8 @@ static void ub_bus_controller_dev_finalize(Object *object)
     }
     ub_obmm_async_free(ubc_dev->obmm_async);
     ubc_dev->obmm_async = NULL;
-    ub_scc_device_free(ubc_dev->obmm_scc);
-    ubc_dev->obmm_scc = NULL;
+    ub_async_load_device_free(ubc_dev->ub_async_load);
+    ubc_dev->ub_async_load = NULL;
     ub_obmm_remote_model_cleanup(&ubc_dev->remote_memory_model);
     g_free(ubc_dev->obmm_async_children);
     ubc_dev->obmm_async_children = NULL;
@@ -9154,9 +9171,9 @@ static void sim_dec_init(BusControllerState *bcs)
 static void sim_dec_map_entry_destroy(SimDecMapEntry *entry)
 {
     if (entry->mapped) {
-        memory_region_del_subregion(get_system_memory(), &entry->cpu_window);
-        entry->mapped = false;
+        ubc_cpu_window_detach(&entry->cpu_window);
     }
+    entry->mapped = false;
     object_unparent(OBJECT(&entry->cpu_window));
     g_free(entry->sync_shadow);
     sim_dec_page_cache_free(entry->page_cache);
@@ -10682,7 +10699,7 @@ static int sim_dec_handle_unmap(const SimDecUnmapReq *req)
         entry->gva_ownership_registered = false;
     }
     if (entry->mapped) {
-        memory_region_del_subregion(get_system_memory(), &entry->cpu_window);
+        ubc_cpu_window_detach(&entry->cpu_window);
         entry->mapped = false;
     }
     QTAILQ_REMOVE(&g_sim_decoder->map_list, entry, next);
@@ -11820,7 +11837,7 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
 
     /* Remove IO memory region before route cleanup */
     if (route && route->cpu_window_mapped) {
-        memory_region_del_subregion(get_system_memory(), &route->cpu_window);
+        ubc_cpu_window_detach(&route->cpu_window);
         object_unparent(OBJECT(&route->cpu_window));
         route->cpu_window_mapped = false;
         qemu_log("GSVA_UNMAP: cpu_window removed from pa=%" PRIx64 "\n",
@@ -12246,10 +12263,8 @@ static MemTxResult ubc_gsva_route_backing_read(BusControllerDev *ubc,
         }
     }
 
-    restore_cpu_window = route && route->cpu_window_mapped;
-    if (restore_cpu_window) {
-        memory_region_del_subregion(get_system_memory(), &route->cpu_window);
-    }
+    restore_cpu_window = route && route->cpu_window_mapped &&
+                         ubc_cpu_window_detach(&route->cpu_window);
     ret = address_space_read(&address_space_memory, pa,
                              MEMTXATTRS_UNSPECIFIED, dst, len);
     if (restore_cpu_window) {
@@ -12302,10 +12317,8 @@ static MemTxResult ubc_gsva_route_backing_write(BusControllerDev *ubc,
         }
     }
 
-    restore_cpu_window = route && route->cpu_window_mapped;
-    if (restore_cpu_window) {
-        memory_region_del_subregion(get_system_memory(), &route->cpu_window);
-    }
+    restore_cpu_window = route && route->cpu_window_mapped &&
+                         ubc_cpu_window_detach(&route->cpu_window);
     ret = address_space_write(&address_space_memory, pa,
                               MEMTXATTRS_UNSPECIFIED, src, len);
     if (restore_cpu_window) {

@@ -58,8 +58,8 @@ tests = {
   'test-ub-obmm-remote': [
     meson.project_source_root() / 'hw/ub/ub_obmm_remote.c'
   ],
-  'test-ub-scc': [
-    meson.project_source_root() / 'hw/ub/ub_scc.c'
+  'test-ub-async-load': [
+    meson.project_source_root() / 'hw/ub/ub_async_load.c'
   ],
 }
 
