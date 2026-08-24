@@ -92,7 +92,7 @@ int linqu_ub_bridge_read_segment_payload(LinquUbBridge *bridge,
                                          size_t offset,
                                          uint8_t *out,
                                          size_t out_len);
-int linqu_ub_bridge_register_qwen3_runtime_object_payload(LinquUbBridge *bridge,
+int linqu_ub_bridge_register_model_runtime_object_payload(LinquUbBridge *bridge,
                                                           const uint8_t *object_ref,
                                                           size_t object_ref_len,
                                                           const uint8_t *payload,
@@ -372,9 +372,9 @@ typedef struct QEMU_PACKED SimDecObmmBootstrapLookupResp {
 
 #define LINGQU_OBMM_OBJECT_REF_MAGIC 0x514f424d4d524546ULL
 #define LINGQU_OBJECT_STATE_COMMITTED_WIRE 2
-#define QWEN3_OBMM_KIND_HIDDEN_RANGE_RUNTIME_OUTPUT 5
-#define QWEN3_OBMM_KIND_QWEN3_TOKEN_RESULT 6
-#define QWEN3_OBMM_KIND_QWEN3_KV_STATE 7
+#define MODEL_OBMM_KIND_HIDDEN_RANGE_RUNTIME_OUTPUT 5
+#define MODEL_OBMM_KIND_TOKEN_RESULT 6
+#define MODEL_OBMM_KIND_KV_STATE 7
 #define OBMM_POOL_HEADER_BYTES 64
 #define OBMM_REGION_DIRENT_BYTES 32
 #define OBMM_REGION_W4_PAYLOAD 5
@@ -721,7 +721,7 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
                                            uint32_t dcna,
                                            uint8_t *buf,
                                            uint32_t len);
-static void linqu_uapi_maybe_register_qwen3_runtime_object_payload(
+static void linqu_uapi_maybe_register_model_runtime_object_payload(
     BusControllerDev *ubc_dev, uint64_t segment, uint64_t write_offset);
 static uint8_t ubc_node_ip_suffix_from_id(const char *node_id);
 static void ubc_fill_link_local_eid_hw(uint8_t eid_hw[16], uint8_t suffix);
@@ -4902,7 +4902,7 @@ static bool linqu_uapi_reg_write(BusControllerDev *ubc_dev, hwaddr reg,
                                                   sizeof(value)) != 0) {
             ubc_dev->linqu_uapi_last_error = 14;
         } else {
-            linqu_uapi_maybe_register_qwen3_runtime_object_payload(
+            linqu_uapi_maybe_register_model_runtime_object_payload(
                 ubc_dev,
                 ubc_dev->linqu_uapi_default_segment,
                 ubc_dev->linqu_uapi_segment_data_offset);
@@ -11082,7 +11082,7 @@ static bool linqu_uapi_obmm_payload_region_offset(
     return false;
 }
 
-static bool linqu_uapi_object_ref_is_qwen3_runtime_payload(
+static bool linqu_uapi_object_ref_is_model_runtime_payload(
     const LinquObmmObjectRefWire *object_ref)
 {
     if (!object_ref ||
@@ -11092,12 +11092,12 @@ static bool linqu_uapi_object_ref_is_qwen3_runtime_payload(
         object_ref->payload_bytes > UINT32_MAX) {
         return false;
     }
-    return object_ref->object_kind == QWEN3_OBMM_KIND_HIDDEN_RANGE_RUNTIME_OUTPUT ||
-           object_ref->object_kind == QWEN3_OBMM_KIND_QWEN3_TOKEN_RESULT ||
-           object_ref->object_kind == QWEN3_OBMM_KIND_QWEN3_KV_STATE;
+    return object_ref->object_kind == MODEL_OBMM_KIND_HIDDEN_RANGE_RUNTIME_OUTPUT ||
+           object_ref->object_kind == MODEL_OBMM_KIND_TOKEN_RESULT ||
+           object_ref->object_kind == MODEL_OBMM_KIND_KV_STATE;
 }
 
-static void linqu_uapi_maybe_register_qwen3_runtime_object_payload(
+static void linqu_uapi_maybe_register_model_runtime_object_payload(
     BusControllerDev *ubc_dev, uint64_t segment, uint64_t write_offset)
 {
     LinquObmmObjectRefWire object_ref;
@@ -11119,7 +11119,7 @@ static void linqu_uapi_maybe_register_qwen3_runtime_object_payload(
                                              object_ref_offset,
                                              (uint8_t *)&object_ref,
                                              sizeof(object_ref)) != 0 ||
-        !linqu_uapi_object_ref_is_qwen3_runtime_payload(&object_ref)) {
+        !linqu_uapi_object_ref_is_model_runtime_payload(&object_ref)) {
         return;
     }
     node_count = linqu_uapi_cluster_node_count();
@@ -11147,7 +11147,7 @@ static void linqu_uapi_maybe_register_qwen3_runtime_object_payload(
                                     export_payload_offset,
                                     payload,
                                     object_ref.payload_bytes) == MEMTX_OK) {
-        (void)linqu_ub_bridge_register_qwen3_runtime_object_payload(
+        (void)linqu_ub_bridge_register_model_runtime_object_payload(
             ubc_dev->linqu_uapi_bridge,
             (const uint8_t *)&object_ref,
             sizeof(object_ref),
