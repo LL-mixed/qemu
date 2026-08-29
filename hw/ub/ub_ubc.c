@@ -138,6 +138,10 @@ int linqu_ub_bridge_poll_completion(LinquUbBridge *bridge,
 #define LINQU_PTO_APERTURE_BASE 0x700000000000ULL
 #define LINQU_PTO_APERTURE_LENGTH 0x010000000000ULL
 #define LINQU_PTO_APERTURE_ALIGN 0x10000ULL
+#define LINQU_PTO_SHAPE_STRIDE_SNAPSHOT_BYTES \
+    (2u * LINGQU_PTO_MAX_RANK * sizeof(uint32_t))
+#define LINQU_PTO_AUTHORIZATION_TIMEOUT_NS_DEFAULT 1000000000ULL
+#define LINQU_PTO_UB_GM_INTERNAL_PENDING (-EINPROGRESS)
 
 typedef struct LinquUbGmBindingState {
     uint64_t request_id;
@@ -173,6 +177,30 @@ struct LinquUbGmRegistry {
     uint64_t qemu_store_bytes;
     uint64_t qemu_fence_count;
 };
+
+typedef struct LinquPtoAuthorizationState {
+    uint8_t slot[LINQU_UAPI_DESC_BYTES];
+    uint8_t control_wire[LINQU_PTO_CONTROL_WIRE_BYTES];
+    uint8_t *memref_wire;
+    uint8_t *scalar_wire;
+    uint8_t *shape_stride_wire;
+    UbcObmmResolvedMap *resolved;
+    bool *range_authorized;
+    uint64_t op_id;
+    uint64_t request_id;
+    uint64_t sequence;
+    uint64_t started_ns;
+    uint64_t ready_ns;
+    uint64_t deadline_ns;
+    uint32_t cmdq_slot;
+    uint32_t memref_count;
+    uint32_t scalar_count;
+    uint32_t memref_cursor;
+    uint32_t resume_batch;
+    int completion_status;
+    bool waiting;
+    bool completion_ready;
+} LinquPtoAuthorizationState;
 
 /*
  * ============================================================================
@@ -4560,6 +4588,74 @@ static void linqu_ub_gm_registry_free(struct LinquUbGmRegistry *registry)
     g_free(registry);
 }
 
+static void linqu_uapi_schedule_kick(BusControllerDev *ubc_dev,
+                                     uint32_t batch);
+
+static void linqu_uapi_authorization_free(
+    LinquPtoAuthorizationState *authorization)
+{
+    if (!authorization) {
+        return;
+    }
+    g_free(authorization->range_authorized);
+    g_free(authorization->resolved);
+    g_free(authorization->shape_stride_wire);
+    g_free(authorization->scalar_wire);
+    g_free(authorization->memref_wire);
+    g_free(authorization);
+}
+
+static void linqu_uapi_authorization_discard(BusControllerDev *ubc_dev)
+{
+    if (!ubc_dev) {
+        return;
+    }
+    if (ubc_dev->linqu_uapi_authorization_timer) {
+        timer_del(ubc_dev->linqu_uapi_authorization_timer);
+    }
+    linqu_uapi_authorization_free(ubc_dev->linqu_uapi_authorization);
+    ubc_dev->linqu_uapi_authorization = NULL;
+}
+
+static uint64_t linqu_uapi_ns_add_saturating(uint64_t base, uint64_t delta)
+{
+    return delta > UINT64_MAX - base ? UINT64_MAX : base + delta;
+}
+
+static void linqu_uapi_authorization_timer(void *opaque)
+{
+    BusControllerDev *ubc_dev = opaque;
+    LinquPtoAuthorizationState *authorization;
+    const char *status;
+
+    if (!ubc_dev || !ubc_dev->linqu_uapi_authorization) {
+        return;
+    }
+    authorization = ubc_dev->linqu_uapi_authorization;
+    if (!authorization->waiting) {
+        return;
+    }
+
+    authorization->waiting = false;
+    authorization->completion_ready = true;
+    if (authorization->ready_ns > authorization->deadline_ns) {
+        authorization->completion_status =
+            LINGQU_PTO_UB_GM_AUTHORIZATION_TIMEOUT;
+        status = "timeout";
+    } else {
+        authorization->completion_status = LINGQU_PTO_UB_GM_OK;
+        status = "ready";
+    }
+    qemu_log("QEMU_UB_GM_AUTHORIZATION_RESUME op=%" PRIu64
+             " request=%" PRIu64 " slot=%u cursor=%u sequence=%" PRIu64
+             " status=%s\n",
+             authorization->op_id, authorization->request_id,
+             authorization->cmdq_slot, authorization->memref_cursor,
+             authorization->sequence, status);
+    linqu_uapi_schedule_kick(
+        ubc_dev, MAX(authorization->resume_batch, 1u));
+}
+
 static bool linqu_ub_gm_binding_snapshot(BusControllerDev *ubc_dev,
                                          uint64_t request_id,
                                          uint64_t binding_id,
@@ -5056,6 +5152,105 @@ static void linqu_uapi_decode_scalar(
     };
 }
 
+static LinquPtoAuthorizationState *linqu_uapi_authorization_snapshot_new(
+    BusControllerDev *ubc_dev, uint32_t cmdq_slot, const uint8_t *slot,
+    const uint8_t control_wire[LINQU_PTO_CONTROL_WIRE_BYTES],
+    const LingquPtoDispatchControlV2 *control, const uint8_t *memref_wire,
+    const uint8_t *scalar_wire)
+{
+    LinquPtoAuthorizationState *authorization;
+    uint64_t timeout_ns;
+
+    if (!ubc_dev || !slot || !control_wire || !control || !memref_wire ||
+        control->memref_count == 0) {
+        return NULL;
+    }
+    authorization = g_new0(LinquPtoAuthorizationState, 1);
+    memcpy(authorization->slot, slot, sizeof(authorization->slot));
+    memcpy(authorization->control_wire, control_wire,
+           sizeof(authorization->control_wire));
+    authorization->memref_wire = g_memdup2(
+        memref_wire,
+        (size_t)control->memref_count * LINQU_PTO_MEMREF_WIRE_BYTES);
+    if (control->scalar_count != 0) {
+        authorization->scalar_wire = g_memdup2(
+            scalar_wire,
+            (size_t)control->scalar_count * LINQU_PTO_SCALAR_WIRE_BYTES);
+    }
+    authorization->shape_stride_wire = g_malloc0(
+        (size_t)control->memref_count *
+        LINQU_PTO_SHAPE_STRIDE_SNAPSHOT_BYTES);
+    authorization->resolved = g_new0(UbcObmmResolvedMap,
+                                      control->memref_count);
+    authorization->range_authorized = g_new0(bool,
+                                              control->memref_count);
+    authorization->op_id = ldq_le_p(
+        slot + LINGQU_PTO_DISPATCH_SLOT_OP_ID_OFFSET);
+    authorization->request_id = control->request_id;
+    authorization->cmdq_slot = cmdq_slot;
+    authorization->memref_count = control->memref_count;
+    authorization->scalar_count = control->scalar_count;
+    authorization->resume_batch = 1;
+    authorization->started_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    timeout_ns = ubc_dev->pto_authorization_timeout_ns != 0 ?
+                 ubc_dev->pto_authorization_timeout_ns :
+                 LINQU_PTO_AUTHORIZATION_TIMEOUT_NS_DEFAULT;
+    authorization->deadline_ns = linqu_uapi_ns_add_saturating(
+        authorization->started_ns, timeout_ns);
+    return authorization;
+}
+
+static uint8_t *linqu_uapi_authorization_shape_wire(
+    LinquPtoAuthorizationState *authorization, uint32_t index)
+{
+    return authorization->shape_stride_wire +
+           (size_t)index * LINQU_PTO_SHAPE_STRIDE_SNAPSHOT_BYTES;
+}
+
+static uint8_t *linqu_uapi_authorization_stride_wire(
+    LinquPtoAuthorizationState *authorization, uint32_t index)
+{
+    return linqu_uapi_authorization_shape_wire(authorization, index) +
+           LINGQU_PTO_MAX_RANK * sizeof(uint32_t);
+}
+
+static bool linqu_uapi_authorization_start_range(
+    BusControllerDev *ubc_dev, LinquPtoAuthorizationState *authorization,
+    uint32_t index)
+{
+    uint64_t due_ns;
+    uint64_t now_ns;
+
+    if (!ubc_dev || !authorization ||
+        !ubc_dev->linqu_uapi_authorization_timer ||
+        index >= authorization->memref_count ||
+        authorization->waiting || authorization->completion_ready) {
+        return false;
+    }
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    authorization->ready_ns = linqu_uapi_ns_add_saturating(
+        now_ns, ubc_dev->pto_authorization_delay_ns);
+    authorization->sequence =
+        ++ubc_dev->linqu_uapi_next_authorization_sequence;
+    if (authorization->sequence == 0) {
+        authorization->sequence =
+            ++ubc_dev->linqu_uapi_next_authorization_sequence;
+    }
+    authorization->waiting = true;
+    authorization->completion_status = LINGQU_PTO_UB_GM_OK;
+    due_ns = MIN(authorization->ready_ns, authorization->deadline_ns);
+    qemu_log("QEMU_UB_GM_AUTHORIZATION_PENDING op=%" PRIu64
+             " request=%" PRIu64 " slot=%u cursor=%u sequence=%" PRIu64
+             " delay_ns=%" PRIu64 " deadline_ns=%" PRIu64 "\n",
+             authorization->op_id, authorization->request_id,
+             authorization->cmdq_slot, index, authorization->sequence,
+             ubc_dev->pto_authorization_delay_ns,
+             authorization->deadline_ns);
+    timer_mod_ns(ubc_dev->linqu_uapi_authorization_timer,
+                 MIN(due_ns, (uint64_t)INT64_MAX));
+    return true;
+}
+
 static uint64_t linqu_uapi_dtype_bytes(uint16_t dtype)
 {
     switch (dtype) {
@@ -5151,6 +5346,7 @@ static bool linqu_uapi_aperture_advance(uint64_t current,
 
 static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
                                       const uint8_t *slot,
+                                      uint32_t cmdq_slot,
                                       uint64_t *op_id_out)
 {
     uint8_t control_wire[LINQU_PTO_CONTROL_WIRE_BYTES];
@@ -5159,6 +5355,7 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
     PtoSimUbGmAuthorizedMemrefV1 *authorized = NULL;
     LingquPtoScalarV1 *scalars = NULL;
     LinquUbGmBindingState *bindings = NULL;
+    LinquPtoAuthorizationState *authorization = NULL;
     uint8_t *memref_wire = NULL;
     uint8_t *scalar_wire = NULL;
     bool arg_seen[LINGQU_PTO_MAX_MEMREFS + LINGQU_PTO_MAX_SCALARS] = { 0 };
@@ -5169,6 +5366,7 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
     uint32_t crc = 0xffffffffu;
     uint32_t total_args;
     uint32_t index;
+    bool new_authorization = false;
     int error = LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
     int rc;
 
@@ -5180,16 +5378,30 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
             LINQU_UAPI_DESC_BYTES - LINGQU_PTO_DISPATCH_SLOT_RESERVED_OFFSET)) {
         return LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
     }
+    authorization = ubc_dev->linqu_uapi_authorization;
+    if (authorization &&
+        (authorization->cmdq_slot != cmdq_slot ||
+         memcmp(authorization->slot, slot, LINQU_UAPI_DESC_BYTES) != 0)) {
+        linqu_uapi_authorization_discard(ubc_dev);
+        return LINGQU_PTO_UB_GM_UNBOUND;
+    }
     op_id = ldq_le_p(slot + LINGQU_PTO_DISPATCH_SLOT_OP_ID_OFFSET);
     control_iova = ldq_le_p(
         slot + LINGQU_PTO_DISPATCH_SLOT_CONTROL_IOVA_OFFSET);
     *op_id_out = op_id;
     if (op_id == 0 ||
-        !linqu_uapi_wire_range_valid(control_iova, sizeof(control_wire)) ||
-        dma_memory_read(&address_space_memory, control_iova, control_wire,
-                        sizeof(control_wire),
-                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-        return LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
+        !linqu_uapi_wire_range_valid(control_iova, sizeof(control_wire))) {
+        error = LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
+        goto out;
+    }
+    if (authorization) {
+        memcpy(control_wire, authorization->control_wire,
+               sizeof(control_wire));
+    } else if (dma_memory_read(&address_space_memory, control_iova,
+                               control_wire, sizeof(control_wire),
+                               MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        error = LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
+        goto out;
     }
     linqu_uapi_decode_control(control_wire, &control);
     if (control.abi_version != LINGQU_PTO_DISPATCH_ABI_V2 ||
@@ -5209,40 +5421,65 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
          !linqu_uapi_wire_range_valid(
              control.scalar_table_iova,
              (uint64_t)control.scalar_count * LINQU_PTO_SCALAR_WIRE_BYTES))) {
-        return control.requester_cna != ubc_dev->pto_device_cna ?
-               LINGQU_PTO_UB_GM_ACCESS_DENIED :
-               LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
+        error = control.requester_cna != ubc_dev->pto_device_cna ?
+                LINGQU_PTO_UB_GM_ACCESS_DENIED :
+                LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
+        goto out;
     }
     if (linqu_ub_bridge_query_ub_gm_callable_v1(
             ubc_dev->linqu_uapi_bridge, control.callable_id,
             &expected_fingerprint) != 0 ||
         expected_fingerprint == 0 ||
         expected_fingerprint != control.artifact_fingerprint) {
-        return LINGQU_PTO_UB_GM_UNSUPPORTED_CALLABLE;
+        error = LINGQU_PTO_UB_GM_UNSUPPORTED_CALLABLE;
+        goto out;
     }
 
     total_args = control.memref_count + control.scalar_count;
     authorized = g_new0(PtoSimUbGmAuthorizedMemrefV1,
                         control.memref_count);
     bindings = g_new0(LinquUbGmBindingState, control.memref_count);
-    memref_wire = g_malloc((size_t)control.memref_count *
-                           LINQU_PTO_MEMREF_WIRE_BYTES);
-    if (dma_memory_read(
-            &address_space_memory, control.memref_table_iova, memref_wire,
-            (size_t)control.memref_count * LINQU_PTO_MEMREF_WIRE_BYTES,
-            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-        goto out;
-    }
-    if (control.scalar_count != 0) {
-        scalars = g_new0(LingquPtoScalarV1, control.scalar_count);
-        scalar_wire = g_malloc((size_t)control.scalar_count *
-                               LINQU_PTO_SCALAR_WIRE_BYTES);
+    if (authorization) {
+        memref_wire = g_memdup2(
+            authorization->memref_wire,
+            (size_t)control.memref_count * LINQU_PTO_MEMREF_WIRE_BYTES);
+    } else {
+        memref_wire = g_malloc((size_t)control.memref_count *
+                               LINQU_PTO_MEMREF_WIRE_BYTES);
         if (dma_memory_read(
-                &address_space_memory, control.scalar_table_iova, scalar_wire,
-                (size_t)control.scalar_count * LINQU_PTO_SCALAR_WIRE_BYTES,
+                &address_space_memory, control.memref_table_iova, memref_wire,
+                (size_t)control.memref_count * LINQU_PTO_MEMREF_WIRE_BYTES,
                 MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
             goto out;
         }
+    }
+    if (control.scalar_count != 0) {
+        scalars = g_new0(LingquPtoScalarV1, control.scalar_count);
+        if (authorization) {
+            scalar_wire = g_memdup2(
+                authorization->scalar_wire,
+                (size_t)control.scalar_count * LINQU_PTO_SCALAR_WIRE_BYTES);
+        } else {
+            scalar_wire = g_malloc((size_t)control.scalar_count *
+                                   LINQU_PTO_SCALAR_WIRE_BYTES);
+            if (dma_memory_read(
+                    &address_space_memory, control.scalar_table_iova,
+                    scalar_wire,
+                    (size_t)control.scalar_count *
+                    LINQU_PTO_SCALAR_WIRE_BYTES,
+                    MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                goto out;
+            }
+        }
+    }
+    if (!authorization && ubc_dev->pto_authorization_delay_ns != 0) {
+        authorization = linqu_uapi_authorization_snapshot_new(
+            ubc_dev, cmdq_slot, slot, control_wire, &control,
+            memref_wire, scalar_wire);
+        if (!authorization) {
+            goto out;
+        }
+        new_authorization = true;
     }
 
     memcpy(control_crc_wire, control_wire, sizeof(control_crc_wire));
@@ -5261,15 +5498,12 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
     for (index = 0; index < control.memref_count; index++) {
         PtoSimUbGmAuthorizedMemrefV1 *item = &authorized[index];
         LingquShmemMemrefV1 *memref = &item->memref;
-        LinquUbGmBindingState *binding = &bindings[index];
         const uint8_t *entry_wire =
             memref_wire + ((size_t)index * LINQU_PTO_MEMREF_WIRE_BYTES);
         uint8_t shape_wire[LINGQU_PTO_MAX_RANK * sizeof(uint32_t)] = { 0 };
         uint8_t stride_wire[LINGQU_PTO_MAX_RANK * sizeof(uint32_t)] = { 0 };
-        UbcObmmResolvedMap resolved;
         uint64_t shape_bytes;
         uint64_t view_start;
-        uint64_t next_aperture;
         uint32_t dim;
 
         linqu_uapi_decode_memref(entry_wire, memref);
@@ -5298,15 +5532,37 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
         if (!linqu_uapi_wire_range_valid(memref->shape_table_iova,
                                          shape_bytes) ||
             !linqu_uapi_wire_range_valid(memref->stride_table_iova,
-                                         shape_bytes) ||
-            dma_memory_read(&address_space_memory, memref->shape_table_iova,
-                            shape_wire, shape_bytes,
-                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
-            dma_memory_read(&address_space_memory, memref->stride_table_iova,
-                            stride_wire, shape_bytes,
-                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                                         shape_bytes)) {
             error = LINGQU_PTO_UB_GM_BAD_MEMREF;
             goto out;
+        }
+        if (authorization && !new_authorization) {
+            memcpy(shape_wire,
+                   linqu_uapi_authorization_shape_wire(
+                       authorization, index),
+                   shape_bytes);
+            memcpy(stride_wire,
+                   linqu_uapi_authorization_stride_wire(
+                       authorization, index),
+                   shape_bytes);
+        } else if (dma_memory_read(
+                       &address_space_memory, memref->shape_table_iova,
+                       shape_wire, shape_bytes,
+                       MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
+                   dma_memory_read(
+                       &address_space_memory, memref->stride_table_iova,
+                       stride_wire, shape_bytes,
+                       MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            error = LINGQU_PTO_UB_GM_BAD_MEMREF;
+            goto out;
+        }
+        if (new_authorization) {
+            memcpy(linqu_uapi_authorization_shape_wire(
+                       authorization, index),
+                   shape_wire, shape_bytes);
+            memcpy(linqu_uapi_authorization_stride_wire(
+                       authorization, index),
+                   stride_wire, shape_bytes);
         }
         crc = linqu_uapi_crc32_ieee_update(crc, shape_wire, shape_bytes);
         crc = linqu_uapi_crc32_ieee_update(crc, stride_wire, shape_bytes);
@@ -5316,11 +5572,108 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
                 ldl_le_p(stride_wire + dim * sizeof(uint32_t));
         }
         if (!linqu_uapi_validate_contiguous_memref(
-                memref, item->shape, item->strides) ||
-            !ub_obmm_async_resolve_mapping_ref(
-                ubc_dev->obmm_async, memref->opaque_mapping_ref,
-                view_start, memref->byte_length, &resolved)) {
+                memref, item->shape, item->strides)) {
             error = LINGQU_PTO_UB_GM_BAD_MEMREF;
+            goto out;
+        }
+    }
+
+    for (index = 0; index < control.scalar_count; index++) {
+        const uint8_t *entry_wire =
+            scalar_wire + ((size_t)index * LINQU_PTO_SCALAR_WIRE_BYTES);
+        LingquPtoScalarV1 *scalar = &scalars[index];
+
+        linqu_uapi_decode_scalar(entry_wire, scalar);
+        if (scalar->abi_version != LINGQU_PTO_SCALAR_ABI_V1 ||
+            scalar->struct_bytes < sizeof(*scalar) ||
+            scalar->arg_index < control.memref_count ||
+            scalar->arg_index >= total_args || arg_seen[scalar->arg_index] ||
+            scalar->dtype > LINGQU_PTO_DTYPE_MAX || scalar->flags != 0) {
+            goto out;
+        }
+        arg_seen[scalar->arg_index] = true;
+    }
+    for (index = 0; index < total_args; index++) {
+        if (!arg_seen[index]) {
+            goto out;
+        }
+    }
+    if ((crc ^ 0xffffffffu) != control.metadata_crc32) {
+        qemu_log("QEMU_UB_GM_METADATA_CRC_FAIL op=%" PRIu64
+                 " request=%" PRIu64 " expected=0x%x actual=0x%x\n",
+                 op_id, control.request_id, control.metadata_crc32,
+                 crc ^ 0xffffffffu);
+        goto out;
+    }
+    if (new_authorization) {
+        g_assert(!ubc_dev->linqu_uapi_authorization);
+        ubc_dev->linqu_uapi_authorization = authorization;
+    }
+
+    for (index = 0; index < control.memref_count; index++) {
+        PtoSimUbGmAuthorizedMemrefV1 *item = &authorized[index];
+        LingquShmemMemrefV1 *memref = &item->memref;
+        LinquUbGmBindingState *binding = &bindings[index];
+        UbcObmmResolvedMap current;
+        UbcObmmResolvedMap resolved;
+        uint64_t view_start = memref->ub_gm_addr + memref->byte_offset;
+        uint64_t next_aperture;
+
+        if (authorization && !authorization->range_authorized[index]) {
+            if (index != authorization->memref_cursor) {
+                error = LINGQU_PTO_UB_GM_UNBOUND;
+                goto out;
+            }
+            if (!authorization->completion_ready) {
+                if (!authorization->waiting &&
+                    !linqu_uapi_authorization_start_range(
+                        ubc_dev, authorization, index)) {
+                    error = LINGQU_PTO_UB_GM_EXECUTION_FAILED;
+                    goto out;
+                }
+                error = LINQU_PTO_UB_GM_INTERNAL_PENDING;
+                goto out;
+            }
+            authorization->completion_ready = false;
+            if (authorization->completion_status != LINGQU_PTO_UB_GM_OK) {
+                error = authorization->completion_status;
+                qemu_log("QEMU_UB_GM_AUTHORIZATION_TIMEOUT op=%" PRIu64
+                         " request=%" PRIu64 " slot=%u cursor=%u"
+                         " sequence=%" PRIu64 "\n",
+                         authorization->op_id, authorization->request_id,
+                         authorization->cmdq_slot, index,
+                         authorization->sequence);
+                goto out;
+            }
+            if (!ub_obmm_async_resolve_mapping_ref(
+                    ubc_dev->obmm_async, memref->opaque_mapping_ref,
+                    view_start, memref->byte_length, &resolved)) {
+                error = LINGQU_PTO_UB_GM_BAD_MEMREF;
+                goto out;
+            }
+            authorization->resolved[index] = resolved;
+            authorization->range_authorized[index] = true;
+            authorization->memref_cursor++;
+        } else if (authorization) {
+            resolved = authorization->resolved[index];
+        } else if (!ub_obmm_async_resolve_mapping_ref(
+                       ubc_dev->obmm_async, memref->opaque_mapping_ref,
+                       view_start, memref->byte_length, &resolved)) {
+            error = LINGQU_PTO_UB_GM_BAD_MEMREF;
+            goto out;
+        }
+        if (authorization &&
+            (!ub_obmm_async_resolve_mapping_ref(
+                 ubc_dev->obmm_async, memref->opaque_mapping_ref,
+                 view_start, memref->byte_length, &current) ||
+             current.map_id != resolved.map_id ||
+             current.map_generation != resolved.map_generation ||
+             current.local_pa != resolved.local_pa ||
+             current.remote_uba != resolved.remote_uba ||
+             current.token_id != resolved.token_id ||
+             current.peer_cna != resolved.peer_cna ||
+             current.access_flags != resolved.access_flags)) {
+            error = LINGQU_PTO_UB_GM_UNBOUND;
             goto out;
         }
         if ((memref->access & LINGQU_PTO_UB_GM_WRITE) &&
@@ -5360,6 +5713,11 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
             .active = true,
         };
         aperture = next_aperture;
+    }
+    for (index = 0; index < control.memref_count; index++) {
+        const LingquShmemMemrefV1 *memref = &authorized[index].memref;
+        const LinquUbGmBindingState *binding = &bindings[index];
+
         qemu_log("QEMU_UB_GM_%s_AUTHORIZE op=%" PRIu64
                  " request=%" PRIu64 " binding=%" PRIu64
                  " requester_cna=0x%x local=0x%" PRIx64
@@ -5368,37 +5726,9 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
                  memref->role == LINGQU_PTO_MEMREF_INPUT ? "INPUT" :
                  memref->role == LINGQU_PTO_MEMREF_OUTPUT ? "OUTPUT" :
                  "INOUT", op_id, control.request_id, binding->binding_id,
-                 control.requester_cna, view_start, memref->byte_length,
-                 resolved.map_id, resolved.map_generation,
-                 resolved.peer_cna);
-    }
-
-    for (index = 0; index < control.scalar_count; index++) {
-        const uint8_t *entry_wire =
-            scalar_wire + ((size_t)index * LINQU_PTO_SCALAR_WIRE_BYTES);
-        LingquPtoScalarV1 *scalar = &scalars[index];
-
-        linqu_uapi_decode_scalar(entry_wire, scalar);
-        if (scalar->abi_version != LINGQU_PTO_SCALAR_ABI_V1 ||
-            scalar->struct_bytes < sizeof(*scalar) ||
-            scalar->arg_index < control.memref_count ||
-            scalar->arg_index >= total_args || arg_seen[scalar->arg_index] ||
-            scalar->dtype > LINGQU_PTO_DTYPE_MAX || scalar->flags != 0) {
-            goto out;
-        }
-        arg_seen[scalar->arg_index] = true;
-    }
-    for (index = 0; index < total_args; index++) {
-        if (!arg_seen[index]) {
-            goto out;
-        }
-    }
-    if ((crc ^ 0xffffffffu) != control.metadata_crc32) {
-        qemu_log("QEMU_UB_GM_METADATA_CRC_FAIL op=%" PRIu64
-                 " request=%" PRIu64 " expected=0x%x actual=0x%x\n",
-                 op_id, control.request_id, control.metadata_crc32,
-                 crc ^ 0xffffffffu);
-        goto out;
+                 control.requester_cna, binding->local_base,
+                 memref->byte_length, binding->map_id,
+                 binding->map_generation, binding->peer_cna);
     }
     if (!linqu_ub_gm_register_dispatch(
             ubc_dev, op_id, control.request_id, bindings,
@@ -5428,6 +5758,13 @@ out:
     g_free(bindings);
     g_free(scalars);
     g_free(authorized);
+    if (error != LINQU_PTO_UB_GM_INTERNAL_PENDING && authorization) {
+        if (ubc_dev->linqu_uapi_authorization == authorization) {
+            linqu_uapi_authorization_discard(ubc_dev);
+        } else if (new_authorization) {
+            linqu_uapi_authorization_free(authorization);
+        }
+    }
     return error;
 }
 
@@ -5604,9 +5941,22 @@ static void linqu_uapi_kick(BusControllerDev *ubc_dev, uint32_t batch)
              ubc_dev->linqu_uapi_cq_depth);
     head = ubc_dev->linqu_uapi_cmdq_head;
     while (head != ubc_dev->linqu_uapi_cmdq_tail && consumed < batch) {
+        LinquPtoAuthorizationState *authorization =
+            ubc_dev->linqu_uapi_authorization;
         uint64_t op_id;
 
-        if (linqu_uapi_read_slot(ubc_dev->linqu_uapi_cmdq_iova, head, slot) != MEMTX_OK) {
+        if (authorization) {
+            if (authorization->cmdq_slot != head) {
+                linqu_uapi_authorization_discard(ubc_dev);
+                ubc_dev->linqu_uapi_last_error =
+                    LINGQU_PTO_UB_GM_UNBOUND;
+                ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
+                return;
+            }
+            memcpy(slot, authorization->slot, sizeof(slot));
+        } else if (linqu_uapi_read_slot(
+                       ubc_dev->linqu_uapi_cmdq_iova, head,
+                       slot) != MEMTX_OK) {
             ubc_dev->linqu_uapi_last_error = 8;
             ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
             qemu_log("linqu-uapi kick read slot failed base=%#" PRIx64 " head=%u\n",
@@ -5620,8 +5970,21 @@ static void linqu_uapi_kick(BusControllerDev *ubc_dev, uint32_t batch)
                  slot[0],
                  op_id);
         if (slot[0] == LINGQU_PTO_DISPATCH_SLOT_TAG_V2) {
-            rc = linqu_uapi_submit_ub_gm_v2(ubc_dev, slot, &op_id);
-            if (rc != LINGQU_PTO_UB_GM_OK) {
+            rc = linqu_uapi_submit_ub_gm_v2(
+                ubc_dev, slot, head, &op_id);
+            if (rc == LINQU_PTO_UB_GM_INTERNAL_PENDING) {
+                authorization = ubc_dev->linqu_uapi_authorization;
+                if (!authorization) {
+                    ubc_dev->linqu_uapi_last_error =
+                        LINGQU_PTO_UB_GM_EXECUTION_FAILED;
+                    ubc_dev->linqu_uapi_irq_status |=
+                        LINQU_UAPI_IRQ_ERROR;
+                    return;
+                }
+                authorization->resume_batch = MAX(
+                    authorization->resume_batch, batch - consumed);
+                break;
+            } else if (rc != LINGQU_PTO_UB_GM_OK) {
                 if (!linqu_uapi_publish_ub_gm_failure(
                         ubc_dev, op_id, rc)) {
                     ubc_dev->linqu_uapi_last_error = rc;
@@ -10014,6 +10377,9 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
         error_setg(errp, "failed to create OBMM asynchronous endpoint");
         return;
     }
+    BUS_CONTROLLER_DEV(dev)->linqu_uapi_authorization_timer = timer_new_ns(
+        QEMU_CLOCK_VIRTUAL, linqu_uapi_authorization_timer,
+        BUS_CONTROLLER_DEV(dev));
     BUS_CONTROLLER_DEV(dev)->ub_async_load = ub_async_load_device_new(
         BUS_CONTROLLER_DEV(dev),
         BUS_CONTROLLER_DEV(dev)->async_load_model, errp);
@@ -10101,6 +10467,11 @@ static Property ub_bus_controller_dev_properties[] = {
     DEFINE_PROP_UB_DEV_GUID("bus_instance_guid", BusControllerDev, bus_instance_guid),
     DEFINE_PROP_UINT32("entity_count", BusControllerDev, entity_count, 1),
     DEFINE_PROP_UINT32("pto-device-cna", BusControllerDev, pto_device_cna, 0),
+    DEFINE_PROP_UINT64("pto-authorization-delay-ns", BusControllerDev,
+                       pto_authorization_delay_ns, 0),
+    DEFINE_PROP_UINT64("pto-authorization-timeout-ns", BusControllerDev,
+                       pto_authorization_timeout_ns,
+                       LINQU_PTO_AUTHORIZATION_TIMEOUT_NS_DEFAULT),
     DEFINE_PROP_STRING("remote-memory-model-manifest", BusControllerDev,
                        remote_memory_model_manifest),
     DEFINE_PROP_STRING("async-load-model", BusControllerDev,
@@ -10122,6 +10493,11 @@ static void ub_bus_controller_dev_finalize(Object *object)
 {
     BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(object);
 
+    linqu_uapi_authorization_discard(ubc_dev);
+    if (ubc_dev->linqu_uapi_authorization_timer) {
+        timer_free(ubc_dev->linqu_uapi_authorization_timer);
+        ubc_dev->linqu_uapi_authorization_timer = NULL;
+    }
     linqu_ub_gm_registry_free(ubc_dev->linqu_uapi_ub_gm_registry);
     ubc_dev->linqu_uapi_ub_gm_registry = NULL;
     if (ubc_dev->linqu_uapi_bridge) {
