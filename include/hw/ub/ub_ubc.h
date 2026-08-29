@@ -147,6 +147,7 @@ typedef struct BusControllerDev {
     uint32_t entity_count;  /* Number of entities (FEs), default=1 */
     char *remote_memory_model_manifest;
     char *async_load_model;
+    uint32_t pto_device_cna;
     UbObmmRemoteModelState remote_memory_model;
     QEMUTimer *remote_memory_model_timer;
     struct UbcObmmAsyncChild *obmm_async_children;

@@ -9070,6 +9070,7 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
 static Property ub_bus_controller_dev_properties[] = {
     DEFINE_PROP_UB_DEV_GUID("bus_instance_guid", BusControllerDev, bus_instance_guid),
     DEFINE_PROP_UINT32("entity_count", BusControllerDev, entity_count, 1),
+    DEFINE_PROP_UINT32("pto-device-cna", BusControllerDev, pto_device_cna, 0),
     DEFINE_PROP_STRING("remote-memory-model-manifest", BusControllerDev,
                        remote_memory_model_manifest),
     DEFINE_PROP_STRING("async-load-model", BusControllerDev,
