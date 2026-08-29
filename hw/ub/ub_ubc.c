@@ -5799,6 +5799,7 @@ static bool linqu_uapi_publish_ub_gm_failure(BusControllerDev *ubc_dev,
     const char *code = linqu_uapi_ub_gm_error_code(error);
     size_t code_len = strlen(code);
     size_t time_offset;
+    uint32_t cq_slot;
 
     if (!ubc_dev || ubc_dev->linqu_uapi_cq_depth == 0 ||
         ((ubc_dev->linqu_uapi_cq_tail + 1) %
@@ -5819,8 +5820,8 @@ static bool linqu_uapi_publish_ub_gm_failure(BusControllerDev *ubc_dev,
     time_offset = 12 + code_len;
     stq_le_p(slot + time_offset,
              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-    if (linqu_uapi_write_slot(ubc_dev->linqu_uapi_cq_iova,
-                              ubc_dev->linqu_uapi_cq_tail,
+    cq_slot = ubc_dev->linqu_uapi_cq_tail;
+    if (linqu_uapi_write_slot(ubc_dev->linqu_uapi_cq_iova, cq_slot,
                               slot) != MEMTX_OK) {
         return false;
     }
@@ -5829,6 +5830,9 @@ static bool linqu_uapi_publish_ub_gm_failure(BusControllerDev *ubc_dev,
     ubc_dev->linqu_uapi_last_error = error;
     ubc_dev->linqu_uapi_irq_status |=
         LINQU_UAPI_IRQ_COMPLETION | LINQU_UAPI_IRQ_ERROR;
+    qemu_log("QEMU_UB_GM_FAILURE_COMPLETION op=%" PRIu64
+             " cq_slot=%u cq_tail=%u status=3 code=%s\n",
+             op_id, cq_slot, ubc_dev->linqu_uapi_cq_tail, code);
     qemu_log("QEMU_UB_GM_DISPATCH_REJECT op=%" PRIu64
              " error=%d code=%s\n", op_id, error, code);
     return true;
