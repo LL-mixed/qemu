@@ -573,6 +573,7 @@ typedef struct SimDecoderState {
     uint64_t page_cache_global_pages;
     bool page_cache_prefetch;
     SimDecWriteMode write_mode;
+    bool experimental_gsva_enabled;
 } SimDecoderState;
 
 static SimDecoderState *g_sim_decoder;
@@ -10182,6 +10183,14 @@ static void sim_dec_init(BusControllerState *bcs)
         g_sim_decoder->write_mode = SIM_DEC_WRITE_BACK;
     }
 
+    env = g_getenv("UB_SIM_EXPERIMENTAL_FEATURES");
+    if (env && env[0]) {
+        g_auto(GStrv) features = g_strsplit_set(env, ",:; ", -1);
+
+        g_sim_decoder->experimental_gsva_enabled =
+            g_strv_contains((const gchar *const *)features, "gsva");
+    }
+
     atexit(sim_dec_print_global_stats);
     qemu_log("SIM_DEC: decoder simulation initialized cache_per_map=%" PRIu64
              " cache_global=%" PRIu64 " prefetch=%d write_mode=%s\n",
@@ -11946,7 +11955,9 @@ static int sim_dec_handle_obmm_bootstrap_publish(
 
     /* Make the local payload resolvable before publishing peer visibility. */
     obmm_export_register(record);
-    sim_dec_register_obmm_gsva_route(record);
+    if (g_sim_decoder->experimental_gsva_enabled) {
+        sim_dec_register_obmm_gsva_route(record);
+    }
     if (g_rename(tmp_path, path) != 0) {
         qemu_log("SIM_DEC: OBMM bootstrap publish rename failed: %s\n",
                  g_strerror(errno));

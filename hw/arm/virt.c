@@ -438,6 +438,19 @@ static void create_fdt(VirtMachineState *vms)
 }
 
 #ifdef CONFIG_UB
+static bool ub_sim_experimental_feature_enabled(const char *feature)
+{
+    const char *features = g_getenv("UB_SIM_EXPERIMENTAL_FEATURES");
+    g_auto(GStrv) entries = NULL;
+
+    if (!features || !features[0]) {
+        return false;
+    }
+
+    entries = g_strsplit_set(features, ",:; ", -1);
+    return g_strv_contains((const gchar *const *)entries, feature);
+}
+
 static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *machine_ram)
 {
     MachineState *ms = MACHINE(vms);
@@ -446,7 +459,8 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
     char *linqu_nodename;
     const char *ssd_backend_profile = "memory";
     const char *skip_devices = g_getenv("UB_SIM_SKIP_DEVICES");
-    bool create_npu = !skip_devices || !strstr(skip_devices, "npu");
+    bool create_npu = ub_sim_experimental_feature_enabled("npu") &&
+                      (!skip_devices || !strstr(skip_devices, "npu"));
     bool create_ssd = !skip_devices || !strstr(skip_devices, "ssd");
 
     qemu_fdt_setprop_u64(ms->fdt, "/chosen", "linux,ubios-information-table",
@@ -2078,7 +2092,8 @@ static void create_ub(VirtMachineState *vms)
     /* Create UB-attached NPU and SSD devices */
     {
         const char *skip_devices = g_getenv("UB_SIM_SKIP_DEVICES");
-        bool create_npu = !skip_devices || !strstr(skip_devices, "npu");
+        bool create_npu = ub_sim_experimental_feature_enabled("npu") &&
+                          (!skip_devices || !strstr(skip_devices, "npu"));
         bool create_ssd = !skip_devices || !strstr(skip_devices, "ssd");
         uint32_t node_id = virt_ub_node_seq(0);
         uint64_t ubc_base = vms->memmap[VIRT_UBC_BASE_REG].base;
