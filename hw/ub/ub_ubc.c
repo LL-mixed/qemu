@@ -577,6 +577,19 @@ typedef struct SimDecoderState {
 } SimDecoderState;
 
 static SimDecoderState *g_sim_decoder;
+static bool sim_dec_experimental_feature_enabled(const char *feature)
+{
+    const char *features = g_getenv("UB_SIM_EXPERIMENTAL_FEATURES");
+    g_auto(GStrv) entries = NULL;
+
+    if (!features || !features[0]) {
+        return false;
+    }
+
+    entries = g_strsplit_set(features, ",:; ", -1);
+    return g_strv_contains((const gchar *const *)entries, feature);
+}
+
 static bool sim_dec_is_gva_entry(const SimDecMapEntry *entry);
 static bool sim_dec_entry_write_back(const SimDecMapEntry *entry);
 static void sim_dec_log_gva_path(const SimDecMapEntry *entry, const char *op,
@@ -10183,13 +10196,10 @@ static void sim_dec_init(BusControllerState *bcs)
         g_sim_decoder->write_mode = SIM_DEC_WRITE_BACK;
     }
 
-    env = g_getenv("UB_SIM_EXPERIMENTAL_FEATURES");
-    if (env && env[0]) {
-        g_auto(GStrv) features = g_strsplit_set(env, ",:; ", -1);
-
-        g_sim_decoder->experimental_gsva_enabled =
-            g_strv_contains((const gchar *const *)features, "gsva");
-    }
+    env = g_getenv("GSVA_MODE");
+    g_sim_decoder->experimental_gsva_enabled =
+        sim_dec_experimental_feature_enabled("gsva") ||
+        (env && env[0]);
 
     atexit(sim_dec_print_global_stats);
     qemu_log("SIM_DEC: decoder simulation initialized cache_per_map=%" PRIu64
@@ -10523,13 +10533,18 @@ bool gsva_arm_mmu_enabled(void)
 {
     static int cached = -1;
     const char *mode;
+    bool feature_enabled;
 
     if (cached >= 0) {
         return cached != 0;
     }
 
     mode = g_getenv("GSVA_MODE");
-    cached = (!mode || mode[0] == '\0' || strcmp(mode, "arm_mmu") == 0) ? 1 : 0;
+    feature_enabled = sim_dec_experimental_feature_enabled("gsva");
+    cached = ((feature_enabled &&
+               (!mode || mode[0] == '\0' ||
+                strcmp(mode, "arm_mmu") == 0)) ||
+              (mode && strcmp(mode, "arm_mmu") == 0)) ? 1 : 0;
     if (cached) {
         qemu_log("GSVA_MODE arm_mmu: ARM tlb_fill will use GSVA route/coherence\n");
     }
