@@ -273,6 +273,7 @@ typedef struct BusControllerDev {
     bool linqu_uapi_kick_pending;
     bool linqu_uapi_kick_running;
     uint32_t linqu_uapi_kick_batch;
+    struct LinquUbGmRegistry *linqu_uapi_ub_gm_registry;
     uint32_t next_sim_dec_read_req_id;
     uint32_t next_tp_id;
 } BusControllerDev;
@@ -280,10 +281,12 @@ typedef struct BusControllerDev {
 typedef struct UbcObmmResolvedMap {
     uint64_t map_id;
     uint64_t map_generation;
+    uint64_t local_pa;
     uint64_t remote_uba;
     uint64_t length;
     uint32_t token_id;
     uint32_t peer_cna;
+    uint32_t access_flags;
 } UbcObmmResolvedMap;
 
 typedef void (*UbcObmmAsyncReadCompleteFn)(

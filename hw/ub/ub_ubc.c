@@ -39,6 +39,7 @@
 #include "hw/ub/ub_async_load_device.h"
 #include "hw/ub/ub_ummu.h"
 #include "hw/ub/ub_config.h"
+#include "hw/ub/linqu_shmem_pto_abi.h"
 #include "hw/ub/ub_usi.h"
 #include "hw/ub/hisi/ubc.h"
 #include "hw/ub/hisi/ub_mem.h"
@@ -69,12 +70,6 @@ static bool ubc_trace_data_path_enabled(void)
     return val && val[0] && strcmp(val, "0") != 0;
 }
 
-typedef struct LinquUbBridge LinquUbBridge;
-LinquUbBridge *linqu_ub_bridge_new_from_yaml(const char *path);
-void linqu_ub_bridge_free(LinquUbBridge *bridge);
-int linqu_ub_bridge_register_endpoint(LinquUbBridge *bridge,
-                                      uint16_t endpoint_id,
-                                      uint32_t entity_id);
 int linqu_ub_bridge_get_default_segment(LinquUbBridge *bridge,
                                         uint16_t endpoint_id,
                                         uint64_t *segment_out);
@@ -136,6 +131,48 @@ int linqu_ub_bridge_poll_completion(LinquUbBridge *bridge,
 #define LINQU_UAPI_IRQ_COMPLETION 1
 #define LINQU_UAPI_IRQ_ERROR 2
 #define LINQU_UAPI_IRQ_CQ_OVERFLOW 4
+
+#define LINQU_PTO_CONTROL_WIRE_BYTES 64u
+#define LINQU_PTO_MEMREF_WIRE_BYTES 80u
+#define LINQU_PTO_SCALAR_WIRE_BYTES 24u
+#define LINQU_PTO_APERTURE_BASE 0x700000000000ULL
+#define LINQU_PTO_APERTURE_LENGTH 0x010000000000ULL
+#define LINQU_PTO_APERTURE_ALIGN 0x10000ULL
+
+typedef struct LinquUbGmBindingState {
+    uint64_t request_id;
+    uint64_t binding_id;
+    uint64_t mapping_ref;
+    uint64_t local_base;
+    uint64_t length;
+    uint64_t map_id;
+    uint64_t map_generation;
+    uint64_t remote_base;
+    uint64_t read_bytes;
+    uint64_t write_bytes;
+    uint64_t fence_count;
+    uint32_t token_id;
+    uint32_t peer_cna;
+    uint32_t access;
+    bool dirty;
+    bool active;
+} LinquUbGmBindingState;
+
+typedef struct LinquUbGmDispatchState {
+    uint64_t op_id;
+    uint64_t request_id;
+    uint32_t binding_count;
+    LinquUbGmBindingState *bindings;
+    QTAILQ_ENTRY(LinquUbGmDispatchState) next;
+} LinquUbGmDispatchState;
+
+struct LinquUbGmRegistry {
+    QemuMutex lock;
+    QTAILQ_HEAD(, LinquUbGmDispatchState) dispatches;
+    uint64_t qemu_load_bytes;
+    uint64_t qemu_store_bytes;
+    uint64_t qemu_fence_count;
+};
 
 /*
  * ============================================================================
@@ -4474,9 +4511,346 @@ static uint64_t linqu_uapi_status(BusControllerDev *ubc_dev)
            ((uint64_t)ubc_dev->linqu_uapi_cq_tail << 56);
 }
 
+static struct LinquUbGmRegistry *linqu_ub_gm_registry_new(void)
+{
+    struct LinquUbGmRegistry *registry = g_new0(struct LinquUbGmRegistry, 1);
+
+    qemu_mutex_init(&registry->lock);
+    QTAILQ_INIT(&registry->dispatches);
+    return registry;
+}
+
+static void linqu_ub_gm_dispatch_free(LinquUbGmDispatchState *dispatch)
+{
+    if (!dispatch) {
+        return;
+    }
+    g_free(dispatch->bindings);
+    g_free(dispatch);
+}
+
+static void linqu_ub_gm_registry_free(struct LinquUbGmRegistry *registry)
+{
+    LinquUbGmDispatchState *dispatch;
+
+    if (!registry) {
+        return;
+    }
+    qemu_mutex_lock(&registry->lock);
+    while ((dispatch = QTAILQ_FIRST(&registry->dispatches)) != NULL) {
+        QTAILQ_REMOVE(&registry->dispatches, dispatch, next);
+        linqu_ub_gm_dispatch_free(dispatch);
+    }
+    qemu_mutex_unlock(&registry->lock);
+    qemu_mutex_destroy(&registry->lock);
+    g_free(registry);
+}
+
+static bool linqu_ub_gm_binding_snapshot(BusControllerDev *ubc_dev,
+                                         uint64_t request_id,
+                                         uint64_t binding_id,
+                                         uint64_t ub_gm_addr,
+                                         uint64_t length,
+                                         uint32_t required_access,
+                                         LinquUbGmBindingState *snapshot)
+{
+    struct LinquUbGmRegistry *registry;
+    LinquUbGmDispatchState *dispatch;
+    bool found = false;
+
+    if (!ubc_dev || !snapshot || request_id == 0 || binding_id == 0 ||
+        length == 0 || ub_gm_addr > UINT64_MAX - length) {
+        return false;
+    }
+    registry = ubc_dev->linqu_uapi_ub_gm_registry;
+    if (!registry) {
+        return false;
+    }
+
+    qemu_mutex_lock(&registry->lock);
+    QTAILQ_FOREACH(dispatch, &registry->dispatches, next) {
+        uint32_t index;
+
+        if (dispatch->request_id != request_id) {
+            continue;
+        }
+        for (index = 0; index < dispatch->binding_count; index++) {
+            LinquUbGmBindingState *binding = &dispatch->bindings[index];
+            uint64_t offset;
+
+            if (!binding->active || binding->binding_id != binding_id ||
+                (binding->access & required_access) != required_access ||
+                ub_gm_addr < binding->local_base) {
+                continue;
+            }
+            offset = ub_gm_addr - binding->local_base;
+            if (offset > binding->length ||
+                length > binding->length - offset) {
+                continue;
+            }
+            *snapshot = *binding;
+            found = true;
+            break;
+        }
+        break;
+    }
+    qemu_mutex_unlock(&registry->lock);
+    return found;
+}
+
+static bool linqu_ub_gm_mapping_still_authorized(
+    BusControllerDev *ubc_dev,
+    const LinquUbGmBindingState *binding,
+    uint64_t ub_gm_addr,
+    uint64_t length,
+    UbcObmmResolvedMap *resolved)
+{
+    uint64_t offset;
+
+    if (!binding || !resolved || ub_gm_addr < binding->local_base ||
+        length == 0 || length > UINT32_MAX) {
+        return false;
+    }
+    offset = ub_gm_addr - binding->local_base;
+    if (offset > binding->length || length > binding->length - offset ||
+        binding->remote_base > UINT64_MAX - offset ||
+        !ubc_obmm_resolve_async_map(ubc_dev, ub_gm_addr, length, resolved)) {
+        return false;
+    }
+    return resolved->map_id == binding->map_id &&
+           resolved->map_generation == binding->map_generation &&
+           resolved->map_generation == binding->mapping_ref &&
+           resolved->remote_uba == binding->remote_base + offset &&
+           resolved->token_id == binding->token_id &&
+           resolved->peer_cna == binding->peer_cna;
+}
+
+static void linqu_ub_gm_account_access(BusControllerDev *ubc_dev,
+                                       uint64_t request_id,
+                                       uint64_t binding_id,
+                                       uint64_t read_bytes,
+                                       uint64_t write_bytes,
+                                       bool fenced)
+{
+    struct LinquUbGmRegistry *registry;
+    LinquUbGmDispatchState *dispatch;
+
+    if (!ubc_dev || !ubc_dev->linqu_uapi_ub_gm_registry) {
+        return;
+    }
+    registry = ubc_dev->linqu_uapi_ub_gm_registry;
+    qemu_mutex_lock(&registry->lock);
+    QTAILQ_FOREACH(dispatch, &registry->dispatches, next) {
+        uint32_t index;
+
+        if (dispatch->request_id != request_id) {
+            continue;
+        }
+        for (index = 0; index < dispatch->binding_count; index++) {
+            LinquUbGmBindingState *binding = &dispatch->bindings[index];
+
+            if (binding->binding_id != binding_id) {
+                continue;
+            }
+            binding->read_bytes += read_bytes;
+            binding->write_bytes += write_bytes;
+            binding->dirty |= write_bytes != 0;
+            binding->fence_count += fenced ? 1 : 0;
+            break;
+        }
+        break;
+    }
+    registry->qemu_load_bytes += read_bytes;
+    registry->qemu_store_bytes += write_bytes;
+    registry->qemu_fence_count += fenced ? 1 : 0;
+    qemu_mutex_unlock(&registry->lock);
+}
+
+static int linqu_ub_gm_read(void *opaque, uint64_t request_id,
+                            uint64_t binding_id, uint64_t ub_gm_addr,
+                            void *dst, uint64_t length)
+{
+    BusControllerDev *ubc_dev = opaque;
+    LinquUbGmBindingState binding;
+    UbcObmmResolvedMap resolved;
+
+    if (!dst || !linqu_ub_gm_binding_snapshot(
+                    ubc_dev, request_id, binding_id, ub_gm_addr, length,
+                    LINGQU_PTO_UB_GM_READ, &binding) ||
+        !linqu_ub_gm_mapping_still_authorized(
+            ubc_dev, &binding, ub_gm_addr, length, &resolved)) {
+        qemu_log("QEMU_UB_GM_LOAD denied request=%" PRIu64
+                 " binding=%" PRIu64 " addr=0x%" PRIx64
+                 " length=%" PRIu64 "\n",
+                 request_id, binding_id, ub_gm_addr, length);
+        return -LINGQU_PTO_UB_GM_UNBOUND;
+    }
+    if (ubc_sim_dec_remote_read(ubc_dev, resolved.remote_uba,
+                                resolved.token_id, resolved.peer_cna,
+                                dst, (uint32_t)length) != MEMTX_OK) {
+        return -LINGQU_PTO_UB_GM_CALLBACK_FAILED;
+    }
+    linqu_ub_gm_account_access(ubc_dev, request_id, binding_id,
+                               length, 0, false);
+    qemu_log("QEMU_UB_GM_LOAD request=%" PRIu64 " binding=%" PRIu64
+             " addr=0x%" PRIx64 " length=%" PRIu64
+             " map=%" PRIu64 " generation=%" PRIu64 "\n",
+             request_id, binding_id, ub_gm_addr, length,
+             resolved.map_id, resolved.map_generation);
+    return 0;
+}
+
+static int linqu_ub_gm_write(void *opaque, uint64_t request_id,
+                             uint64_t binding_id, uint64_t ub_gm_addr,
+                             const void *src, uint64_t length)
+{
+    BusControllerDev *ubc_dev = opaque;
+    LinquUbGmBindingState binding;
+    UbcObmmResolvedMap resolved;
+
+    if (!src || !linqu_ub_gm_binding_snapshot(
+                    ubc_dev, request_id, binding_id, ub_gm_addr, length,
+                    LINGQU_PTO_UB_GM_WRITE, &binding) ||
+        !linqu_ub_gm_mapping_still_authorized(
+            ubc_dev, &binding, ub_gm_addr, length, &resolved) ||
+        (resolved.access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY)) {
+        qemu_log("QEMU_UB_GM_STORE denied request=%" PRIu64
+                 " binding=%" PRIu64 " addr=0x%" PRIx64
+                 " length=%" PRIu64 "\n",
+                 request_id, binding_id, ub_gm_addr, length);
+        return -LINGQU_PTO_UB_GM_ACCESS_DENIED;
+    }
+    if (ubc_sim_dec_remote_write(ubc_dev, resolved.remote_uba,
+                                 resolved.token_id, resolved.peer_cna,
+                                 src, (uint32_t)length) != MEMTX_OK) {
+        return -LINGQU_PTO_UB_GM_CALLBACK_FAILED;
+    }
+    linqu_ub_gm_account_access(ubc_dev, request_id, binding_id,
+                               0, length, false);
+    qemu_log("QEMU_UB_GM_STORE request=%" PRIu64 " binding=%" PRIu64
+             " addr=0x%" PRIx64 " length=%" PRIu64
+             " map=%" PRIu64 " generation=%" PRIu64 "\n",
+             request_id, binding_id, ub_gm_addr, length,
+             resolved.map_id, resolved.map_generation);
+    return 0;
+}
+
+static int linqu_ub_gm_fence(void *opaque, uint64_t request_id,
+                             uint64_t binding_id, uint64_t ub_gm_addr,
+                             uint64_t length, uint32_t flags)
+{
+    BusControllerDev *ubc_dev = opaque;
+    LinquUbGmBindingState binding;
+    UbcObmmResolvedMap resolved;
+
+    if (flags != 0 || !linqu_ub_gm_binding_snapshot(
+                          ubc_dev, request_id, binding_id, ub_gm_addr,
+                          length, LINGQU_PTO_UB_GM_WRITE, &binding) ||
+        !binding.dirty || !linqu_ub_gm_mapping_still_authorized(
+                              ubc_dev, &binding, ub_gm_addr, length,
+                              &resolved)) {
+        return -LINGQU_PTO_UB_GM_CALLBACK_FAILED;
+    }
+    linqu_ub_gm_account_access(ubc_dev, request_id, binding_id,
+                               0, 0, true);
+    qemu_log("QEMU_UB_GM_FENCE request=%" PRIu64 " binding=%" PRIu64
+             " addr=0x%" PRIx64 " length=%" PRIu64 "\n",
+             request_id, binding_id, ub_gm_addr, length);
+    return 0;
+}
+
+static bool linqu_ub_gm_register_dispatch(
+    BusControllerDev *ubc_dev,
+    uint64_t op_id,
+    uint64_t request_id,
+    const LinquUbGmBindingState *bindings,
+    uint32_t binding_count)
+{
+    struct LinquUbGmRegistry *registry;
+    LinquUbGmDispatchState *existing;
+    LinquUbGmDispatchState *dispatch;
+
+    if (!ubc_dev || !bindings || binding_count == 0 ||
+        !ubc_dev->linqu_uapi_ub_gm_registry) {
+        return false;
+    }
+    registry = ubc_dev->linqu_uapi_ub_gm_registry;
+    dispatch = g_new0(LinquUbGmDispatchState, 1);
+    dispatch->op_id = op_id;
+    dispatch->request_id = request_id;
+    dispatch->binding_count = binding_count;
+    dispatch->bindings = g_memdup2(
+        bindings, sizeof(*bindings) * (size_t)binding_count);
+
+    qemu_mutex_lock(&registry->lock);
+    QTAILQ_FOREACH(existing, &registry->dispatches, next) {
+        if (existing->op_id == op_id || existing->request_id == request_id) {
+            qemu_mutex_unlock(&registry->lock);
+            linqu_ub_gm_dispatch_free(dispatch);
+            return false;
+        }
+    }
+    QTAILQ_INSERT_TAIL(&registry->dispatches, dispatch, next);
+    qemu_mutex_unlock(&registry->lock);
+    return true;
+}
+
+static void linqu_ub_gm_remove_dispatch(BusControllerDev *ubc_dev,
+                                        uint64_t op_id,
+                                        const char *reason)
+{
+    struct LinquUbGmRegistry *registry;
+    LinquUbGmDispatchState *dispatch;
+    LinquUbGmDispatchState *dispatch_next;
+
+    if (!ubc_dev || !ubc_dev->linqu_uapi_ub_gm_registry) {
+        return;
+    }
+    registry = ubc_dev->linqu_uapi_ub_gm_registry;
+    qemu_mutex_lock(&registry->lock);
+    QTAILQ_FOREACH_SAFE(dispatch, &registry->dispatches, next,
+                        dispatch_next) {
+        uint64_t read_bytes = 0;
+        uint64_t write_bytes = 0;
+        uint64_t fence_count = 0;
+        uint32_t index;
+
+        if (dispatch->op_id != op_id) {
+            continue;
+        }
+        for (index = 0; index < dispatch->binding_count; index++) {
+            LinquUbGmBindingState *binding = &dispatch->bindings[index];
+
+            binding->active = false;
+            read_bytes += binding->read_bytes;
+            write_bytes += binding->write_bytes;
+            fence_count += binding->fence_count;
+        }
+        QTAILQ_REMOVE(&registry->dispatches, dispatch, next);
+        qemu_mutex_unlock(&registry->lock);
+        qemu_log("QEMU_UB_GM_UNBIND op=%" PRIu64 " request=%" PRIu64
+                 " reason=%s bindings=%u load_bytes=%" PRIu64
+                 " store_bytes=%" PRIu64 " fences=%" PRIu64
+                 " segment_payload_staging_bytes=0\n",
+                 dispatch->op_id, dispatch->request_id,
+                 reason ? reason : "unknown", dispatch->binding_count,
+                 read_bytes, write_bytes, fence_count);
+        linqu_ub_gm_dispatch_free(dispatch);
+        return;
+    }
+    qemu_mutex_unlock(&registry->lock);
+}
+
 static bool linqu_uapi_init_bridge(BusControllerDev *ubc_dev)
 {
     const char *scenario_path;
+    PtoSimUbGmAccessOpsV1 ub_gm_ops = {
+        .abi_version = PTO_SIM_UB_GM_ACCESS_ABI_V1,
+        .struct_bytes = sizeof(PtoSimUbGmAccessOpsV1),
+        .read = linqu_ub_gm_read,
+        .write = linqu_ub_gm_write,
+        .fence = linqu_ub_gm_fence,
+    };
     uint64_t segment = 0;
 
     if (!ubc_dev) {
@@ -4505,13 +4879,37 @@ static bool linqu_uapi_init_bridge(BusControllerDev *ubc_dev)
                                           LINQU_UAPI_ENDPOINT_ID,
                                           LINQU_UAPI_ENTITY_ID) != 0) {
         ubc_dev->linqu_uapi_last_error = 3;
+        linqu_ub_bridge_free(ubc_dev->linqu_uapi_bridge);
+        ubc_dev->linqu_uapi_bridge = NULL;
         return false;
+    }
+    if (ubc_dev->pto_device_cna != 0) {
+        ubc_dev->linqu_uapi_ub_gm_registry = linqu_ub_gm_registry_new();
+        if (linqu_ub_bridge_register_ub_gm_access_v1(
+                ubc_dev->linqu_uapi_bridge, &ub_gm_ops, ubc_dev,
+                ubc_dev->pto_device_cna) != 0) {
+            ubc_dev->linqu_uapi_last_error = 15;
+            linqu_ub_gm_registry_free(
+                ubc_dev->linqu_uapi_ub_gm_registry);
+            ubc_dev->linqu_uapi_ub_gm_registry = NULL;
+            linqu_ub_bridge_free(ubc_dev->linqu_uapi_bridge);
+            ubc_dev->linqu_uapi_bridge = NULL;
+            return false;
+        }
+        qemu_log("QEMU_UB_GM_ACCESS_REGISTER pto_device_cna=0x%x\n",
+                 ubc_dev->pto_device_cna);
+    } else {
+        qemu_log("QEMU_UB_GM_ACCESS_DISABLED pto_device_cna=0\n");
     }
     if (linqu_ub_bridge_get_default_segment(ubc_dev->linqu_uapi_bridge,
                                             LINQU_UAPI_ENDPOINT_ID,
                                             &segment) != 0 ||
         segment == 0) {
         ubc_dev->linqu_uapi_last_error = 4;
+        linqu_ub_gm_registry_free(ubc_dev->linqu_uapi_ub_gm_registry);
+        ubc_dev->linqu_uapi_ub_gm_registry = NULL;
+        linqu_ub_bridge_free(ubc_dev->linqu_uapi_bridge);
+        ubc_dev->linqu_uapi_bridge = NULL;
         return false;
     }
 
@@ -4539,6 +4937,540 @@ static MemTxResult linqu_uapi_write_slot(uint64_t base, uint32_t slot,
                             buf,
                             LINQU_UAPI_DESC_BYTES,
                             MEMTXATTRS_UNSPECIFIED);
+}
+
+static bool linqu_uapi_wire_range_valid(uint64_t iova, uint64_t length)
+{
+    return iova != 0 && length != 0 && iova <= UINT64_MAX - length;
+}
+
+static bool linqu_uapi_wire_is_zero(const uint8_t *bytes, size_t length)
+{
+    size_t index;
+
+    for (index = 0; index < length; index++) {
+        if (bytes[index] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint32_t linqu_uapi_crc32_ieee_update(uint32_t crc,
+                                              const uint8_t *bytes,
+                                              size_t length)
+{
+    size_t index;
+
+    for (index = 0; index < length; index++) {
+        uint32_t value = crc ^ bytes[index];
+        uint32_t bit;
+
+        for (bit = 0; bit < 8; bit++) {
+            value = (value >> 1) ^
+                    (0xedb88320u & (0u - (value & 1u)));
+        }
+        crc = value;
+    }
+    return crc;
+}
+
+static void linqu_uapi_decode_control(
+    const uint8_t wire[LINQU_PTO_CONTROL_WIRE_BYTES],
+    LingquPtoDispatchControlV2 *control)
+{
+    *control = (LingquPtoDispatchControlV2) {
+        .abi_version = ldl_le_p(wire + 0),
+        .struct_bytes = ldl_le_p(wire + 4),
+        .request_id = ldq_le_p(wire + 8),
+        .callable_id = ldq_le_p(wire + 16),
+        .memref_count = ldl_le_p(wire + 24),
+        .scalar_count = ldl_le_p(wire + 28),
+        .memref_table_iova = ldq_le_p(wire + 32),
+        .scalar_table_iova = ldq_le_p(wire + 40),
+        .artifact_fingerprint = ldq_le_p(wire + 48),
+        .metadata_crc32 = ldl_le_p(wire + 56),
+        .requester_cna = ldl_le_p(wire + 60),
+    };
+}
+
+static void linqu_uapi_decode_memref(
+    const uint8_t wire[LINQU_PTO_MEMREF_WIRE_BYTES],
+    LingquShmemMemrefV1 *memref)
+{
+    *memref = (LingquShmemMemrefV1) {
+        .abi_version = ldl_le_p(wire + 0),
+        .struct_bytes = ldl_le_p(wire + 4),
+        .opaque_mapping_ref = ldq_le_p(wire + 8),
+        .ub_gm_addr = ldq_le_p(wire + 16),
+        .byte_offset = ldq_le_p(wire + 24),
+        .byte_length = ldq_le_p(wire + 32),
+        .shape_table_iova = ldq_le_p(wire + 40),
+        .stride_table_iova = ldq_le_p(wire + 48),
+        .arg_index = ldl_le_p(wire + 56),
+        .rank = ldl_le_p(wire + 60),
+        .dtype = lduw_le_p(wire + 64),
+        .role = wire[66],
+        .access = wire[67],
+        .flags = ldl_le_p(wire + 68),
+        .reserved0 = ldl_le_p(wire + 72),
+        .reserved1 = ldl_le_p(wire + 76),
+    };
+}
+
+static void linqu_uapi_decode_scalar(
+    const uint8_t wire[LINQU_PTO_SCALAR_WIRE_BYTES],
+    LingquPtoScalarV1 *scalar)
+{
+    *scalar = (LingquPtoScalarV1) {
+        .abi_version = ldl_le_p(wire + 0),
+        .struct_bytes = ldl_le_p(wire + 4),
+        .arg_index = ldl_le_p(wire + 8),
+        .dtype = lduw_le_p(wire + 12),
+        .flags = lduw_le_p(wire + 14),
+        .value = ldq_le_p(wire + 16),
+    };
+}
+
+static uint64_t linqu_uapi_dtype_bytes(uint16_t dtype)
+{
+    switch (dtype) {
+    case 0:
+    case 2:
+    case 10:
+        return 4;
+    case 1:
+    case 3:
+    case 6:
+    case 9:
+        return 2;
+    case 4:
+    case 5:
+    case 11:
+    case 12:
+    case 13:
+    case 14:
+        return 1;
+    case 7:
+    case 8:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+static bool linqu_uapi_validate_contiguous_memref(
+    const LingquShmemMemrefV1 *memref,
+    const uint32_t shape[LINGQU_PTO_MAX_RANK],
+    const uint32_t strides[LINGQU_PTO_MAX_RANK])
+{
+    uint64_t elements = 1;
+    uint64_t expected_stride = 1;
+    uint64_t element_bytes;
+    uint32_t index;
+
+    if (!memref || memref->rank == 0 ||
+        memref->rank > LINGQU_PTO_MAX_RANK) {
+        return false;
+    }
+    element_bytes = linqu_uapi_dtype_bytes(memref->dtype);
+    if (element_bytes == 0) {
+        return false;
+    }
+    for (index = memref->rank; index > 0; index--) {
+        uint32_t dim = shape[index - 1];
+
+        if (dim == 0 || strides[index - 1] != expected_stride ||
+            elements > UINT64_MAX / dim) {
+            return false;
+        }
+        elements *= dim;
+        expected_stride = elements;
+    }
+    if (elements > UINT64_MAX / element_bytes ||
+        elements * element_bytes != memref->byte_length) {
+        return false;
+    }
+    return true;
+}
+
+static bool linqu_uapi_role_access_valid(const LingquShmemMemrefV1 *memref)
+{
+    return (memref->role == LINGQU_PTO_MEMREF_INPUT &&
+            memref->access == LINGQU_PTO_UB_GM_READ) ||
+           (memref->role == LINGQU_PTO_MEMREF_OUTPUT &&
+            memref->access == LINGQU_PTO_UB_GM_WRITE) ||
+           (memref->role == LINGQU_PTO_MEMREF_INOUT &&
+            memref->access == LINGQU_PTO_UB_GM_READ_WRITE);
+}
+
+static bool linqu_uapi_aperture_advance(uint64_t current,
+                                        uint64_t length,
+                                        uint64_t *next)
+{
+    uint64_t rounded;
+    uint64_t limit = LINQU_PTO_APERTURE_BASE + LINQU_PTO_APERTURE_LENGTH;
+
+    if (length == 0 || length > UINT64_MAX - (LINQU_PTO_APERTURE_ALIGN - 1)) {
+        return false;
+    }
+    rounded = (length + LINQU_PTO_APERTURE_ALIGN - 1) &
+              ~(LINQU_PTO_APERTURE_ALIGN - 1);
+    if (current < LINQU_PTO_APERTURE_BASE || current > limit ||
+        rounded > limit - current ||
+        LINQU_PTO_APERTURE_ALIGN > limit - current - rounded) {
+        return false;
+    }
+    *next = current + rounded + LINQU_PTO_APERTURE_ALIGN;
+    return true;
+}
+
+static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
+                                      const uint8_t *slot,
+                                      uint64_t *op_id_out)
+{
+    uint8_t control_wire[LINQU_PTO_CONTROL_WIRE_BYTES];
+    uint8_t control_crc_wire[LINQU_PTO_CONTROL_WIRE_BYTES];
+    LingquPtoDispatchControlV2 control;
+    PtoSimUbGmAuthorizedMemrefV1 *authorized = NULL;
+    LingquPtoScalarV1 *scalars = NULL;
+    LinquUbGmBindingState *bindings = NULL;
+    uint8_t *memref_wire = NULL;
+    uint8_t *scalar_wire = NULL;
+    bool arg_seen[LINGQU_PTO_MAX_MEMREFS + LINGQU_PTO_MAX_SCALARS] = { 0 };
+    uint64_t op_id;
+    uint64_t control_iova;
+    uint64_t expected_fingerprint = 0;
+    uint64_t aperture = LINQU_PTO_APERTURE_BASE;
+    uint32_t crc = 0xffffffffu;
+    uint32_t total_args;
+    uint32_t index;
+    int error = LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
+    int rc;
+
+    if (!ubc_dev || !slot || !op_id_out ||
+        !ubc_dev->linqu_uapi_ub_gm_registry ||
+        slot[0] != LINGQU_PTO_DISPATCH_SLOT_TAG_V2 ||
+        !linqu_uapi_wire_is_zero(
+            slot + LINGQU_PTO_DISPATCH_SLOT_RESERVED_OFFSET,
+            LINQU_UAPI_DESC_BYTES - LINGQU_PTO_DISPATCH_SLOT_RESERVED_OFFSET)) {
+        return LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
+    }
+    op_id = ldq_le_p(slot + LINGQU_PTO_DISPATCH_SLOT_OP_ID_OFFSET);
+    control_iova = ldq_le_p(
+        slot + LINGQU_PTO_DISPATCH_SLOT_CONTROL_IOVA_OFFSET);
+    *op_id_out = op_id;
+    if (op_id == 0 ||
+        !linqu_uapi_wire_range_valid(control_iova, sizeof(control_wire)) ||
+        dma_memory_read(&address_space_memory, control_iova, control_wire,
+                        sizeof(control_wire),
+                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        return LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
+    }
+    linqu_uapi_decode_control(control_wire, &control);
+    if (control.abi_version != LINGQU_PTO_DISPATCH_ABI_V2 ||
+        control.struct_bytes < sizeof(control) || control.request_id == 0 ||
+        control.callable_id == 0 || control.artifact_fingerprint == 0 ||
+        control.requester_cna == 0 ||
+        control.requester_cna > LINGQU_PTO_CNA_MAX ||
+        control.requester_cna != ubc_dev->pto_device_cna ||
+        control.memref_count == 0 ||
+        control.memref_count > LINGQU_PTO_MAX_MEMREFS ||
+        control.scalar_count > LINGQU_PTO_MAX_SCALARS ||
+        (control.memref_count != 0 &&
+         !linqu_uapi_wire_range_valid(
+             control.memref_table_iova,
+             (uint64_t)control.memref_count * LINQU_PTO_MEMREF_WIRE_BYTES)) ||
+        (control.scalar_count != 0 &&
+         !linqu_uapi_wire_range_valid(
+             control.scalar_table_iova,
+             (uint64_t)control.scalar_count * LINQU_PTO_SCALAR_WIRE_BYTES))) {
+        return control.requester_cna != ubc_dev->pto_device_cna ?
+               LINGQU_PTO_UB_GM_ACCESS_DENIED :
+               LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
+    }
+    if (linqu_ub_bridge_query_ub_gm_callable_v1(
+            ubc_dev->linqu_uapi_bridge, control.callable_id,
+            &expected_fingerprint) != 0 ||
+        expected_fingerprint == 0 ||
+        expected_fingerprint != control.artifact_fingerprint) {
+        return LINGQU_PTO_UB_GM_UNSUPPORTED_CALLABLE;
+    }
+
+    total_args = control.memref_count + control.scalar_count;
+    authorized = g_new0(PtoSimUbGmAuthorizedMemrefV1,
+                        control.memref_count);
+    bindings = g_new0(LinquUbGmBindingState, control.memref_count);
+    memref_wire = g_malloc((size_t)control.memref_count *
+                           LINQU_PTO_MEMREF_WIRE_BYTES);
+    if (dma_memory_read(
+            &address_space_memory, control.memref_table_iova, memref_wire,
+            (size_t)control.memref_count * LINQU_PTO_MEMREF_WIRE_BYTES,
+            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        goto out;
+    }
+    if (control.scalar_count != 0) {
+        scalars = g_new0(LingquPtoScalarV1, control.scalar_count);
+        scalar_wire = g_malloc((size_t)control.scalar_count *
+                               LINQU_PTO_SCALAR_WIRE_BYTES);
+        if (dma_memory_read(
+                &address_space_memory, control.scalar_table_iova, scalar_wire,
+                (size_t)control.scalar_count * LINQU_PTO_SCALAR_WIRE_BYTES,
+                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            goto out;
+        }
+    }
+
+    memcpy(control_crc_wire, control_wire, sizeof(control_crc_wire));
+    memset(control_crc_wire + 56, 0, sizeof(uint32_t));
+    crc = linqu_uapi_crc32_ieee_update(
+        crc, control_crc_wire, sizeof(control_crc_wire));
+    crc = linqu_uapi_crc32_ieee_update(
+        crc, memref_wire,
+        (size_t)control.memref_count * LINQU_PTO_MEMREF_WIRE_BYTES);
+    if (control.scalar_count != 0) {
+        crc = linqu_uapi_crc32_ieee_update(
+            crc, scalar_wire,
+            (size_t)control.scalar_count * LINQU_PTO_SCALAR_WIRE_BYTES);
+    }
+
+    for (index = 0; index < control.memref_count; index++) {
+        PtoSimUbGmAuthorizedMemrefV1 *item = &authorized[index];
+        LingquShmemMemrefV1 *memref = &item->memref;
+        LinquUbGmBindingState *binding = &bindings[index];
+        const uint8_t *entry_wire =
+            memref_wire + ((size_t)index * LINQU_PTO_MEMREF_WIRE_BYTES);
+        uint8_t shape_wire[LINGQU_PTO_MAX_RANK * sizeof(uint32_t)] = { 0 };
+        uint8_t stride_wire[LINGQU_PTO_MAX_RANK * sizeof(uint32_t)] = { 0 };
+        UbcObmmResolvedMap resolved;
+        uint64_t shape_bytes;
+        uint64_t view_start;
+        uint64_t next_aperture;
+        uint32_t dim;
+
+        linqu_uapi_decode_memref(entry_wire, memref);
+        if (memref->abi_version != LINGQU_SHMEM_MEMREF_ABI_V1 ||
+            memref->struct_bytes < sizeof(*memref) ||
+            memref->opaque_mapping_ref == 0 || memref->ub_gm_addr == 0 ||
+            memref->byte_length == 0 ||
+            memref->arg_index >= control.memref_count ||
+            arg_seen[memref->arg_index] || memref->rank == 0 ||
+            memref->rank > LINGQU_PTO_MAX_RANK ||
+            memref->dtype > LINGQU_PTO_DTYPE_MAX ||
+            memref->flags != 0 || memref->reserved0 != 0 ||
+            memref->reserved1 != 0 || !linqu_uapi_role_access_valid(memref) ||
+            memref->byte_offset > UINT64_MAX - memref->byte_length ||
+            memref->ub_gm_addr > UINT64_MAX - memref->byte_offset) {
+            error = LINGQU_PTO_UB_GM_BAD_MEMREF;
+            goto out;
+        }
+        view_start = memref->ub_gm_addr + memref->byte_offset;
+        if (view_start > UINT64_MAX - memref->byte_length) {
+            error = LINGQU_PTO_UB_GM_BAD_MEMREF;
+            goto out;
+        }
+        arg_seen[memref->arg_index] = true;
+        shape_bytes = (uint64_t)memref->rank * sizeof(uint32_t);
+        if (!linqu_uapi_wire_range_valid(memref->shape_table_iova,
+                                         shape_bytes) ||
+            !linqu_uapi_wire_range_valid(memref->stride_table_iova,
+                                         shape_bytes) ||
+            dma_memory_read(&address_space_memory, memref->shape_table_iova,
+                            shape_wire, shape_bytes,
+                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
+            dma_memory_read(&address_space_memory, memref->stride_table_iova,
+                            stride_wire, shape_bytes,
+                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            error = LINGQU_PTO_UB_GM_BAD_MEMREF;
+            goto out;
+        }
+        crc = linqu_uapi_crc32_ieee_update(crc, shape_wire, shape_bytes);
+        crc = linqu_uapi_crc32_ieee_update(crc, stride_wire, shape_bytes);
+        for (dim = 0; dim < memref->rank; dim++) {
+            item->shape[dim] = ldl_le_p(shape_wire + dim * sizeof(uint32_t));
+            item->strides[dim] =
+                ldl_le_p(stride_wire + dim * sizeof(uint32_t));
+        }
+        if (!linqu_uapi_validate_contiguous_memref(
+                memref, item->shape, item->strides) ||
+            !ubc_obmm_resolve_async_map(ubc_dev, view_start,
+                                        memref->byte_length, &resolved) ||
+            resolved.map_generation != memref->opaque_mapping_ref) {
+            error = LINGQU_PTO_UB_GM_BAD_MEMREF;
+            goto out;
+        }
+        if ((memref->access & LINGQU_PTO_UB_GM_WRITE) &&
+            (resolved.access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY)) {
+            error = LINGQU_PTO_UB_GM_ACCESS_DENIED;
+            goto out;
+        }
+        if (!linqu_uapi_aperture_advance(
+                aperture, memref->byte_length, &next_aperture)) {
+            error = LINGQU_PTO_UB_GM_BAD_MEMREF;
+            goto out;
+        }
+
+        item->binding = (PtoSimUbGmBindingV1) {
+            .request_id = control.request_id,
+            .binding_id = (uint64_t)memref->arg_index + 1,
+            .aperture_base = aperture,
+            .aperture_length = memref->byte_length,
+            .ub_gm_base = view_start,
+            .mapped_length = memref->byte_length,
+            .access = memref->access,
+            .flags = 0,
+            .backend_cookie = memref->opaque_mapping_ref,
+        };
+        *binding = (LinquUbGmBindingState) {
+            .request_id = control.request_id,
+            .binding_id = item->binding.binding_id,
+            .mapping_ref = memref->opaque_mapping_ref,
+            .local_base = view_start,
+            .length = memref->byte_length,
+            .map_id = resolved.map_id,
+            .map_generation = resolved.map_generation,
+            .remote_base = resolved.remote_uba,
+            .token_id = resolved.token_id,
+            .peer_cna = resolved.peer_cna,
+            .access = memref->access,
+            .active = true,
+        };
+        aperture = next_aperture;
+        qemu_log("QEMU_UB_GM_%s_AUTHORIZE op=%" PRIu64
+                 " request=%" PRIu64 " binding=%" PRIu64
+                 " requester_cna=0x%x local=0x%" PRIx64
+                 " length=%" PRIu64 " map=%" PRIu64
+                 " generation=%" PRIu64 " peer_cna=0x%x\n",
+                 memref->role == LINGQU_PTO_MEMREF_INPUT ? "INPUT" :
+                 memref->role == LINGQU_PTO_MEMREF_OUTPUT ? "OUTPUT" :
+                 "INOUT", op_id, control.request_id, binding->binding_id,
+                 control.requester_cna, view_start, memref->byte_length,
+                 resolved.map_id, resolved.map_generation,
+                 resolved.peer_cna);
+    }
+
+    for (index = 0; index < control.scalar_count; index++) {
+        const uint8_t *entry_wire =
+            scalar_wire + ((size_t)index * LINQU_PTO_SCALAR_WIRE_BYTES);
+        LingquPtoScalarV1 *scalar = &scalars[index];
+
+        linqu_uapi_decode_scalar(entry_wire, scalar);
+        if (scalar->abi_version != LINGQU_PTO_SCALAR_ABI_V1 ||
+            scalar->struct_bytes < sizeof(*scalar) ||
+            scalar->arg_index < control.memref_count ||
+            scalar->arg_index >= total_args || arg_seen[scalar->arg_index] ||
+            scalar->dtype > LINGQU_PTO_DTYPE_MAX || scalar->flags != 0) {
+            goto out;
+        }
+        arg_seen[scalar->arg_index] = true;
+    }
+    for (index = 0; index < total_args; index++) {
+        if (!arg_seen[index]) {
+            goto out;
+        }
+    }
+    if ((crc ^ 0xffffffffu) != control.metadata_crc32) {
+        qemu_log("QEMU_UB_GM_METADATA_CRC_FAIL op=%" PRIu64
+                 " request=%" PRIu64 " expected=0x%x actual=0x%x\n",
+                 op_id, control.request_id, control.metadata_crc32,
+                 crc ^ 0xffffffffu);
+        goto out;
+    }
+    if (!linqu_ub_gm_register_dispatch(
+            ubc_dev, op_id, control.request_id, bindings,
+            control.memref_count)) {
+        error = LINGQU_PTO_UB_GM_UNBOUND;
+        goto out;
+    }
+    rc = linqu_ub_bridge_submit_ub_gm_v2(
+        ubc_dev->linqu_uapi_bridge, LINQU_UAPI_ENDPOINT_ID, op_id,
+        &control, authorized, control.memref_count, scalars,
+        control.scalar_count);
+    if (rc != 0) {
+        linqu_ub_gm_remove_dispatch(ubc_dev, op_id, "bridge_submit_failed");
+        error = rc < 0 && -rc <= LINGQU_PTO_UB_GM_EXECUTION_FAILED ?
+                -rc : LINGQU_PTO_UB_GM_EXECUTION_FAILED;
+        goto out;
+    }
+    qemu_log("SIM_QEMU_UB_GM_BIND_REGISTER op=%" PRIu64
+             " request=%" PRIu64 " bindings=%u requester_cna=0x%x\n",
+             op_id, control.request_id, control.memref_count,
+             control.requester_cna);
+    error = LINGQU_PTO_UB_GM_OK;
+
+out:
+    g_free(scalar_wire);
+    g_free(memref_wire);
+    g_free(bindings);
+    g_free(scalars);
+    g_free(authorized);
+    return error;
+}
+
+static const char *linqu_uapi_ub_gm_error_code(int error)
+{
+    switch (error) {
+    case LINGQU_PTO_UB_GM_UNSUPPORTED_CALLABLE:
+        return "pto_ub_gm_unsupported_callable";
+    case LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE:
+        return "pto_ub_gm_bad_control_table";
+    case LINGQU_PTO_UB_GM_BAD_MEMREF:
+        return "pto_ub_gm_bad_memref";
+    case LINGQU_PTO_UB_GM_UNBOUND:
+        return "pto_ub_gm_unbound";
+    case LINGQU_PTO_UB_GM_ACCESS_DENIED:
+        return "pto_ub_gm_access_denied";
+    case LINGQU_PTO_UB_GM_AUTHORIZATION_TIMEOUT:
+        return "pto_ub_gm_authorization_timeout";
+    case LINGQU_PTO_UB_GM_CALLBACK_FAILED:
+        return "pto_ub_gm_callback_failed";
+    case LINGQU_PTO_UB_GM_EXECUTION_FAILED:
+    default:
+        return "pto_ub_gm_execution_failed";
+    }
+}
+
+static bool linqu_uapi_publish_ub_gm_failure(BusControllerDev *ubc_dev,
+                                             uint64_t op_id,
+                                             int error)
+{
+    uint8_t slot[LINQU_UAPI_DESC_BYTES] = { 0 };
+    const char *code = linqu_uapi_ub_gm_error_code(error);
+    size_t code_len = strlen(code);
+    size_t time_offset;
+
+    if (!ubc_dev || ubc_dev->linqu_uapi_cq_depth == 0 ||
+        ((ubc_dev->linqu_uapi_cq_tail + 1) %
+         ubc_dev->linqu_uapi_cq_depth) == ubc_dev->linqu_uapi_cq_head ||
+        code_len > UINT8_MAX ||
+        12 + code_len + sizeof(uint64_t) > sizeof(slot)) {
+        if (ubc_dev) {
+            ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_CQ_OVERFLOW;
+        }
+        return false;
+    }
+    stq_le_p(slot, op_id);
+    slot[8] = 0;
+    slot[9] = 1;
+    slot[10] = 3;
+    slot[11] = code_len;
+    memcpy(slot + 12, code, code_len);
+    time_offset = 12 + code_len;
+    stq_le_p(slot + time_offset,
+             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (linqu_uapi_write_slot(ubc_dev->linqu_uapi_cq_iova,
+                              ubc_dev->linqu_uapi_cq_tail,
+                              slot) != MEMTX_OK) {
+        return false;
+    }
+    ubc_dev->linqu_uapi_cq_tail =
+        (ubc_dev->linqu_uapi_cq_tail + 1) % ubc_dev->linqu_uapi_cq_depth;
+    ubc_dev->linqu_uapi_last_error = error;
+    ubc_dev->linqu_uapi_irq_status |=
+        LINQU_UAPI_IRQ_COMPLETION | LINQU_UAPI_IRQ_ERROR;
+    qemu_log("QEMU_UB_GM_DISPATCH_REJECT op=%" PRIu64
+             " error=%d code=%s\n", op_id, error, code);
+    return true;
 }
 
 static void linqu_uapi_flush_cq(BusControllerDev *ubc_dev)
@@ -4587,6 +5519,9 @@ static void linqu_uapi_flush_cq(BusControllerDev *ubc_dev)
                  slot[11],
                  slot[11],
                  (const char *)(slot + 12));
+        linqu_ub_gm_remove_dispatch(
+            ubc_dev, ldq_le_p(slot),
+            slot[10] == 1 ? "completion_success" : "completion_failure");
         ubc_dev->linqu_uapi_cq_tail =
             (ubc_dev->linqu_uapi_cq_tail + 1) % ubc_dev->linqu_uapi_cq_depth;
         ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_COMPLETION;
@@ -4596,7 +5531,11 @@ static void linqu_uapi_flush_cq(BusControllerDev *ubc_dev)
 static void linqu_uapi_kick(BusControllerDev *ubc_dev, uint32_t batch)
 {
     uint8_t slot[LINQU_UAPI_DESC_BYTES];
-    uint32_t submitted = 0;
+    uint64_t ub_gm_ops[LINQU_UAPI_DEFAULT_CMDQ_DEPTH] = { 0 };
+    uint32_t ub_gm_op_count = 0;
+    uint32_t consumed = 0;
+    uint32_t bridge_queued = 0;
+    uint32_t ring_submitted = 0;
     uint32_t pending = 0;
     uint32_t head;
     int rc;
@@ -4623,7 +5562,9 @@ static void linqu_uapi_kick(BusControllerDev *ubc_dev, uint32_t batch)
              ubc_dev->linqu_uapi_cq_tail,
              ubc_dev->linqu_uapi_cq_depth);
     head = ubc_dev->linqu_uapi_cmdq_head;
-    while (head != ubc_dev->linqu_uapi_cmdq_tail && submitted < batch) {
+    while (head != ubc_dev->linqu_uapi_cmdq_tail && consumed < batch) {
+        uint64_t op_id;
+
         if (linqu_uapi_read_slot(ubc_dev->linqu_uapi_cmdq_iova, head, slot) != MEMTX_OK) {
             ubc_dev->linqu_uapi_last_error = 8;
             ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
@@ -4632,43 +5573,82 @@ static void linqu_uapi_kick(BusControllerDev *ubc_dev, uint32_t batch)
                      head);
             return;
         }
+        op_id = ldq_le_p(slot + 1);
         qemu_log("linqu-uapi kick submit slot=%u opcode=%u op_id=%" PRIu64 "\n",
                  head,
                  slot[0],
-                 ldq_le_p(slot + 8));
-        rc = linqu_ub_bridge_submit_slot(ubc_dev->linqu_uapi_bridge,
-                                         LINQU_UAPI_ENDPOINT_ID,
-                                         slot,
-                                         sizeof(slot));
-        if (rc != 0) {
-            ubc_dev->linqu_uapi_last_error = 9;
-            ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
-            qemu_log("linqu-uapi kick submit failed slot=%u rc=%d\n", head, rc);
-            return;
+                 op_id);
+        if (slot[0] == LINGQU_PTO_DISPATCH_SLOT_TAG_V2) {
+            rc = linqu_uapi_submit_ub_gm_v2(ubc_dev, slot, &op_id);
+            if (rc != LINGQU_PTO_UB_GM_OK) {
+                if (!linqu_uapi_publish_ub_gm_failure(
+                        ubc_dev, op_id, rc)) {
+                    ubc_dev->linqu_uapi_last_error = rc;
+                    ubc_dev->linqu_uapi_irq_status |=
+                        LINQU_UAPI_IRQ_ERROR;
+                    return;
+                }
+            } else {
+                if (ub_gm_op_count >= G_N_ELEMENTS(ub_gm_ops)) {
+                    linqu_ub_gm_remove_dispatch(
+                        ubc_dev, op_id, "batch_capacity");
+                    ubc_dev->linqu_uapi_last_error =
+                        LINGQU_PTO_UB_GM_EXECUTION_FAILED;
+                    return;
+                }
+                ub_gm_ops[ub_gm_op_count++] = op_id;
+                bridge_queued++;
+            }
+        } else {
+            rc = linqu_ub_bridge_submit_slot(
+                ubc_dev->linqu_uapi_bridge, LINQU_UAPI_ENDPOINT_ID,
+                slot, sizeof(slot));
+            if (rc != 0) {
+                ubc_dev->linqu_uapi_last_error = 9;
+                ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
+                qemu_log("linqu-uapi kick submit failed slot=%u rc=%d\n",
+                         head, rc);
+                return;
+            }
+            bridge_queued++;
         }
         head = (head + 1) % ubc_dev->linqu_uapi_cmdq_depth;
-        submitted++;
+        consumed++;
     }
 
-    qemu_log("linqu-uapi kick ring submitted_pre=%u pending_head=%u tail=%u\n",
-             submitted,
+    qemu_log("linqu-uapi kick ring queued=%u consumed=%u"
+             " pending_head=%u tail=%u\n",
+             bridge_queued,
+             consumed,
              head,
              ubc_dev->linqu_uapi_cmdq_tail);
+    ubc_dev->linqu_uapi_cmdq_head = head;
+    if (bridge_queued == 0) {
+        return;
+    }
     rc = linqu_ub_bridge_ring_doorbell(ubc_dev->linqu_uapi_bridge,
                                        LINQU_UAPI_ENDPOINT_ID,
-                                       submitted,
-                                       &submitted,
+                                       bridge_queued,
+                                       &ring_submitted,
                                        &pending);
     if (rc != 0) {
+        uint32_t index;
+
+        for (index = 0; index < ub_gm_op_count; index++) {
+            linqu_ub_gm_remove_dispatch(
+                ubc_dev, ub_gm_ops[index], "doorbell_failed");
+            linqu_uapi_publish_ub_gm_failure(
+                ubc_dev, ub_gm_ops[index],
+                LINGQU_PTO_UB_GM_EXECUTION_FAILED);
+        }
         ubc_dev->linqu_uapi_last_error = 10;
         ubc_dev->linqu_uapi_irq_status |= LINQU_UAPI_IRQ_ERROR;
         qemu_log("linqu-uapi kick ring failed rc=%d\n", rc);
         return;
     }
     qemu_log("linqu-uapi kick ring done submitted=%u pending=%u\n",
-             submitted,
+             ring_submitted,
              pending);
-    ubc_dev->linqu_uapi_cmdq_head = head;
     linqu_uapi_flush_cq(ubc_dev);
     qemu_log("linqu-uapi kick done cmdq_head=%u cq_tail=%u irq=%#" PRIx64 " last_error=%" PRIu64 "\n",
              ubc_dev->linqu_uapi_cmdq_head,
@@ -6438,28 +7418,37 @@ bool ubc_obmm_resolve_async_map(BusControllerDev *ubc_dev,
 {
     SimDecMapEntry *entry;
     uint64_t offset;
+    bool found = false;
 
-    if (!ubc_dev || !resolved || length == 0 ||
+    if (!ubc_dev || !resolved || !g_sim_decoder || length == 0 ||
         local_pa > UINT64_MAX - length) {
         return false;
     }
+    qemu_mutex_lock(&g_sim_decoder->lock);
     entry = sim_dec_find_entry_by_pa(local_pa);
     if (!entry || !entry->active || local_pa < entry->local_pa) {
-        return false;
+        goto out;
     }
     offset = local_pa - entry->local_pa;
-    if (offset > entry->size || length > entry->size - offset) {
-        return false;
+    if (offset > entry->size || length > entry->size - offset ||
+        entry->remote_uba > UINT64_MAX - offset ||
+        entry->remote_uba + offset > UINT64_MAX - length) {
+        goto out;
     }
     *resolved = (UbcObmmResolvedMap) {
         .map_id = entry->map_id,
         .map_generation = entry->gva_id ? entry->gva_id : entry->map_id,
+        .local_pa = local_pa,
         .remote_uba = entry->remote_uba + offset,
         .length = length,
         .token_id = entry->token_id,
         .peer_cna = entry->dcna,
+        .access_flags = entry->access_flags,
     };
-    return true;
+    found = true;
+out:
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+    return found;
 }
 
 bool ubc_sim_dec_remote_read_async_submit(
@@ -9092,6 +10081,12 @@ static void ub_bus_controller_dev_finalize(Object *object)
 {
     BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(object);
 
+    linqu_ub_gm_registry_free(ubc_dev->linqu_uapi_ub_gm_registry);
+    ubc_dev->linqu_uapi_ub_gm_registry = NULL;
+    if (ubc_dev->linqu_uapi_bridge) {
+        linqu_ub_bridge_free(ubc_dev->linqu_uapi_bridge);
+        ubc_dev->linqu_uapi_bridge = NULL;
+    }
     if (ubc_dev->remote_memory_model_timer) {
         timer_free(ubc_dev->remote_memory_model_timer);
         ubc_dev->remote_memory_model_timer = NULL;
