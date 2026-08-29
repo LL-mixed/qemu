@@ -16,6 +16,7 @@
 
 typedef struct BusControllerDev BusControllerDev;
 typedef struct UbObmmAsyncState UbObmmAsyncState;
+typedef struct UbcObmmResolvedMap UbcObmmResolvedMap;
 
 typedef struct QEMU_PACKED UbObmmAsyncSqEntryV1 {
     uint16_t abi_version;
@@ -54,5 +55,10 @@ uint64_t ub_obmm_async_read(UbObmmAsyncState *state, hwaddr reg,
                             unsigned int size);
 bool ub_obmm_async_write(UbObmmAsyncState *state, hwaddr reg,
                          uint64_t value, unsigned int size);
+bool ub_obmm_async_resolve_mapping_ref(UbObmmAsyncState *state,
+                                       uint64_t mapping_ref,
+                                       uint64_t local_pa,
+                                       uint64_t length,
+                                       UbcObmmResolvedMap *resolved);
 
 #endif

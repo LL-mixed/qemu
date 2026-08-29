@@ -4,6 +4,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/ub/ub_obmm_async.h"
+#include "hw/ub/linqu_shmem_pto_abi.h"
 #include "qemu/log.h"
 #include "hw/ub/ub_obmm_remote.h"
 #include "hw/ub/ub_ubc.h"
@@ -280,6 +281,57 @@ static bool ub_obmm_async_map_valid(void *opaque, uint64_t map_id,
     }
     map = &state->maps[map_id - 1];
     return map->active && map->generation == map_generation;
+}
+
+bool ub_obmm_async_resolve_mapping_ref(UbObmmAsyncState *state,
+                                       uint64_t mapping_ref,
+                                       uint64_t local_pa,
+                                       uint64_t length,
+                                       UbcObmmResolvedMap *resolved)
+{
+    UbcObmmResolvedMap current;
+    UbObmmAsyncMap *map;
+    uint64_t map_generation;
+    uint64_t map_id;
+    uint64_t offset;
+
+    if (!state || !resolved || mapping_ref == 0 || length == 0 ||
+        local_pa > UINT64_MAX - length) {
+        return false;
+    }
+    map_id = lingqu_pto_obmm_mapping_ref_map_id(mapping_ref);
+    map_generation =
+        lingqu_pto_obmm_mapping_ref_generation(mapping_ref);
+    if (lingqu_pto_obmm_mapping_ref_encode(map_id, map_generation) !=
+            mapping_ref ||
+        map_id > UB_OBMM_ASYNC_QUEUE_DEPTH ||
+        !ub_obmm_async_map_valid(state, map_id, map_generation)) {
+        return false;
+    }
+
+    map = &state->maps[map_id - 1];
+    if (local_pa < map->resolved.local_pa) {
+        return false;
+    }
+    offset = local_pa - map->resolved.local_pa;
+    if (offset > map->length || length > map->length - offset ||
+        map->resolved.remote_uba > UINT64_MAX - offset ||
+        map->resolved.remote_uba + offset > UINT64_MAX - length ||
+        !ubc_obmm_resolve_async_map(state->ubc_dev, local_pa, length,
+                                    &current)) {
+        return false;
+    }
+    if (current.map_id != map->resolved.map_id ||
+        current.map_generation != map->resolved.map_generation ||
+        current.local_pa != local_pa ||
+        current.remote_uba != map->resolved.remote_uba + offset ||
+        current.token_id != map->resolved.token_id ||
+        current.peer_cna != map->resolved.peer_cna ||
+        current.access_flags != map->resolved.access_flags) {
+        return false;
+    }
+    *resolved = current;
+    return true;
 }
 
 static void ub_obmm_async_child_complete(

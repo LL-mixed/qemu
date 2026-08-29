@@ -4614,12 +4614,13 @@ static bool linqu_ub_gm_mapping_still_authorized(
     offset = ub_gm_addr - binding->local_base;
     if (offset > binding->length || length > binding->length - offset ||
         binding->remote_base > UINT64_MAX - offset ||
-        !ubc_obmm_resolve_async_map(ubc_dev, ub_gm_addr, length, resolved)) {
+        !ub_obmm_async_resolve_mapping_ref(
+            ubc_dev->obmm_async, binding->mapping_ref, ub_gm_addr, length,
+            resolved)) {
         return false;
     }
     return resolved->map_id == binding->map_id &&
            resolved->map_generation == binding->map_generation &&
-           resolved->map_generation == binding->mapping_ref &&
            resolved->remote_uba == binding->remote_base + offset &&
            resolved->token_id == binding->token_id &&
            resolved->peer_cna == binding->peer_cna;
@@ -5293,9 +5294,9 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
         }
         if (!linqu_uapi_validate_contiguous_memref(
                 memref, item->shape, item->strides) ||
-            !ubc_obmm_resolve_async_map(ubc_dev, view_start,
-                                        memref->byte_length, &resolved) ||
-            resolved.map_generation != memref->opaque_mapping_ref) {
+            !ub_obmm_async_resolve_mapping_ref(
+                ubc_dev->obmm_async, memref->opaque_mapping_ref,
+                view_start, memref->byte_length, &resolved)) {
             error = LINGQU_PTO_UB_GM_BAD_MEMREF;
             goto out;
         }
