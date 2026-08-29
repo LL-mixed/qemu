@@ -4675,6 +4675,9 @@ static int linqu_ub_gm_read(void *opaque, uint64_t request_id,
     LinquUbGmBindingState binding;
     UbcObmmResolvedMap resolved;
 
+    /* Simpler invokes this callback from its PTO worker thread. */
+    QEMU_IOTHREAD_LOCK_GUARD();
+
     if (!dst || !linqu_ub_gm_binding_snapshot(
                     ubc_dev, request_id, binding_id, ub_gm_addr, length,
                     LINGQU_PTO_UB_GM_READ, &binding) ||
@@ -4708,6 +4711,9 @@ static int linqu_ub_gm_write(void *opaque, uint64_t request_id,
     BusControllerDev *ubc_dev = opaque;
     LinquUbGmBindingState binding;
     UbcObmmResolvedMap resolved;
+
+    /* Simpler invokes this callback from its PTO worker thread. */
+    QEMU_IOTHREAD_LOCK_GUARD();
 
     if (!src || !linqu_ub_gm_binding_snapshot(
                     ubc_dev, request_id, binding_id, ub_gm_addr, length,
@@ -4743,6 +4749,9 @@ static int linqu_ub_gm_fence(void *opaque, uint64_t request_id,
     BusControllerDev *ubc_dev = opaque;
     LinquUbGmBindingState binding;
     UbcObmmResolvedMap resolved;
+
+    /* Simpler invokes this callback from its PTO worker thread. */
+    QEMU_IOTHREAD_LOCK_GUARD();
 
     if (flags != 0 || !linqu_ub_gm_binding_snapshot(
                           ubc_dev, request_id, binding_id, ub_gm_addr,
@@ -5474,6 +5483,26 @@ static bool linqu_uapi_publish_ub_gm_failure(BusControllerDev *ubc_dev,
     return true;
 }
 
+static int linqu_uapi_poll_completion(BusControllerDev *ubc_dev,
+                                      uint8_t *slot)
+{
+    int rc;
+
+    /*
+     * The bridge waits synchronously for a Simpler PTO worker.  That worker
+     * calls back into this QEMU device to perform UB_GM accesses, so it must
+     * be able to acquire the BQL while the main loop waits for completion.
+     */
+    g_assert(qemu_mutex_iothread_locked());
+    qemu_mutex_unlock_iothread();
+    rc = linqu_ub_bridge_poll_completion(ubc_dev->linqu_uapi_bridge,
+                                         LINQU_UAPI_ENDPOINT_ID,
+                                         slot,
+                                         LINQU_UAPI_DESC_BYTES);
+    qemu_mutex_lock_iothread();
+    return rc;
+}
+
 static void linqu_uapi_flush_cq(BusControllerDev *ubc_dev)
 {
     uint8_t slot[LINQU_UAPI_DESC_BYTES];
@@ -5485,10 +5514,7 @@ static void linqu_uapi_flush_cq(BusControllerDev *ubc_dev)
              ubc_dev->linqu_uapi_cq_depth);
     while (((ubc_dev->linqu_uapi_cq_tail + 1) % ubc_dev->linqu_uapi_cq_depth) !=
            ubc_dev->linqu_uapi_cq_head) {
-        rc = linqu_ub_bridge_poll_completion(ubc_dev->linqu_uapi_bridge,
-                                             LINQU_UAPI_ENDPOINT_ID,
-                                             slot,
-                                             sizeof(slot));
+        rc = linqu_uapi_poll_completion(ubc_dev, slot);
         if (rc == 1) {
             qemu_log("linqu-uapi flush_cq empty head=%u tail=%u\n",
                      ubc_dev->linqu_uapi_cq_head,
