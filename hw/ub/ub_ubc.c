@@ -226,6 +226,8 @@ typedef struct LinquPtoAuthorizationState {
 #define SIM_DEC_OP_GSVA_UNMAP_V1    0x0a
 #define SIM_DEC_OP_GSVA_EVENT_V1    0x0b
 #define SIM_DEC_OP_GSVA_QUERY_V1    0x0c
+#define SIM_DEC_OP_OBMM_EXPORT_RETIRE 0x0d
+#define SIM_DEC_OP_OBMM_MAP_V2      0x0e
 
 /* SIM_DEC status codes */
 #define SIM_DEC_STATUS_SUCCESS          0x00
@@ -258,6 +260,12 @@ typedef struct QEMU_PACKED SimDecMapReq {
     uint32_t upi;
     uint32_t src_eid;
 } SimDecMapReq;
+
+typedef struct QEMU_PACKED SimDecObmmMapV2Req {
+    SimDecMapReq map_req;
+    uint64_t remote_export_mem_id;
+    uint64_t remote_export_generation;
+} SimDecObmmMapV2Req;
 
 /* SIM_DEC GVA map request (Phase A metadata plane) */
 typedef struct QEMU_PACKED SimDecGvaMapReq {
@@ -437,6 +445,14 @@ typedef struct QEMU_PACKED SimDecObmmBootstrapLookupResp {
     SimDecObmmBootstrapRecord records[SIM_DEC_OBMM_BOOTSTRAP_MAX_NODES];
 } SimDecObmmBootstrapLookupResp;
 
+typedef struct QEMU_PACKED SimDecObmmExportRetireReq {
+    uint64_t export_mem_id;
+    uint64_t remote_uba;
+    uint64_t size;
+    uint32_t export_cna;
+    uint32_t token_id;
+} SimDecObmmExportRetireReq;
+
 #define LINGQU_OBMM_OBJECT_REF_MAGIC 0x514f424d4d524546ULL
 #define LINGQU_OBJECT_STATE_COMMITTED_WIRE 2
 #define MODEL_OBMM_KIND_HIDDEN_RANGE_RUNTIME_OUTPUT 5
@@ -523,6 +539,8 @@ typedef struct SimDecMapEntry {
     uint64_t local_pa;
     uint64_t size;
     uint64_t remote_uba;
+    uint64_t remote_export_mem_id;
+    uint64_t remote_export_generation;
     uint32_t token_id;
     uint32_t token_value;
     uint32_t scna;
@@ -547,6 +565,7 @@ typedef struct SimDecMapEntry {
     uint64_t pte_offset;
     uint64_t gva_id;
     uint64_t remote_read_ordinal;
+    bool remote_export_retired_observed;
     SimDecRouteState state;
     int last_error;
     bool     gva_ownership_registered;
@@ -5429,6 +5448,7 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
     uint32_t total_args;
     uint32_t index;
     bool new_authorization = false;
+    int callable_query_status;
     int error = LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
     int rc;
 
@@ -5488,11 +5508,21 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
                 LINGQU_PTO_UB_GM_BAD_CONTROL_TABLE;
         goto out;
     }
-    if (linqu_ub_bridge_query_ub_gm_callable_v1(
-            ubc_dev->linqu_uapi_bridge, control.callable_id,
-            &expected_fingerprint) != 0 ||
+    callable_query_status = linqu_ub_bridge_query_ub_gm_callable_v1(
+        ubc_dev->linqu_uapi_bridge, control.callable_id,
+        &expected_fingerprint);
+    if (callable_query_status != 0 ||
         expected_fingerprint == 0 ||
         expected_fingerprint != control.artifact_fingerprint) {
+        fprintf(stderr,
+                "QEMU_UB_GM_CALLABLE_REJECT op=%" PRIu64
+                " callable=%" PRIu64 " query_status=%d"
+                " expected_fingerprint=0x%016" PRIx64
+                " requested_fingerprint=0x%016" PRIx64
+                " manifest=%s\n",
+                op_id, control.callable_id, callable_query_status,
+                expected_fingerprint, control.artifact_fingerprint,
+                g_getenv("SIMPLER_HOST_VECTOR_MANIFEST") ?: "<default>");
         error = LINGQU_PTO_UB_GM_UNSUPPORTED_CALLABLE;
         goto out;
     }
@@ -7227,15 +7257,23 @@ static SimDecMapEntry *sim_dec_find_entry_by_pa(uint64_t pa);
 static SimDecMapEntry *sim_dec_find_entry_by_uba(uint64_t uba, uint64_t len);
 
 typedef struct ObmmExportEntry {
+    uint64_t export_mem_id;
+    uint64_t generation;
     uint64_t remote_uba;
     uint64_t backing_uba;
     uint64_t size;
     uint32_t export_cna;
+    uint32_t token_id;
     QTAILQ_ENTRY(ObmmExportEntry) next;
 } ObmmExportEntry;
 
 static QTAILQ_HEAD(, ObmmExportEntry) g_obmm_exports = QTAILQ_HEAD_INITIALIZER(g_obmm_exports);
 static ObmmExportEntry *obmm_export_lookup(uint64_t uba, uint64_t len);
+static bool sim_dec_obmm_export_is_retired(uint32_t export_cna,
+                                           uint64_t remote_uba,
+                                           uint32_t token_id,
+                                           uint64_t export_generation,
+                                           uint64_t export_mem_id);
 
 static bool ubc_cpu_window_detach(MemoryRegion *cpu_window)
 {
@@ -8047,6 +8085,22 @@ bool ubc_obmm_resolve_async_map(BusControllerDev *ubc_dev,
     if (offset > entry->size || length > entry->size - offset ||
         entry->remote_uba > UINT64_MAX - offset ||
         entry->remote_uba + offset > UINT64_MAX - length) {
+        goto out;
+    }
+    if (sim_dec_obmm_export_is_retired(entry->dcna, entry->remote_uba,
+                                       entry->token_id,
+                                       entry->remote_export_generation,
+                                       entry->remote_export_mem_id)) {
+        if (!entry->remote_export_retired_observed) {
+            qemu_log("SIM_DEC: OBMM remote export retired map_id=%" PRIu64
+                     " owner_cna=0x%x uba=%" PRIx64
+                     " token=%u generation=%" PRIu64
+                     " export_mem_id=%" PRIu64 "\n",
+                     entry->map_id, entry->dcna, entry->remote_uba,
+                     entry->token_id, entry->remote_export_generation,
+                     entry->remote_export_mem_id);
+            entry->remote_export_retired_observed = true;
+        }
         goto out;
     }
     *resolved = (UbcObmmResolvedMap) {
@@ -10959,16 +11013,22 @@ static void obmm_export_register(const SimDecObmmBootstrapRecord *record)
     QTAILQ_FOREACH(entry, &g_obmm_exports, next) {
         if (entry->remote_uba == record->remote_uba &&
             entry->export_cna == record->export_cna) {
+            entry->export_mem_id = record->export_mem_id;
+            entry->generation = record->generation;
             entry->backing_uba = record->backing_uba;
             entry->size = record->size;
+            entry->token_id = record->token_id;
             return;
         }
     }
     entry = g_new0(ObmmExportEntry, 1);
+    entry->export_mem_id = record->export_mem_id;
+    entry->generation = record->generation;
     entry->remote_uba = record->remote_uba;
     entry->backing_uba = record->backing_uba;
     entry->size = record->size;
     entry->export_cna = record->export_cna;
+    entry->token_id = record->token_id;
     QTAILQ_INSERT_TAIL(&g_obmm_exports, entry, next);
 }
 
@@ -11992,7 +12052,9 @@ static void sim_dec_log_gva_route_dump(const SimDecMapEntry *entry,
 }
 
 static int sim_dec_populate_map_entry(SimDecMapEntry *entry,
-                                     const SimDecMapReq *req)
+                                     const SimDecMapReq *req,
+                                     uint64_t remote_export_mem_id,
+                                     uint64_t remote_export_generation)
 {
     if (!entry || !req) {
         return -1;
@@ -12001,6 +12063,8 @@ static int sim_dec_populate_map_entry(SimDecMapEntry *entry,
     entry->local_pa = req->local_pa;
     entry->size = req->size;
     entry->remote_uba = req->remote_uba;
+    entry->remote_export_mem_id = remote_export_mem_id;
+    entry->remote_export_generation = remote_export_generation;
     entry->token_id = req->token_id;
     entry->token_value = req->token_value;
     entry->scna = req->scna;
@@ -12145,7 +12209,7 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
     }
 
     entry = g_malloc0(sizeof(*entry));
-    if (sim_dec_populate_map_entry(entry, &req->map_req) != 0) {
+    if (sim_dec_populate_map_entry(entry, &req->map_req, 0, 0) != 0) {
         SimDecMapEntry unregister_entry = {
             .map_id = map_id,
             .gva_id = req->gva_id,
@@ -12233,7 +12297,10 @@ static int sim_dec_handle_gva_map(const SimDecGvaMapReq *req,
     return 0;
 }
 
-static int sim_dec_handle_map(const SimDecMapReq *req, SimDecMapResp *resp)
+static int sim_dec_handle_map(const SimDecMapReq *req,
+                              uint64_t remote_export_mem_id,
+                              uint64_t remote_export_generation,
+                              SimDecMapResp *resp)
 {
     SimDecMapEntry *entry;
     uint64_t map_id;
@@ -12280,7 +12347,9 @@ static int sim_dec_handle_map(const SimDecMapReq *req, SimDecMapResp *resp)
     if (map_id == 0)
         map_id = g_sim_decoder->next_map_id++;
 
-    if (sim_dec_populate_map_entry(entry, req) != 0) {
+    if (sim_dec_populate_map_entry(entry, req,
+                                   remote_export_mem_id,
+                                   remote_export_generation) != 0) {
         qemu_mutex_unlock(&g_sim_decoder->lock);
         g_free(entry);
         resp->status = SIM_DEC_STATUS_BACKEND_ERROR;
@@ -12306,8 +12375,11 @@ static int sim_dec_handle_map(const SimDecMapReq *req, SimDecMapResp *resp)
     resp->status = SIM_DEC_STATUS_SUCCESS;
 
     qemu_log("SIM_DEC: MAP success id=%" PRIx64 " pa=%" PRIx64 " sz=%" PRIx64
-             " remote_uba=%" PRIx64 " token=%u\n",
-             map_id, req->local_pa, req->size, req->remote_uba, req->token_id);
+             " remote_uba=%" PRIx64 " token=%u generation=%" PRIu64
+             " export_mem_id=%" PRIu64 "\n",
+             map_id, req->local_pa, req->size, req->remote_uba,
+             req->token_id, remote_export_generation,
+             remote_export_mem_id);
     return 0;
 }
 
@@ -12540,6 +12612,113 @@ static char *sim_dec_obmm_bootstrap_path(uint32_t node_id,
     name = g_strdup_printf("node%u-generation%" PRIu64 ".ini",
                            node_id, generation);
     return g_build_filename(dir, name, NULL);
+}
+
+static char *sim_dec_obmm_retired_dir(void)
+{
+    const char *shared_dir = g_getenv("UB_FM_SHARED_DIR");
+
+    return shared_dir && shared_dir[0] ?
+        g_build_filename(shared_dir, "obmm_retired", NULL) : NULL;
+}
+
+static char *sim_dec_obmm_retired_path(uint32_t export_cna,
+                                       uint64_t remote_uba,
+                                       uint32_t token_id,
+                                       uint64_t export_generation,
+                                       uint64_t export_mem_id)
+{
+    g_autofree char *dir = sim_dec_obmm_retired_dir();
+    g_autofree char *name = NULL;
+
+    if (!dir) {
+        return NULL;
+    }
+    name = g_strdup_printf("cna%08x-uba%016" PRIx64
+                           "-token%08x-generation%016" PRIx64
+                           "-export%016" PRIx64 ".retired",
+                           export_cna, remote_uba, token_id,
+                           export_generation, export_mem_id);
+    return g_build_filename(dir, name, NULL);
+}
+
+static bool sim_dec_obmm_export_is_retired(uint32_t export_cna,
+                                           uint64_t remote_uba,
+                                           uint32_t token_id,
+                                           uint64_t export_generation,
+                                           uint64_t export_mem_id)
+{
+    if (export_generation == 0 || export_mem_id == 0) {
+        return false;
+    }
+    g_autofree char *path = sim_dec_obmm_retired_path(
+        export_cna, remote_uba, token_id, export_generation,
+        export_mem_id);
+
+    return path && g_file_test(path, G_FILE_TEST_EXISTS);
+}
+
+static int sim_dec_handle_obmm_export_retire(
+    const SimDecObmmExportRetireReq *req)
+{
+    ObmmExportEntry *entry;
+    g_autofree char *dir = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *tmp_path = NULL;
+    g_autofree char *data = NULL;
+    GError *err = NULL;
+    uint64_t export_generation;
+    bool found = false;
+
+    if (!req || req->export_mem_id == 0 || req->remote_uba == 0 ||
+        req->size == 0 || req->export_cna == 0 || req->token_id == 0) {
+        return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+    QTAILQ_FOREACH(entry, &g_obmm_exports, next) {
+        if (entry->export_mem_id == req->export_mem_id &&
+            entry->remote_uba == req->remote_uba &&
+            entry->size == req->size &&
+            entry->export_cna == req->export_cna &&
+            entry->token_id == req->token_id) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+    export_generation = entry->generation;
+    dir = sim_dec_obmm_retired_dir();
+    path = sim_dec_obmm_retired_path(req->export_cna, req->remote_uba,
+                                     req->token_id, export_generation,
+                                     req->export_mem_id);
+    if (!dir || !path || g_mkdir_with_parents(dir, 0755) != 0) {
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+    data = g_strdup_printf(
+        "export_mem_id=%" PRIu64 "\ngeneration=%" PRIu64
+        "\nremote_uba=%" PRIu64
+        "\nsize=%" PRIu64 "\nexport_cna=%u\ntoken_id=%u\n",
+        req->export_mem_id, export_generation, req->remote_uba, req->size,
+        req->export_cna, req->token_id);
+    tmp_path = g_strdup_printf("%s.tmp.%d", path, getpid());
+    if (!g_file_set_contents(tmp_path, data, -1, &err)) {
+        qemu_log("SIM_DEC: OBMM export retire write failed: %s\n",
+                 err ? err->message : "unknown");
+        g_clear_error(&err);
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+    if (g_rename(tmp_path, path) != 0) {
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+    QTAILQ_REMOVE(&g_obmm_exports, entry, next);
+    g_free(entry);
+    qemu_log("SIM_DEC: OBMM export retired mem_id=%" PRIu64
+             " owner_cna=0x%x uba=%" PRIx64 " token=%u size=%" PRIu64
+             " generation=%" PRIu64 "\n", req->export_mem_id,
+             req->export_cna, req->remote_uba, req->token_id, req->size,
+             export_generation);
+    return SIM_DEC_STATUS_SUCCESS;
 }
 
 static int sim_dec_handle_obmm_bootstrap_publish(
@@ -13580,7 +13759,34 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         }
         {
             SimDecMapResp map_resp = {0};
-            (void)sim_dec_handle_map((const SimDecMapReq *)(data + sizeof(*hdr)),
+            (void)sim_dec_handle_map(
+                (const SimDecMapReq *)(data + sizeof(*hdr)), 0, 0,
+                &map_resp);
+            resp_hdr->payload_len = sizeof(map_resp);
+            memcpy(resp + sizeof(*resp_hdr), &map_resp, sizeof(map_resp));
+            resp_hdr->status = map_resp.status;
+        }
+        break;
+
+    case SIM_DEC_OP_OBMM_MAP_V2:
+        min_len = sizeof(*hdr) + sizeof(SimDecObmmMapV2Req);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        {
+            const SimDecObmmMapV2Req *map_req =
+                (const SimDecObmmMapV2Req *)(data + sizeof(*hdr));
+            SimDecMapResp map_resp = {0};
+
+            if (map_req->remote_export_mem_id == 0 ||
+                map_req->remote_export_generation == 0) {
+                resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+                break;
+            }
+            (void)sim_dec_handle_map(&map_req->map_req,
+                                     map_req->remote_export_mem_id,
+                                     map_req->remote_export_generation,
                                      &map_resp);
             resp_hdr->payload_len = sizeof(map_resp);
             memcpy(resp + sizeof(*resp_hdr), &map_resp, sizeof(map_resp));
@@ -13683,6 +13889,17 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             resp_hdr->payload_len = sizeof(lookup_resp);
             memcpy(resp + sizeof(*resp_hdr), &lookup_resp, sizeof(lookup_resp));
         }
+        break;
+
+    case SIM_DEC_OP_OBMM_EXPORT_RETIRE:
+        min_len = sizeof(*hdr) + sizeof(SimDecObmmExportRetireReq);
+        if (len < min_len) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        resp_hdr->status = sim_dec_handle_obmm_export_retire(
+            (const SimDecObmmExportRetireReq *)(data + sizeof(*hdr)));
+        resp_hdr->payload_len = 0;
         break;
 
     case SIM_DEC_OP_GSVA_QUERY_V1:
