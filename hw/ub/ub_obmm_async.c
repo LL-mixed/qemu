@@ -334,6 +334,69 @@ bool ub_obmm_async_resolve_mapping_ref(UbObmmAsyncState *state,
     return true;
 }
 
+bool ub_obmm_async_crosses_mapping_boundary(
+    UbObmmAsyncState *state, uint64_t mapping_ref, uint64_t local_pa,
+    uint64_t length, UbObmmAsyncBoundaryCrossing *crossing)
+{
+    UbObmmAsyncMap *source;
+    uint64_t source_generation;
+    uint64_t source_map_id;
+    uint64_t request_end;
+    uint64_t boundary;
+    uint32_t index;
+
+    if (!state || !crossing || mapping_ref == 0 || length == 0 ||
+        local_pa > UINT64_MAX - length) {
+        return false;
+    }
+    source_map_id = lingqu_pto_obmm_mapping_ref_map_id(mapping_ref);
+    source_generation =
+        lingqu_pto_obmm_mapping_ref_generation(mapping_ref);
+    if (lingqu_pto_obmm_mapping_ref_encode(source_map_id,
+                                           source_generation) !=
+            mapping_ref ||
+        source_map_id == 0 || source_map_id > UB_OBMM_ASYNC_QUEUE_DEPTH ||
+        !ub_obmm_async_map_valid(state, source_map_id,
+                                 source_generation)) {
+        return false;
+    }
+    source = &state->maps[source_map_id - 1];
+    if (source->resolved.local_pa > UINT64_MAX - source->length) {
+        return false;
+    }
+    boundary = source->resolved.local_pa + source->length;
+    request_end = local_pa + length;
+    if (local_pa < source->resolved.local_pa || local_pa >= boundary ||
+        request_end <= boundary) {
+        return false;
+    }
+    for (index = 0; index < UB_OBMM_ASYNC_QUEUE_DEPTH; index++) {
+        UbObmmAsyncMap *adjacent = &state->maps[index];
+        uint64_t adjacent_end;
+
+        if (!adjacent->active || index + 1 == source_map_id ||
+            adjacent->resolved.local_pa != boundary ||
+            adjacent->resolved.local_pa > UINT64_MAX - adjacent->length) {
+            continue;
+        }
+        adjacent_end = adjacent->resolved.local_pa + adjacent->length;
+        if (request_end > adjacent_end) {
+            continue;
+        }
+        *crossing = (UbObmmAsyncBoundaryCrossing) {
+            .source_map_id = source_map_id,
+            .source_map_generation = source_generation,
+            .source_base = source->resolved.local_pa,
+            .source_length = source->length,
+            .boundary = boundary,
+            .adjacent_map_id = index + 1,
+            .adjacent_map_generation = adjacent->generation,
+        };
+        return true;
+    }
+    return false;
+}
+
 static void ub_obmm_async_child_complete(
     void *opaque, ObmmRemoteToken token, uint16_t child_index,
     ObmmRemoteStatus status, const void *payload, uint32_t bytes_done,

@@ -18,6 +18,16 @@ typedef struct BusControllerDev BusControllerDev;
 typedef struct UbObmmAsyncState UbObmmAsyncState;
 typedef struct UbcObmmResolvedMap UbcObmmResolvedMap;
 
+typedef struct UbObmmAsyncBoundaryCrossing {
+    uint64_t source_map_id;
+    uint64_t source_map_generation;
+    uint64_t source_base;
+    uint64_t source_length;
+    uint64_t boundary;
+    uint64_t adjacent_map_id;
+    uint64_t adjacent_map_generation;
+} UbObmmAsyncBoundaryCrossing;
+
 typedef struct QEMU_PACKED UbObmmAsyncSqEntryV1 {
     uint16_t abi_version;
     uint8_t opcode;
@@ -60,5 +70,8 @@ bool ub_obmm_async_resolve_mapping_ref(UbObmmAsyncState *state,
                                        uint64_t local_pa,
                                        uint64_t length,
                                        UbcObmmResolvedMap *resolved);
+bool ub_obmm_async_crosses_mapping_boundary(
+    UbObmmAsyncState *state, uint64_t mapping_ref, uint64_t local_pa,
+    uint64_t length, UbObmmAsyncBoundaryCrossing *crossing);
 
 #endif

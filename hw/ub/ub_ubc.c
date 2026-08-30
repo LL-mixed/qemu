@@ -5362,14 +5362,18 @@ static uint64_t linqu_uapi_dtype_bytes(uint16_t dtype)
 static bool linqu_uapi_validate_contiguous_memref(
     const LingquShmemMemrefV1 *memref,
     const uint32_t shape[LINGQU_PTO_MAX_RANK],
-    const uint32_t strides[LINGQU_PTO_MAX_RANK])
+    const uint32_t strides[LINGQU_PTO_MAX_RANK],
+    uint64_t *extent_bytes)
 {
     uint64_t elements = 1;
     uint64_t expected_stride = 1;
     uint64_t element_bytes;
     uint32_t index;
 
-    if (!memref || memref->rank == 0 ||
+    if (extent_bytes) {
+        *extent_bytes = 0;
+    }
+    if (!memref || !extent_bytes || memref->rank == 0 ||
         memref->rank > LINGQU_PTO_MAX_RANK) {
         return false;
     }
@@ -5387,11 +5391,11 @@ static bool linqu_uapi_validate_contiguous_memref(
         elements *= dim;
         expected_stride = elements;
     }
-    if (elements > UINT64_MAX / element_bytes ||
-        elements * element_bytes != memref->byte_length) {
+    if (elements > UINT64_MAX / element_bytes) {
         return false;
     }
-    return true;
+    *extent_bytes = elements * element_bytes;
+    return *extent_bytes == memref->byte_length;
 }
 
 static bool linqu_uapi_role_access_valid(const LingquShmemMemrefV1 *memref)
@@ -5595,6 +5599,7 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
         uint8_t shape_wire[LINGQU_PTO_MAX_RANK * sizeof(uint32_t)] = { 0 };
         uint8_t stride_wire[LINGQU_PTO_MAX_RANK * sizeof(uint32_t)] = { 0 };
         uint64_t shape_bytes;
+        uint64_t extent_bytes = 0;
         uint64_t view_start;
         uint32_t dim;
 
@@ -5664,7 +5669,12 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
                 ldl_le_p(stride_wire + dim * sizeof(uint32_t));
         }
         if (!linqu_uapi_validate_contiguous_memref(
-                memref, item->shape, item->strides)) {
+                memref, item->shape, item->strides, &extent_bytes)) {
+            qemu_log("QEMU_UB_GM_SHAPE_STRIDE_REJECT op=%" PRIu64
+                     " request=%" PRIu64 " arg=%u rank=%u"
+                     " extent_bytes=%" PRIu64 " view_bytes=%" PRIu64
+                     "\n", op_id, control.request_id, memref->arg_index,
+                     memref->rank, extent_bytes, memref->byte_length);
             error = LINGQU_PTO_UB_GM_BAD_MEMREF;
             goto out;
         }
@@ -5708,8 +5718,33 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
         LinquUbGmBindingState *binding = &bindings[index];
         UbcObmmResolvedMap current;
         UbcObmmResolvedMap resolved;
+        UbObmmAsyncBoundaryCrossing crossing;
         uint64_t view_start = memref->ub_gm_addr + memref->byte_offset;
         uint64_t next_aperture;
+
+        if (ub_obmm_async_crosses_mapping_boundary(
+                ubc_dev->obmm_async, memref->opaque_mapping_ref,
+                view_start, memref->byte_length, &crossing)) {
+            qemu_log("QEMU_UB_GM_MAPPING_BOUNDARY_REJECT op=%" PRIu64
+                     " request=%" PRIu64 " arg=%u source_map=%" PRIu64
+                     " source_generation=%" PRIu64
+                     " source_base=0x%" PRIx64
+                     " source_length=%" PRIu64
+                     " boundary=0x%" PRIx64
+                     " adjacent_map=%" PRIu64
+                     " adjacent_generation=%" PRIu64
+                     " request_start=0x%" PRIx64
+                     " request_length=%" PRIu64 "\n",
+                     op_id, control.request_id, memref->arg_index,
+                     crossing.source_map_id,
+                     crossing.source_map_generation,
+                     crossing.source_base, crossing.source_length,
+                     crossing.boundary, crossing.adjacent_map_id,
+                     crossing.adjacent_map_generation, view_start,
+                     memref->byte_length);
+            error = LINGQU_PTO_UB_GM_BAD_MEMREF;
+            goto out;
+        }
 
         if (authorization && !authorization->range_authorized[index]) {
             if (index != authorization->memref_cursor) {
@@ -7268,7 +7303,8 @@ typedef struct ObmmExportEntry {
 } ObmmExportEntry;
 
 static QTAILQ_HEAD(, ObmmExportEntry) g_obmm_exports = QTAILQ_HEAD_INITIALIZER(g_obmm_exports);
-static ObmmExportEntry *obmm_export_lookup(uint64_t uba, uint64_t len);
+static ObmmExportEntry *obmm_export_lookup(uint64_t uba, uint64_t len,
+                                           uint32_t token_id);
 static bool sim_dec_obmm_export_is_retired(uint32_t export_cna,
                                            uint64_t remote_uba,
                                            uint32_t token_id,
@@ -7340,7 +7376,9 @@ void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
         }
         if (ret != MEMTX_OK) {
             /* OBMM export fallback: resolve backing_uba from export table. */
-            ObmmExportEntry *exp = obmm_export_lookup(hdr->remote_uba, data_len);
+            ObmmExportEntry *exp = obmm_export_lookup(hdr->remote_uba,
+                                                      data_len,
+                                                      hdr->token_id);
             if (exp && exp->backing_uba) {
                 uint64_t offset = hdr->remote_uba - exp->remote_uba;
                 uint64_t backing_addr = exp->backing_uba + offset;
@@ -7451,7 +7489,8 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
         if (ret != MEMTX_OK) {
             /* OBMM export fallback: resolve backing_uba from export table. */
             ObmmExportEntry *exp = obmm_export_lookup(req->remote_uba,
-                                                      req->read_len);
+                                                      req->read_len,
+                                                      req->token_id);
             if (exp && exp->backing_uba) {
                 uint64_t offset = req->remote_uba - exp->remote_uba;
                 uint64_t backing_addr = exp->backing_uba + offset;
@@ -11012,7 +11051,10 @@ static void obmm_export_register(const SimDecObmmBootstrapRecord *record)
     }
     QTAILQ_FOREACH(entry, &g_obmm_exports, next) {
         if (entry->remote_uba == record->remote_uba &&
-            entry->export_cna == record->export_cna) {
+            entry->export_cna == record->export_cna &&
+            entry->token_id == record->token_id &&
+            entry->export_mem_id == record->export_mem_id &&
+            entry->generation == record->generation) {
             entry->export_mem_id = record->export_mem_id;
             entry->generation = record->generation;
             entry->backing_uba = record->backing_uba;
@@ -11036,12 +11078,15 @@ static void sim_dec_register_obmm_gsva_route(
     const SimDecObmmBootstrapRecord *record);
 
 
-static ObmmExportEntry *obmm_export_lookup(uint64_t uba, uint64_t len)
+static ObmmExportEntry *obmm_export_lookup(uint64_t uba, uint64_t len,
+                                           uint32_t token_id)
 {
     ObmmExportEntry *entry;
     QTAILQ_FOREACH(entry, &g_obmm_exports, next) {
-        if (uba >= entry->remote_uba &&
-            uba + len <= entry->remote_uba + entry->size) {
+        if (entry->token_id == token_id &&
+            uba >= entry->remote_uba &&
+            len <= entry->size &&
+            uba - entry->remote_uba <= entry->size - len) {
             return entry;
         }
     }
@@ -14146,7 +14191,8 @@ static MemTxResult ubc_gsva_route_backing_read(BusControllerDev *ubc,
         }
     }
 
-    exp = obmm_export_lookup(gsva, len);
+    exp = obmm_export_lookup(gsva, len,
+                             route ? route->token.token_id : 0);
     if (exp && exp->backing_uba) {
         uint64_t offset = gsva - exp->remote_uba;
         uint64_t backing_addr = exp->backing_uba + offset;
@@ -14200,7 +14246,8 @@ static MemTxResult ubc_gsva_route_backing_write(BusControllerDev *ubc,
         }
     }
 
-    exp = obmm_export_lookup(gsva, len);
+    exp = obmm_export_lookup(gsva, len,
+                             route ? route->token.token_id : 0);
     if (exp && exp->backing_uba) {
         uint64_t offset = gsva - exp->remote_uba;
         uint64_t backing_addr = exp->backing_uba + offset;
