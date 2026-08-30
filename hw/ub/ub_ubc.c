@@ -5359,15 +5359,19 @@ static uint64_t linqu_uapi_dtype_bytes(uint16_t dtype)
     }
 }
 
-static bool linqu_uapi_validate_contiguous_memref(
+static bool linqu_uapi_validate_strided_memref(
     const LingquShmemMemrefV1 *memref,
     const uint32_t shape[LINGQU_PTO_MAX_RANK],
     const uint32_t strides[LINGQU_PTO_MAX_RANK],
     uint64_t *extent_bytes)
 {
-    uint64_t elements = 1;
-    uint64_t expected_stride = 1;
+    struct {
+        uint64_t stride;
+        uint32_t dim;
+    } active_dims[LINGQU_PTO_MAX_RANK];
+    uint64_t extent_elements = 1;
     uint64_t element_bytes;
+    uint32_t active_count = 0;
     uint32_t index;
 
     if (extent_bytes) {
@@ -5381,20 +5385,46 @@ static bool linqu_uapi_validate_contiguous_memref(
     if (element_bytes == 0) {
         return false;
     }
-    for (index = memref->rank; index > 0; index--) {
-        uint32_t dim = shape[index - 1];
+    for (index = 0; index < memref->rank; index++) {
+        uint32_t dim = shape[index];
+        uint64_t stride = strides[index];
+        uint32_t insert_at;
 
-        if (dim == 0 || strides[index - 1] != expected_stride ||
-            elements > UINT64_MAX / dim) {
+        if (dim == 0 || stride == 0) {
             return false;
         }
-        elements *= dim;
-        expected_stride = elements;
+        if (dim == 1) {
+            continue;
+        }
+        insert_at = active_count;
+        while (insert_at > 0 &&
+               active_dims[insert_at - 1].stride > stride) {
+            active_dims[insert_at] = active_dims[insert_at - 1];
+            insert_at--;
+        }
+        active_dims[insert_at].stride = stride;
+        active_dims[insert_at].dim = dim;
+        active_count++;
     }
-    if (elements > UINT64_MAX / element_bytes) {
+    /*
+     * A dimension may begin only after the complete span formed by all
+     * lower-stride dimensions.  This accepts dense and padded tensors while
+     * rejecting overlapping aliases before any authorization or callback.
+     */
+    for (index = 0; index < active_count; index++) {
+        uint64_t stride = active_dims[index].stride;
+        uint64_t dim_span = (uint64_t)active_dims[index].dim - 1;
+
+        if (stride < extent_elements ||
+            dim_span > (UINT64_MAX - extent_elements) / stride) {
+            return false;
+        }
+        extent_elements += dim_span * stride;
+    }
+    if (extent_elements > UINT64_MAX / element_bytes) {
         return false;
     }
-    *extent_bytes = elements * element_bytes;
+    *extent_bytes = extent_elements * element_bytes;
     return *extent_bytes == memref->byte_length;
 }
 
@@ -5668,7 +5698,7 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
             item->strides[dim] =
                 ldl_le_p(stride_wire + dim * sizeof(uint32_t));
         }
-        if (!linqu_uapi_validate_contiguous_memref(
+        if (!linqu_uapi_validate_strided_memref(
                 memref, item->shape, item->strides, &extent_bytes)) {
             qemu_log("QEMU_UB_GM_SHAPE_STRIDE_REJECT op=%" PRIu64
                      " request=%" PRIu64 " arg=%u rank=%u"
