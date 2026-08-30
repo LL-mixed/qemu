@@ -790,6 +790,7 @@ static void sim_dec_print_global_stats(void)
 /* Forward declarations for SIM decoder */
 static void sim_dec_init(BusControllerState *bcs);
 static void sim_dec_cleanup(void);
+static uint32_t sim_dec_reset_mappings(BusControllerDev *ubc_dev);
 MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
                                      uint64_t remote_uba,
                                      uint32_t token_id,
@@ -6455,7 +6456,9 @@ static void ub_bus_controller_dev_reset(DeviceState *device)
     uint64_t request_id = authorization ? authorization->request_id : 0;
     uint64_t sequence = authorization ? authorization->sequence : 0;
     uint32_t cmdq_slot = authorization ? authorization->cmdq_slot : 0;
+    uint32_t sim_dec_unmaps;
     bool had_authorization = authorization != NULL;
+    bool obmm_async_reset = false;
 
     linqu_uapi_authorization_discard(ubc_dev);
     if (had_authorization &&
@@ -6464,6 +6467,13 @@ static void ub_bus_controller_dev_reset(DeviceState *device)
             ubc_dev, op_id, request_id, sequence,
             LINGQU_PTO_UB_GM_OK, "reset-late-injection");
     }
+
+    if (ubc_dev->obmm_async) {
+        ub_obmm_async_free(ubc_dev->obmm_async);
+        ubc_dev->obmm_async = ub_obmm_async_new(ubc_dev);
+        obmm_async_reset = ubc_dev->obmm_async != NULL;
+    }
+    sim_dec_unmaps = sim_dec_reset_mappings(ubc_dev);
 
     ubc_dev->linqu_uapi_kick_pending = false;
     ubc_dev->linqu_uapi_kick_batch = 0;
@@ -6490,9 +6500,11 @@ static void ub_bus_controller_dev_reset(DeviceState *device)
 
     qemu_log("QEMU_UB_GM_RESET authorization_pending=%u op=%" PRIu64
              " request=%" PRIu64 " slot=%u sequence=%" PRIu64
-             " cq_completion=0 next_sequence=%" PRIu64 "\n",
+             " cq_completion=0 next_sequence=%" PRIu64
+             " sim_dec_unmaps=%u obmm_async_reset=%u\n",
              had_authorization, op_id, request_id, cmdq_slot, sequence,
-             ubc_dev->linqu_uapi_next_authorization_sequence);
+             ubc_dev->linqu_uapi_next_authorization_sequence,
+             sim_dec_unmaps, obmm_async_reset);
 }
 
 static uint64_t ub_ers_region_read(void *opaque, hwaddr addr, unsigned len)
@@ -10804,6 +10816,45 @@ static void sim_dec_map_entry_destroy(SimDecMapEntry *entry)
     sim_dec_page_cache_free(entry->page_cache);
     entry->page_cache = NULL;
     g_free(entry);
+}
+
+static uint32_t sim_dec_reset_mappings(BusControllerDev *ubc_dev)
+{
+    SimDecMapEntry *entry;
+    uint32_t reset_count = 0;
+    bool flush_gva = false;
+
+    if (!g_sim_decoder || !g_sim_decoder->bcs ||
+        g_sim_decoder->bcs->ubc_dev != ubc_dev) {
+        return 0;
+    }
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    while ((entry = QTAILQ_FIRST(&g_sim_decoder->map_list)) != NULL) {
+        QTAILQ_REMOVE(&g_sim_decoder->map_list, entry, next);
+        entry->active = false;
+        entry->state = SIM_DEC_ROUTE_RETIRED;
+        entry->last_error = 0;
+        if (sim_dec_is_gva_entry(entry)) {
+            sim_dec_gva_ownership_unregister_entry(entry);
+            entry->gva_ownership_registered = false;
+            flush_gva = true;
+        }
+        if (entry->mapped) {
+            ubc_cpu_window_detach(&entry->cpu_window);
+            entry->mapped = false;
+        }
+        QTAILQ_INSERT_TAIL(&g_sim_decoder->retired_map_list, entry, next);
+        reset_count++;
+    }
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+
+    if (flush_gva) {
+        sim_dec_flush_gva_tlbs("device_reset");
+    }
+    qemu_log("SIM_DEC: RESET_UNMAP count=%u next_map_id=%" PRIu64 "\n",
+             reset_count, g_sim_decoder->next_map_id);
+    return reset_count;
 }
 
 static void sim_dec_cleanup_coherence_entry(SimDecMapEntry *entry)
