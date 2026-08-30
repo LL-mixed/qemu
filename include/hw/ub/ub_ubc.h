@@ -150,6 +150,8 @@ typedef struct BusControllerDev {
     uint32_t pto_device_cna;
     uint64_t pto_authorization_delay_ns;
     uint64_t pto_authorization_timeout_ns;
+    bool pto_authorization_inject_duplicate_completion;
+    bool pto_authorization_inject_late_completion;
     UbObmmRemoteModelState remote_memory_model;
     QEMUTimer *remote_memory_model_timer;
     struct UbcObmmAsyncChild *obmm_async_children;
@@ -272,6 +274,7 @@ typedef struct BusControllerDev {
     uint64_t linqu_uapi_segment_data_offset;
     uint64_t linqu_uapi_last_error;
     uint64_t linqu_uapi_irq_status;
+    uint64_t linqu_uapi_cancel_op_id;
     bool linqu_uapi_kick_pending;
     bool linqu_uapi_kick_running;
     uint32_t linqu_uapi_kick_batch;

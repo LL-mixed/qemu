@@ -104,7 +104,7 @@ int linqu_ub_bridge_poll_completion(LinquUbBridge *bridge,
 
 #define LINQU_UAPI_ENDPOINT_ID 1
 #define LINQU_UAPI_ENTITY_ID 0
-#define LINQU_UAPI_VERSION 0x0000000400020000ULL
+#define LINQU_UAPI_VERSION 0x0000000400030000ULL
 #define LINQU_UAPI_ENDPOINT_BASE 0x1000
 #define LINQU_UAPI_REG_VERSION 0x000
 #define LINQU_UAPI_REG_CMDQ_BASE_LO 0x010
@@ -125,6 +125,8 @@ int linqu_ub_bridge_poll_completion(LinquUbBridge *bridge,
 #define LINQU_UAPI_REG_DEFAULT_SEGMENT 0x088
 #define LINQU_UAPI_REG_SEG_DATA_OFFSET 0x090
 #define LINQU_UAPI_REG_SEG_DATA_VALUE 0x098
+#define LINQU_UAPI_REG_CANCEL_OP_ID 0x0a0
+#define LINQU_UAPI_REG_CANCEL_DOORBELL 0x0a8
 #define LINQU_UAPI_DESC_BYTES 64
 #define LINQU_UAPI_DEFAULT_CMDQ_DEPTH 32
 #define LINQU_UAPI_DEFAULT_CQ_DEPTH 64
@@ -4622,11 +4624,72 @@ static uint64_t linqu_uapi_ns_add_saturating(uint64_t base, uint64_t delta)
     return delta > UINT64_MAX - base ? UINT64_MAX : base + delta;
 }
 
+static bool linqu_uapi_authorization_complete(
+    BusControllerDev *ubc_dev, uint64_t op_id, uint64_t request_id,
+    uint64_t sequence, int completion_status, const char *source)
+{
+    LinquPtoAuthorizationState *authorization;
+    const char *status;
+
+    if (!ubc_dev || !ubc_dev->linqu_uapi_authorization) {
+        qemu_log("QEMU_UB_GM_AUTHORIZATION_COMPLETION_IGNORED"
+                 " op=%" PRIu64 " request=%" PRIu64
+                 " sequence=%" PRIu64 " source=%s reason=no_pending\n",
+                 op_id, request_id, sequence,
+                 source ? source : "unknown");
+        return false;
+    }
+    authorization = ubc_dev->linqu_uapi_authorization;
+    if (authorization->op_id != op_id ||
+        authorization->request_id != request_id ||
+        authorization->sequence != sequence) {
+        qemu_log("QEMU_UB_GM_AUTHORIZATION_COMPLETION_IGNORED"
+                 " op=%" PRIu64 " request=%" PRIu64
+                 " sequence=%" PRIu64 " source=%s"
+                 " reason=identity_mismatch active_op=%" PRIu64
+                 " active_request=%" PRIu64
+                 " active_sequence=%" PRIu64 "\n",
+                 op_id, request_id, sequence,
+                 source ? source : "unknown", authorization->op_id,
+                 authorization->request_id, authorization->sequence);
+        return false;
+    }
+    if (!authorization->waiting) {
+        qemu_log("QEMU_UB_GM_AUTHORIZATION_COMPLETION_IGNORED"
+                 " op=%" PRIu64 " request=%" PRIu64
+                 " sequence=%" PRIu64 " source=%s"
+                 " reason=already_completed\n",
+                 op_id, request_id, sequence,
+                 source ? source : "unknown");
+        return false;
+    }
+
+    authorization->waiting = false;
+    authorization->completion_ready = true;
+    authorization->completion_status = completion_status;
+    status = completion_status == LINGQU_PTO_UB_GM_OK ? "ready" :
+             completion_status == LINGQU_PTO_UB_GM_AUTHORIZATION_TIMEOUT ?
+             "timeout" : "failed";
+    qemu_log("QEMU_UB_GM_AUTHORIZATION_RESUME op=%" PRIu64
+             " request=%" PRIu64 " slot=%u cursor=%u sequence=%" PRIu64
+             " status=%s source=%s\n",
+             authorization->op_id, authorization->request_id,
+             authorization->cmdq_slot, authorization->memref_cursor,
+             authorization->sequence, status,
+             source ? source : "unknown");
+    linqu_uapi_schedule_kick(
+        ubc_dev, MAX(authorization->resume_batch, 1u));
+    return true;
+}
+
 static void linqu_uapi_authorization_timer(void *opaque)
 {
     BusControllerDev *ubc_dev = opaque;
     LinquPtoAuthorizationState *authorization;
-    const char *status;
+    uint64_t op_id;
+    uint64_t request_id;
+    uint64_t sequence;
+    int completion_status;
 
     if (!ubc_dev || !ubc_dev->linqu_uapi_authorization) {
         return;
@@ -4636,24 +4699,22 @@ static void linqu_uapi_authorization_timer(void *opaque)
         return;
     }
 
-    authorization->waiting = false;
-    authorization->completion_ready = true;
+    op_id = authorization->op_id;
+    request_id = authorization->request_id;
+    sequence = authorization->sequence;
     if (authorization->ready_ns > authorization->deadline_ns) {
-        authorization->completion_status =
-            LINGQU_PTO_UB_GM_AUTHORIZATION_TIMEOUT;
-        status = "timeout";
+        completion_status = LINGQU_PTO_UB_GM_AUTHORIZATION_TIMEOUT;
     } else {
-        authorization->completion_status = LINGQU_PTO_UB_GM_OK;
-        status = "ready";
+        completion_status = LINGQU_PTO_UB_GM_OK;
     }
-    qemu_log("QEMU_UB_GM_AUTHORIZATION_RESUME op=%" PRIu64
-             " request=%" PRIu64 " slot=%u cursor=%u sequence=%" PRIu64
-             " status=%s\n",
-             authorization->op_id, authorization->request_id,
-             authorization->cmdq_slot, authorization->memref_cursor,
-             authorization->sequence, status);
-    linqu_uapi_schedule_kick(
-        ubc_dev, MAX(authorization->resume_batch, 1u));
+    if (linqu_uapi_authorization_complete(
+            ubc_dev, op_id, request_id, sequence, completion_status,
+            "timer") &&
+        ubc_dev->pto_authorization_inject_duplicate_completion) {
+        linqu_uapi_authorization_complete(
+            ubc_dev, op_id, request_id, sequence, completion_status,
+            "duplicate-injection");
+    }
 }
 
 static bool linqu_ub_gm_binding_snapshot(BusControllerDev *ubc_dev,
@@ -5785,6 +5846,8 @@ static const char *linqu_uapi_ub_gm_error_code(int error)
         return "pto_ub_gm_authorization_timeout";
     case LINGQU_PTO_UB_GM_CALLBACK_FAILED:
         return "pto_ub_gm_callback_failed";
+    case LINGQU_PTO_UB_GM_AUTHORIZATION_CANCELLED:
+        return "pto_ub_gm_authorization_cancelled";
     case LINGQU_PTO_UB_GM_EXECUTION_FAILED:
     default:
         return "pto_ub_gm_execution_failed";
@@ -5835,6 +5898,69 @@ static bool linqu_uapi_publish_ub_gm_failure(BusControllerDev *ubc_dev,
              op_id, cq_slot, ubc_dev->linqu_uapi_cq_tail, code);
     qemu_log("QEMU_UB_GM_DISPATCH_REJECT op=%" PRIu64
              " error=%d code=%s\n", op_id, error, code);
+    return true;
+}
+
+static bool linqu_uapi_cancel_authorization(BusControllerDev *ubc_dev,
+                                             uint64_t op_id)
+{
+    LinquPtoAuthorizationState *authorization;
+    uint64_t request_id;
+    uint64_t sequence;
+    uint32_t cmdq_slot;
+    uint32_t resume_batch;
+
+    if (!ubc_dev || !ubc_dev->linqu_uapi_authorization) {
+        qemu_log("QEMU_UB_GM_AUTHORIZATION_CANCEL_IGNORED op=%" PRIu64
+                 " reason=no_pending\n", op_id);
+        return false;
+    }
+    authorization = ubc_dev->linqu_uapi_authorization;
+    if (op_id == 0 || authorization->op_id != op_id) {
+        qemu_log("QEMU_UB_GM_AUTHORIZATION_CANCEL_IGNORED op=%" PRIu64
+                 " active_op=%" PRIu64 " reason=op_mismatch\n",
+                 op_id, authorization->op_id);
+        return false;
+    }
+    if (ubc_dev->linqu_uapi_cmdq_depth == 0 ||
+        ubc_dev->linqu_uapi_cmdq_head != authorization->cmdq_slot) {
+        qemu_log("QEMU_UB_GM_AUTHORIZATION_CANCEL_IGNORED op=%" PRIu64
+                 " slot=%u head=%u reason=queue_identity_mismatch\n",
+                 op_id, authorization->cmdq_slot,
+                 ubc_dev->linqu_uapi_cmdq_head);
+        return false;
+    }
+    if (!linqu_uapi_publish_ub_gm_failure(
+            ubc_dev, op_id,
+            LINGQU_PTO_UB_GM_AUTHORIZATION_CANCELLED)) {
+        qemu_log("QEMU_UB_GM_AUTHORIZATION_CANCEL_IGNORED op=%" PRIu64
+                 " reason=cq_unavailable\n", op_id);
+        return false;
+    }
+
+    request_id = authorization->request_id;
+    sequence = authorization->sequence;
+    cmdq_slot = authorization->cmdq_slot;
+    resume_batch = MAX(authorization->resume_batch, 1u);
+    ubc_dev->linqu_uapi_cmdq_head =
+        (cmdq_slot + 1) % ubc_dev->linqu_uapi_cmdq_depth;
+    qemu_log("QEMU_UB_GM_AUTHORIZATION_CANCEL op=%" PRIu64
+             " request=%" PRIu64 " slot=%u sequence=%" PRIu64
+             " cmdq_head=%u cq_tail=%u\n",
+             op_id, request_id, cmdq_slot, sequence,
+             ubc_dev->linqu_uapi_cmdq_head,
+             ubc_dev->linqu_uapi_cq_tail);
+    linqu_uapi_authorization_discard(ubc_dev);
+
+    if (ubc_dev->pto_authorization_inject_late_completion) {
+        linqu_uapi_authorization_complete(
+            ubc_dev, op_id, request_id, sequence,
+            LINGQU_PTO_UB_GM_OK, "cancel-late-injection");
+    }
+    if (ubc_dev->linqu_uapi_cmdq_head !=
+        ubc_dev->linqu_uapi_cmdq_tail) {
+        linqu_uapi_schedule_kick(ubc_dev, resume_batch);
+    }
     return true;
 }
 
@@ -6205,6 +6331,9 @@ static uint64_t linqu_uapi_reg_read(BusControllerDev *ubc_dev, hwaddr reg,
             return 0;
         }
         break;
+    case LINQU_UAPI_REG_CANCEL_OP_ID:
+        value = ubc_dev->linqu_uapi_cancel_op_id;
+        break;
     default:
         return 0;
     }
@@ -6296,9 +6425,74 @@ static bool linqu_uapi_reg_write(BusControllerDev *ubc_dev, hwaddr reg,
                 ubc_dev->linqu_uapi_segment_data_offset);
         }
         return true;
+    case LINQU_UAPI_REG_CANCEL_OP_ID:
+        current = ubc_dev->linqu_uapi_cancel_op_id;
+        ubc_dev->linqu_uapi_cancel_op_id =
+            linqu_uapi_access_merge(current, reg, value, len);
+        return true;
+    case LINQU_UAPI_REG_CANCEL_DOORBELL:
+        if (len == DWORD_SIZE && (reg & 0x4)) {
+            return true;
+        }
+        if (value != 1 || ubc_dev->linqu_uapi_cancel_op_id == 0 ||
+            !linqu_uapi_cancel_authorization(
+                ubc_dev, ubc_dev->linqu_uapi_cancel_op_id)) {
+            ubc_dev->linqu_uapi_last_error = LINGQU_PTO_UB_GM_UNBOUND;
+        }
+        ubc_dev->linqu_uapi_cancel_op_id = 0;
+        return true;
     default:
         return false;
     }
+}
+
+static void ub_bus_controller_dev_reset(DeviceState *device)
+{
+    BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(device);
+    LinquPtoAuthorizationState *authorization =
+        ubc_dev->linqu_uapi_authorization;
+    uint64_t op_id = authorization ? authorization->op_id : 0;
+    uint64_t request_id = authorization ? authorization->request_id : 0;
+    uint64_t sequence = authorization ? authorization->sequence : 0;
+    uint32_t cmdq_slot = authorization ? authorization->cmdq_slot : 0;
+    bool had_authorization = authorization != NULL;
+
+    linqu_uapi_authorization_discard(ubc_dev);
+    if (had_authorization &&
+        ubc_dev->pto_authorization_inject_late_completion) {
+        linqu_uapi_authorization_complete(
+            ubc_dev, op_id, request_id, sequence,
+            LINGQU_PTO_UB_GM_OK, "reset-late-injection");
+    }
+
+    ubc_dev->linqu_uapi_kick_pending = false;
+    ubc_dev->linqu_uapi_kick_batch = 0;
+    if (ubc_dev->linqu_uapi_bridge) {
+        linqu_ub_bridge_free(ubc_dev->linqu_uapi_bridge);
+        ubc_dev->linqu_uapi_bridge = NULL;
+    }
+    linqu_ub_gm_registry_free(ubc_dev->linqu_uapi_ub_gm_registry);
+    ubc_dev->linqu_uapi_ub_gm_registry = NULL;
+    ubc_dev->linqu_uapi_bridge_ready = false;
+    ubc_dev->linqu_uapi_cmdq_iova = 0;
+    ubc_dev->linqu_uapi_cq_iova = 0;
+    ubc_dev->linqu_uapi_cmdq_depth = 0;
+    ubc_dev->linqu_uapi_cq_depth = 0;
+    ubc_dev->linqu_uapi_cmdq_head = 0;
+    ubc_dev->linqu_uapi_cmdq_tail = 0;
+    ubc_dev->linqu_uapi_cq_head = 0;
+    ubc_dev->linqu_uapi_cq_tail = 0;
+    ubc_dev->linqu_uapi_default_segment = 0;
+    ubc_dev->linqu_uapi_segment_data_offset = 0;
+    ubc_dev->linqu_uapi_last_error = 0;
+    ubc_dev->linqu_uapi_irq_status = 0;
+    ubc_dev->linqu_uapi_cancel_op_id = 0;
+
+    qemu_log("QEMU_UB_GM_RESET authorization_pending=%u op=%" PRIu64
+             " request=%" PRIu64 " slot=%u sequence=%" PRIu64
+             " cq_completion=0 next_sequence=%" PRIu64 "\n",
+             had_authorization, op_id, request_id, cmdq_slot, sequence,
+             ubc_dev->linqu_uapi_next_authorization_sequence);
 }
 
 static uint64_t ub_ers_region_read(void *opaque, hwaddr addr, unsigned len)
@@ -10476,6 +10670,14 @@ static Property ub_bus_controller_dev_properties[] = {
     DEFINE_PROP_UINT64("pto-authorization-timeout-ns", BusControllerDev,
                        pto_authorization_timeout_ns,
                        LINQU_PTO_AUTHORIZATION_TIMEOUT_NS_DEFAULT),
+    DEFINE_PROP_BOOL("pto-authorization-inject-duplicate-completion",
+                     BusControllerDev,
+                     pto_authorization_inject_duplicate_completion,
+                     false),
+    DEFINE_PROP_BOOL("pto-authorization-inject-late-completion",
+                     BusControllerDev,
+                     pto_authorization_inject_late_completion,
+                     false),
     DEFINE_PROP_STRING("remote-memory-model-manifest", BusControllerDev,
                        remote_memory_model_manifest),
     DEFINE_PROP_STRING("async-load-model", BusControllerDev,
@@ -10490,6 +10692,7 @@ static void ub_bus_controller_dev_class_init(ObjectClass *class, void *data)
 
     device_class_set_props(dc, ub_bus_controller_dev_properties);
     uc->realize = ub_bus_controller_dev_realize;
+    dc->reset = ub_bus_controller_dev_reset;
     dc->vmsd = &vmstate_ub_bus_controller_dev;
 }
 
