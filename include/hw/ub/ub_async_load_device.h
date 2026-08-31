@@ -12,9 +12,14 @@
 
 #define UB_ASYNC_LOAD_ENDPOINT_BASE 0x3000
 #define UB_ASYNC_LOAD_ENDPOINT_BYTES 0x1000
-#define UB_ASYNC_LOAD_ABI_VERSION 2
+#define UB_ASYNC_LOAD_ABI_VERSION 3
 #define UB_ASYNC_LOAD_RESUME_IMM 0x5343
+#define UB_ASYNC_LOAD_WAIT_IMM 0x5344
+#define UB_ASYNC_LOAD_SCHEDULER_ENTER_IMM 0x5345
 #define UB_ASYNC_LOAD_CAP_REPLAY_RETIRE (1ULL << 8)
+#define UB_ASYNC_LOAD_CAP_KERNEL_FREE_EVENT_RING (1ULL << 9)
+#define UB_ASYNC_LOAD_CAP_EL0_WAIT_WAKE (1ULL << 10)
+#define UB_ASYNC_LOAD_CAP_EL0_SCHEDULER_ENTER (1ULL << 11)
 #define UB_ASYNC_LOAD_START_REPLAY_RETIRE (1ULL << 0)
 
 typedef struct BusControllerDev BusControllerDev;
@@ -27,6 +32,12 @@ typedef enum UbAsyncLoadTryResult {
     UB_ASYNC_LOAD_TRY_REPLAYED,
     UB_ASYNC_LOAD_TRY_FAIL_STOP,
 } UbAsyncLoadTryResult;
+
+typedef enum UbAsyncLoadWaitResult {
+    UB_ASYNC_LOAD_WAIT_FAIL_STOP,
+    UB_ASYNC_LOAD_WAIT_READY,
+    UB_ASYNC_LOAD_WAIT_HALT,
+} UbAsyncLoadWaitResult;
 
 UbAsyncLoadDeviceState *ub_async_load_device_new(BusControllerDev *ubc_dev,
                                     const char *model_spec,
@@ -47,6 +58,8 @@ bool ub_async_load_cpu_replay_expected(CPUState *cpu);
 bool ub_async_load_cpu_take_upcall(CPUState *cpu, uint64_t interrupted_pc,
                             uint64_t *upcall_entry);
 bool ub_async_load_cpu_resume(CPUState *cpu, uint64_t context_id);
+UbAsyncLoadWaitResult ub_async_load_cpu_wait(CPUState *cpu);
+bool ub_async_load_cpu_scheduler_enter(CPUState *cpu);
 void ub_async_load_cpu_fail_stop(CPUState *cpu);
 UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
     CPUState *cpu, const UbAsyncLoadDesc *load, uint64_t *replay_value);

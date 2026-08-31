@@ -34,7 +34,7 @@ static void test_model_spec(void)
     bool enabled;
 
     g_assert_true(ub_async_load_config_parse(
-        "v2|enabled=1|contexts=32|pending=16|events=64|clock_mhz=2500",
+        "v3|enabled=1|contexts=32|pending=16|events=64|clock_mhz=2500",
         &enabled, &config));
     g_assert_true(enabled);
     g_assert_cmpuint(config.context_entries, ==, 32);
@@ -42,7 +42,7 @@ static void test_model_spec(void)
     g_assert_cmpuint(config.event_queue_depth, ==, 64);
     g_assert_cmpuint(config.clock_mhz, ==, 2500);
     g_assert_false(ub_async_load_config_parse(
-        "v2|enabled=1|contexts=65|pending=16|events=64|clock_mhz=2500",
+        "v3|enabled=1|contexts=65|pending=16|events=64|clock_mhz=2500",
         &enabled, &config));
     g_assert_false(ub_async_load_config_parse("v1", &enabled, &config));
     g_assert_true(ub_async_load_config_parse(NULL, &enabled, &config));

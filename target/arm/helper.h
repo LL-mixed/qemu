@@ -107,6 +107,8 @@ DEF_HELPER_FLAGS_5(probe_access, TCG_CALL_NO_WG, void, env, tl, i32, i32, i32)
 DEF_HELPER_1(async_load_boundary, void, env)
 DEF_HELPER_6(async_load_remote_load, i64, env, tl, i32, i32, i32, tl)
 DEF_HELPER_2(async_load_resume, void, env, tl)
+DEF_HELPER_1(async_load_wait, void, env)
+DEF_HELPER_1(async_load_scheduler_enter, void, env)
 
 DEF_HELPER_1(vfp_get_fpscr, i32, env)
 DEF_HELPER_2(vfp_set_fpscr, void, env, i32)

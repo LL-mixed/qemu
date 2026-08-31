@@ -319,6 +319,71 @@ void HELPER(async_load_resume)(CPUARMState *env, target_ulong context_address)
     cpu_loop_exit_noexc(cs);
 }
 
+void HELPER(async_load_wait)(CPUARMState *env)
+{
+    CPUState *cs = env_cpu(env);
+    UbAsyncLoadWaitResult result;
+    bool need_lock;
+
+    if (!ub_async_load_cpu_enabled(cs) || !is_a64(env) ||
+        !ub_async_load_cpu_owner_matches(cs, env->cp15.ttbr0_el[1]) ||
+        arm_current_el(env) != 0) {
+        cpu_abort(cs, "invalid OBMM EL0 wait instruction");
+    }
+    need_lock = !qemu_mutex_iothread_locked();
+    if (need_lock) {
+        qemu_mutex_lock_iothread();
+    }
+    result = ub_async_load_cpu_wait(cs);
+    if (result == UB_ASYNC_LOAD_WAIT_HALT) {
+        /*
+         * Publish the halted state while the BQL still serializes us with
+         * completion delivery.  A completion arriving after the unlock will
+         * observe halted=1, clear it, and kick this vCPU.  Setting halted
+         * after the unlock would leave a lost-wakeup window.
+         */
+        cs->exception_index = EXCP_HLT;
+        cs->halted = 1;
+    }
+    if (need_lock) {
+        qemu_mutex_unlock_iothread();
+    }
+    if (result == UB_ASYNC_LOAD_WAIT_READY) {
+        cpu_loop_exit_noexc(cs);
+    }
+    if (result == UB_ASYNC_LOAD_WAIT_HALT) {
+        cpu_loop_exit(cs);
+    }
+    ub_async_load_cpu_fail_stop(cs);
+    cpu_abort(cs, "OBMM EL0 wait instruction entered fail-stop");
+}
+
+void HELPER(async_load_scheduler_enter)(CPUARMState *env)
+{
+    CPUState *cs = env_cpu(env);
+    bool accepted;
+    bool need_lock;
+
+    if (!ub_async_load_cpu_enabled(cs) || !is_a64(env) ||
+        !ub_async_load_cpu_owner_matches(cs, env->cp15.ttbr0_el[1]) ||
+        arm_current_el(env) != 0) {
+        cpu_abort(cs, "invalid OBMM EL0 scheduler-enter instruction");
+    }
+    need_lock = !qemu_mutex_iothread_locked();
+    if (need_lock) {
+        qemu_mutex_lock_iothread();
+    }
+    accepted = ub_async_load_cpu_scheduler_enter(cs);
+    if (need_lock) {
+        qemu_mutex_unlock_iothread();
+    }
+    if (!accepted) {
+        ub_async_load_cpu_fail_stop(cs);
+        cpu_abort(cs, "OBMM EL0 scheduler-enter instruction entered fail-stop");
+    }
+    cpu_loop_exit_noexc(cs);
+}
+
 #else
 
 void HELPER(async_load_boundary)(CPUARMState *env)
@@ -346,6 +411,16 @@ void HELPER(async_load_resume)(CPUARMState *env,
 {
     (void)env;
     (void)context_address;
+}
+
+void HELPER(async_load_wait)(CPUARMState *env)
+{
+    (void)env;
+}
+
+void HELPER(async_load_scheduler_enter)(CPUARMState *env)
+{
+    (void)env;
 }
 
 #endif

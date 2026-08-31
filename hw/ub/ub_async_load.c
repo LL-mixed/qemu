@@ -53,7 +53,7 @@ bool ub_async_load_config_parse(const char *spec, bool *enabled,
         return true;
     }
     if (sscanf(spec,
-               "v2|enabled=%u|contexts=%u|pending=%u|events=%u|"
+               "v3|enabled=%u|contexts=%u|pending=%u|events=%u|"
                "clock_mhz=%u%n",
                &values[0], &values[1], &values[2], &values[3],
                &values[4], &consumed) != 5 || spec[consumed] != '\0' ||
@@ -193,6 +193,9 @@ static bool ub_async_load_event_push(UbAsyncLoad *async_load, UbAsyncLoadEventKi
         .fault_pc = entry->load.fault_pc,
         .effective_va = entry->load.effective_va,
         .value = value,
+        .map_id = entry->load.map_id,
+        .map_generation = entry->load.map_generation,
+        .map_model_generation = entry->load.map_model_generation,
         .kind = kind,
         .status = status,
         .rt = entry->load.rt,
@@ -400,6 +403,7 @@ static bool ub_async_load_replay_load_matches(
         expected->effective_va == actual->effective_va &&
         expected->map_id == actual->map_id &&
         expected->map_generation == actual->map_generation &&
+        expected->map_model_generation == actual->map_model_generation &&
         expected->remote_offset == actual->remote_offset &&
         expected->rt == actual->rt &&
         expected->access_bytes == actual->access_bytes &&

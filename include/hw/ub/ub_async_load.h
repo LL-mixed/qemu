@@ -78,6 +78,7 @@ typedef struct UbAsyncLoadDesc {
     uint64_t effective_va;
     uint64_t map_id;
     uint64_t map_generation;
+    uint64_t map_model_generation;
     uint64_t remote_offset;
     uint64_t submit_cycle;
     uint64_t deadline_cycle;
@@ -96,6 +97,9 @@ typedef struct UbAsyncLoadEvent {
     uint64_t fault_pc;
     uint64_t effective_va;
     uint64_t value;
+    uint64_t map_id;
+    uint64_t map_generation;
+    uint64_t map_model_generation;
     UbAsyncLoadEventKind kind;
     UbAsyncLoadStatus status;
     uint32_t flags;
