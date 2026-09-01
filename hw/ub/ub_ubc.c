@@ -8282,6 +8282,20 @@ void ubc_obmm_async_irq_notify(BusControllerDev *ubc_dev)
     qemu_set_irq(bcs->irq, 0);
 }
 
+void ubc_async_load_irq_set(BusControllerDev *ubc_dev, bool level)
+{
+    BusControllerState *bcs;
+
+    if (!ubc_dev) {
+        return;
+    }
+    bcs = container_of_ubbus(ub_get_bus(&ubc_dev->parent));
+    if (!bcs) {
+        return;
+    }
+    qemu_set_irq(bcs->async_load_irq, level);
+}
+
 MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
                                     uint64_t remote_uba,
                                     uint32_t token_id,
@@ -9879,6 +9893,7 @@ static void ub_bus_controller_realize(DeviceState *dev, Error **errp)
                           s, TYPE_BUS_CONTROLLER, s->msgq_reg_size);
     sysbus_init_mmio(sysdev, &s->msgq_reg_mem);
     sysbus_init_irq(sysdev, &s->irq);
+    sysbus_init_irq(sysdev, &s->async_load_irq);
     /* for fm msgq reg */
     memory_region_init_io(&s->fm_msgq_reg_mem, OBJECT(s), &ub_fm_msgq_reg_ops,
                           s, TYPE_BUS_CONTROLLER, s->fm_msgq_reg_size);

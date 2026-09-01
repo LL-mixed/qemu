@@ -316,6 +316,7 @@ typedef struct BusControllerState BusControllerState;
 struct BusControllerState {
     SysBusDevice busdev;
     qemu_irq irq;
+    qemu_irq async_load_irq;
 
     MemoryRegion msgq_reg_mem; /* ubc msgq */
     uint32_t msgq_reg_size;
@@ -389,6 +390,7 @@ bool ubc_sim_dec_remote_read_async_submit(
 void ubc_sim_dec_remote_read_async_cancel(BusControllerDev *ubc_dev,
                                           ObmmRemoteToken token);
 void ubc_obmm_async_irq_notify(BusControllerDev *ubc_dev);
+void ubc_async_load_irq_set(BusControllerDev *ubc_dev, bool level);
 
 /* Coherence message send helper (obmm_coherence.c uses these) */
 int obmm_coh_send_ub_link_msg(BusControllerDev *ubc_dev, uint32_t dcna,

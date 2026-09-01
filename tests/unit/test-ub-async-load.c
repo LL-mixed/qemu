@@ -73,6 +73,7 @@ static void test_pending_and_complete_events(void)
     uint8_t payload[] = { 0x88, 0x77, 0x66, 0x55,
                           0x44, 0x33, 0x22, 0x11 };
 
+    load.context_cookie = 0xa5a5000012345678ULL;
     g_assert_nonnull(async_load);
     g_assert_cmpint(ub_async_load_load_pending(
                         async_load, context_id, &load, &token),
@@ -81,6 +82,7 @@ static void test_pending_and_complete_events(void)
     g_assert_true(ub_async_load_event_pop(async_load, &event, false));
     g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_PENDING);
     g_assert_cmpuint(event.context_id, ==, context_id);
+    g_assert_cmphex(event.context_cookie, ==, load.context_cookie);
     g_assert_cmpuint(event.plt_token.generation, ==, token.generation);
     g_assert_cmpuint(event.plt_token.slot, ==, token.slot);
     g_assert_cmphex(event.fault_pc, ==, load.fault_pc);
@@ -91,6 +93,7 @@ static void test_pending_and_complete_events(void)
                     ==, UB_ASYNC_LOAD_COMPLETION_ACCEPTED);
     g_assert_true(ub_async_load_event_pop(async_load, &event, false));
     g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_COMPLETE);
+    g_assert_cmphex(event.context_cookie, ==, load.context_cookie);
     g_assert_cmphex(event.value, ==, 0x1122334455667788ULL);
     g_assert_cmpuint(ub_async_load_pending_count(async_load), ==, 0);
     g_assert_cmpuint(ub_async_load_stats(async_load)->completion_events_delivered, ==, 1);

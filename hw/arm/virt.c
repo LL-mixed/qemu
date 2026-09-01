@@ -489,6 +489,10 @@ static void create_ubios_info_table_fdt(VirtMachineState *vms, MemoryRegion *mac
     qemu_fdt_setprop_sized_cells(ms->fdt, linqu_nodename, "reg",
                                  2, ub_ers_phys_base() + 0x200000ULL,
                                  2, UBC_ERS2_SPACE_SIZE * 4096ULL);
+    qemu_fdt_setprop_cells(ms->fdt, linqu_nodename, "interrupts",
+                           GIC_FDT_IRQ_TYPE_SPI,
+                           vms->irqmap[VIRT_PLATFORM_BUS] + 1,
+                           GIC_FDT_IRQ_FLAGS_LEVEL_HI);
     g_free(linqu_nodename);
     {
         uint32_t ubc_phandle = qemu_fdt_alloc_phandle(ms->fdt);
@@ -1945,6 +1949,9 @@ static void create_ub(VirtMachineState *vms)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(ubc), &error_fatal);
     sysbus_connect_irq(SYS_BUS_DEVICE(ubc), 0,
                        qdev_get_gpio_in(vms->gic, vms->irqmap[VIRT_PLATFORM_BUS]));
+    sysbus_connect_irq(SYS_BUS_DEVICE(ubc), 1,
+                       qdev_get_gpio_in(vms->gic,
+                                        vms->irqmap[VIRT_PLATFORM_BUS] + 1));
 
     /* in ub_bus_controller_realize will call sysbus_init_mmio init memory_region in order,
      * 0: msgq_reg_mem

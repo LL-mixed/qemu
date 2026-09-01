@@ -196,7 +196,8 @@ void HELPER(async_load_boundary)(CPUARMState *env)
 
     if (!ub_async_load_cpu_enabled(cs) || !is_a64(env) ||
         !ub_async_load_cpu_owner_matches(cs, env->cp15.ttbr0_el[1]) ||
-        arm_current_el(env) != 0) {
+        arm_current_el(env) != 0 ||
+        ub_async_load_cpu_kernel_task_mode(cs)) {
         return;
     }
     need_lock = !qemu_mutex_iothread_locked();
@@ -223,7 +224,9 @@ uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
     UbAsyncLoadDesc load;
     UbAsyncLoadTryResult result;
     uint64_t upcall_entry;
+    uint32_t syndrome;
     uint8_t bytes = 1U << (memop & MO_SIZE);
+    bool kernel_task = false;
     bool need_lock;
     uintptr_t retaddr = GETPC();
     uint64_t replay_value = 0;
@@ -244,6 +247,7 @@ uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
     async_load_probe_access_range(env, va, bytes, MMU_DATA_LOAD, mmu_index,
                                 retaddr);
     load = (UbAsyncLoadDesc) {
+        .context_cookie = env->cp15.tpidr_el[0],
         .fault_pc = fault_pc,
         .effective_va = va,
         .submit_cycle = ub_async_load_cpu_cycle(cs),
@@ -257,9 +261,17 @@ uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
     if (need_lock) {
         qemu_mutex_lock_iothread();
     }
-    result = ub_async_load_cpu_remote_load(cs, &load, &replay_value);
+    kernel_task = ub_async_load_cpu_kernel_task_mode(cs);
+    if (kernel_task && !ub_async_load_cpu_prepare_kernel_context(
+                           cs, load.context_cookie)) {
+        result = UB_ASYNC_LOAD_TRY_FAIL_STOP;
+    } else {
+        result = ub_async_load_cpu_remote_load(cs, &load, &replay_value);
+    }
     if (result == UB_ASYNC_LOAD_TRY_PENDING) {
-        if (!ub_async_load_cpu_take_upcall(cs, fault_pc, &upcall_entry)) {
+        if (kernel_task ?
+            !ub_async_load_cpu_take_kernel_fault(cs, fault_pc) :
+            !ub_async_load_cpu_take_upcall(cs, fault_pc, &upcall_entry)) {
             result = UB_ASYNC_LOAD_TRY_FAIL_STOP;
         }
     }
@@ -275,6 +287,14 @@ uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
         return replay_value;
     }
     if (result == UB_ASYNC_LOAD_TRY_PENDING) {
+        if (kernel_task) {
+            syndrome = syn_data_abort_with_iss(
+                0, memop & MO_SIZE, 0, rt, bytes == 8, 0,
+                0, 0, 0, 0, UB_ASYNC_LOAD_REMOTE_FSC, false);
+            env->exception.vaddress = va;
+            env->exception.fsr = UB_ASYNC_LOAD_REMOTE_FSC;
+            raise_exception_ra(env, EXCP_DATA_ABORT, syndrome, 1, retaddr);
+        }
         env->pc = upcall_entry;
         cpu_loop_exit_noexc(cs);
     }

@@ -20,7 +20,10 @@
 #define UB_ASYNC_LOAD_CAP_KERNEL_FREE_EVENT_RING (1ULL << 9)
 #define UB_ASYNC_LOAD_CAP_EL0_WAIT_WAKE (1ULL << 10)
 #define UB_ASYNC_LOAD_CAP_EL0_SCHEDULER_ENTER (1ULL << 11)
+#define UB_ASYNC_LOAD_CAP_KERNEL_TASK_REPLAY (1ULL << 12)
 #define UB_ASYNC_LOAD_START_REPLAY_RETIRE (1ULL << 0)
+#define UB_ASYNC_LOAD_START_KERNEL_TASK (1ULL << 1)
+#define UB_ASYNC_LOAD_REMOTE_FSC 0x3a
 
 typedef struct BusControllerDev BusControllerDev;
 typedef struct UbAsyncLoadDeviceState UbAsyncLoadDeviceState;
@@ -55,6 +58,11 @@ uint64_t ub_async_load_cpu_cycle(CPUState *cpu);
 bool ub_async_load_cpu_address_is_remote(CPUState *cpu, uint64_t va,
                                   uint8_t bytes);
 bool ub_async_load_cpu_replay_expected(CPUState *cpu);
+bool ub_async_load_cpu_kernel_task_mode(CPUState *cpu);
+bool ub_async_load_cpu_prepare_kernel_context(CPUState *cpu,
+                                        uint64_t context_cookie);
+bool ub_async_load_cpu_take_kernel_fault(CPUState *cpu,
+                                   uint64_t interrupted_pc);
 bool ub_async_load_cpu_take_upcall(CPUState *cpu, uint64_t interrupted_pc,
                             uint64_t *upcall_entry);
 bool ub_async_load_cpu_resume(CPUState *cpu, uint64_t context_id);

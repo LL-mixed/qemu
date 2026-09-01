@@ -74,6 +74,7 @@ typedef struct UbAsyncLoadPltToken {
 } UbAsyncLoadPltToken;
 
 typedef struct UbAsyncLoadDesc {
+    uint64_t context_cookie;
     uint64_t fault_pc;
     uint64_t effective_va;
     uint64_t map_id;
@@ -92,6 +93,7 @@ typedef struct UbAsyncLoadDesc {
 typedef struct UbAsyncLoadEvent {
     uint64_t sequence;
     uint64_t context_id;
+    uint64_t context_cookie;
     UbAsyncLoadPltToken plt_token;
     uint64_t interrupted_pc;
     uint64_t fault_pc;

@@ -189,6 +189,7 @@ static bool ub_async_load_event_push(UbAsyncLoad *async_load, UbAsyncLoadEventKi
     }
     *event = (UbAsyncLoadEvent) {
         .context_id = entry->context_id,
+        .context_cookie = entry->load.context_cookie,
         .plt_token = token,
         .fault_pc = entry->load.fault_pc,
         .effective_va = entry->load.effective_va,
