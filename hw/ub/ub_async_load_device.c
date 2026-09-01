@@ -1160,8 +1160,8 @@ bool ub_async_load_cpu_kernel_task_mode(CPUState *cpu)
         state->session_flags & UB_ASYNC_LOAD_START_KERNEL_TASK;
 }
 
-bool ub_async_load_cpu_prepare_kernel_context(CPUState *cpu,
-                                        uint64_t context_cookie)
+bool ub_async_load_cpu_select_kernel_context(CPUState *cpu,
+                                       uint64_t context_cookie)
 {
     UbAsyncLoadDeviceState *state = ub_async_load_global;
     uint16_t slot;
@@ -1177,6 +1177,22 @@ bool ub_async_load_cpu_prepare_kernel_context(CPUState *cpu,
                 state->owner_generation, (uint16_t)cpu->cpu_index, slot);
             return true;
         }
+    }
+    return false;
+}
+
+bool ub_async_load_cpu_prepare_kernel_context(CPUState *cpu,
+                                        uint64_t context_cookie)
+{
+    UbAsyncLoadDeviceState *state = ub_async_load_global;
+    uint16_t slot;
+
+    if (ub_async_load_cpu_select_kernel_context(cpu, context_cookie)) {
+        return true;
+    }
+    if (!ub_async_load_cpu_kernel_task_mode(cpu) ||
+        cpu->cpu_index < 0 || cpu->cpu_index > UINT16_MAX) {
+        return false;
     }
     for (slot = 0; slot < state->logical_context_count; slot++) {
         if (!state->context_cookie_used[slot]) {

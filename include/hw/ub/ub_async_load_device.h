@@ -59,6 +59,8 @@ bool ub_async_load_cpu_address_is_remote(CPUState *cpu, uint64_t va,
                                   uint8_t bytes);
 bool ub_async_load_cpu_replay_expected(CPUState *cpu);
 bool ub_async_load_cpu_kernel_task_mode(CPUState *cpu);
+bool ub_async_load_cpu_select_kernel_context(CPUState *cpu,
+                                       uint64_t context_cookie);
 bool ub_async_load_cpu_prepare_kernel_context(CPUState *cpu,
                                         uint64_t context_cookie);
 bool ub_async_load_cpu_take_kernel_fault(CPUState *cpu,

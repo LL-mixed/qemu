@@ -227,6 +227,7 @@ uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
     uint32_t syndrome;
     uint8_t bytes = 1U << (memop & MO_SIZE);
     bool kernel_task = false;
+    bool kernel_context_selected = false;
     bool need_lock;
     uintptr_t retaddr = GETPC();
     uint64_t replay_value = 0;
@@ -237,12 +238,40 @@ uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
         arm_current_el(env) != 0) {
         return 0;
     }
+    kernel_task = ub_async_load_cpu_kernel_task_mode(cs);
+    if (kernel_task) {
+        need_lock = !qemu_mutex_iothread_locked();
+        if (need_lock) {
+            qemu_mutex_lock_iothread();
+        }
+        kernel_context_selected = ub_async_load_cpu_select_kernel_context(
+            cs, env->cp15.tpidr_el[0]);
+        if (need_lock) {
+            qemu_mutex_unlock_iothread();
+        }
+    }
     if (!ub_async_load_cpu_address_is_remote(cs, va, bytes)) {
-        if (ub_async_load_cpu_replay_expected(cs)) {
+        if ((!kernel_task || kernel_context_selected) &&
+            ub_async_load_cpu_replay_expected(cs)) {
             ub_async_load_cpu_fail_stop(cs);
             cpu_abort(cs, "OBMM replayed LDR no longer matches a remote map");
         }
         return 0;
+    }
+    if (kernel_task && !kernel_context_selected) {
+        need_lock = !qemu_mutex_iothread_locked();
+        if (need_lock) {
+            qemu_mutex_lock_iothread();
+        }
+        kernel_context_selected = ub_async_load_cpu_prepare_kernel_context(
+            cs, env->cp15.tpidr_el[0]);
+        if (need_lock) {
+            qemu_mutex_unlock_iothread();
+        }
+        if (!kernel_context_selected) {
+            ub_async_load_cpu_fail_stop(cs);
+            cpu_abort(cs, "OBMM kernel-task context selection failed");
+        }
     }
     async_load_probe_access_range(env, va, bytes, MMU_DATA_LOAD, mmu_index,
                                 retaddr);
@@ -261,13 +290,7 @@ uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
     if (need_lock) {
         qemu_mutex_lock_iothread();
     }
-    kernel_task = ub_async_load_cpu_kernel_task_mode(cs);
-    if (kernel_task && !ub_async_load_cpu_prepare_kernel_context(
-                           cs, load.context_cookie)) {
-        result = UB_ASYNC_LOAD_TRY_FAIL_STOP;
-    } else {
-        result = ub_async_load_cpu_remote_load(cs, &load, &replay_value);
-    }
+    result = ub_async_load_cpu_remote_load(cs, &load, &replay_value);
     if (result == UB_ASYNC_LOAD_TRY_PENDING) {
         if (kernel_task ?
             !ub_async_load_cpu_take_kernel_fault(cs, fault_pc) :
