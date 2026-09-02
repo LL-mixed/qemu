@@ -9831,6 +9831,16 @@ static void ub_bus_controller_init_ers_regions(UBDevice *dev)
         ers->storage = g_malloc0(ers->storage_size);
         memory_region_init_io(&ers->region, OBJECT(dev), &ub_ers_region_ops,
                               ers, ers_names[i], region_size);
+        /*
+         * ERS2 contains both queue doorbells and the event-cause registers.
+         * Raising a queue interrupt can make another vCPU clear the event
+         * cause while the initiating vCPU is still in a UBC MMIO callback.
+         * That access is part of the device protocol, so the generic device
+         * reentrancy guard must not turn it into MEMTX_ACCESS_ERROR.
+         */
+        if (i == 2) {
+            ers->region.disable_reentrancy_guard = true;
+        }
         ub_register_ers(dev, i, &ers->region);
 
         qemu_log("ubc ers%u initialized size=%#" PRIx64 "\n",
