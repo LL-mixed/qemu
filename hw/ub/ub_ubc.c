@@ -8098,6 +8098,10 @@ MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
     if (!ubc_dev || !data || !len || dcna == 0) {
         return MEMTX_DECODE_ERROR;
     }
+    if (dcna == ubc_dev->parent.cna) {
+        return ubc_dma_write_local_data_tid_strict(
+            ubc_dev, remote_uba, data, len, ubc_tid_or_auto(token_id));
+    }
     link = ubc_find_active_link(ubc_dev, &dcna);
     if (!link) {
         qemu_log("ubc sim_dec write: no active link\n");
@@ -8309,6 +8313,10 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
 
     if (!ubc_dev || !data || !len || dcna == 0) {
         return MEMTX_DECODE_ERROR;
+    }
+    if (dcna == ubc_dev->parent.cna) {
+        return ubc_dma_read_local_data_tid_strict(
+            ubc_dev, remote_uba, data, len, ubc_tid_or_auto(token_id));
     }
     link = ubc_find_active_link(ubc_dev, &dcna);
     if (!link) {
