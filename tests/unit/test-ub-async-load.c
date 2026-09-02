@@ -70,6 +70,7 @@ static void test_pending_and_complete_events(void)
     UbAsyncLoadPltToken token;
     UbAsyncLoadEvent event;
     uint64_t context_id = ub_async_load_context_id_make(9, 0, 2);
+    uint64_t value = 0;
     uint8_t payload[] = { 0x88, 0x77, 0x66, 0x55,
                           0x44, 0x33, 0x22, 0x11 };
 
@@ -79,7 +80,7 @@ static void test_pending_and_complete_events(void)
                         async_load, context_id, &load, &token),
                     ==, UB_ASYNC_LOAD_PENDING_ACCEPTED);
     g_assert_true(ub_async_load_event_pending(async_load));
-    g_assert_true(ub_async_load_event_pop(async_load, &event, false));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_PENDING);
     g_assert_cmpuint(event.context_id, ==, context_id);
     g_assert_cmphex(event.context_cookie, ==, load.context_cookie);
@@ -91,10 +92,18 @@ static void test_pending_and_complete_events(void)
                         async_load, token, UB_ASYNC_LOAD_STATUS_SUCCESS,
                         payload, sizeof(payload), 500),
                     ==, UB_ASYNC_LOAD_COMPLETION_ACCEPTED);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, false));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_COMPLETE);
     g_assert_cmphex(event.context_cookie, ==, load.context_cookie);
-    g_assert_cmphex(event.value, ==, 0x1122334455667788ULL);
+    g_assert_cmphex(event.value, ==, 0);
+    g_assert_cmpuint(event.flags & UB_ASYNC_LOAD_EVENT_FLAG_REPLAY_RETIRE,
+                     !=, 0);
+    g_assert_true(ub_async_load_replay_arm(
+        async_load, context_id, token, load.fault_pc));
+    g_assert_cmpint(ub_async_load_replay_consume_token(
+                        async_load, token, &load, &value),
+                    ==, UB_ASYNC_LOAD_REPLAY_CONSUMED);
+    g_assert_cmphex(value, ==, 0x1122334455667788ULL);
     g_assert_cmpuint(ub_async_load_pending_count(async_load), ==, 0);
     g_assert_cmpuint(ub_async_load_stats(async_load)->completion_events_delivered, ==, 1);
     g_assert_cmpuint(ub_async_load_stats(async_load)->context_saves, ==, 0);
@@ -124,17 +133,24 @@ static void test_scalar_value_matrix(void)
                 0x1000, 0, sizes[index], endian);
             UbAsyncLoadPltToken token;
             UbAsyncLoadEvent event;
+            uint64_t value = 0;
 
             g_assert_cmpint(ub_async_load_load_pending(
                                 async_load, 1, &load, &token),
                             ==, UB_ASYNC_LOAD_PENDING_ACCEPTED);
-            g_assert_true(ub_async_load_event_pop(async_load, &event, false));
+            g_assert_true(ub_async_load_event_pop(async_load, &event));
             g_assert_cmpint(ub_async_load_load_complete(
                                 async_load, token, UB_ASYNC_LOAD_STATUS_SUCCESS,
                                 payload, sizes[index], 200),
                             ==, UB_ASYNC_LOAD_COMPLETION_ACCEPTED);
-            g_assert_true(ub_async_load_event_pop(async_load, &event, false));
-            g_assert_cmphex(event.value, ==,
+            g_assert_true(ub_async_load_event_pop(async_load, &event));
+            g_assert_cmphex(event.value, ==, 0);
+            g_assert_true(ub_async_load_replay_arm(
+                async_load, 1, token, load.fault_pc));
+            g_assert_cmpint(ub_async_load_replay_consume_token(
+                                async_load, token, &load, &value),
+                            ==, UB_ASYNC_LOAD_REPLAY_CONSUMED);
+            g_assert_cmphex(value, ==,
                             endian ? big[index] : little[index]);
         }
     }
@@ -155,7 +171,7 @@ static void test_new_pending_precedes_queued_completion(void)
                         async_load, ub_async_load_context_id_make(9, 0, 1),
                         &first, &first_token),
                     ==, UB_ASYNC_LOAD_PENDING_ACCEPTED);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, false));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_PENDING);
     g_assert_cmpuint(event.sequence, ==, 1);
     g_assert_cmpint(ub_async_load_load_complete(
@@ -167,12 +183,12 @@ static void test_new_pending_precedes_queued_completion(void)
                         async_load, ub_async_load_context_id_make(9, 0, 2),
                         &second, &second_token),
                     ==, UB_ASYNC_LOAD_PENDING_ACCEPTED);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, false));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_PENDING);
     g_assert_cmpuint(event.context_id, ==,
                      ub_async_load_context_id_make(9, 0, 2));
     g_assert_cmpuint(event.sequence, ==, 2);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, false));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_COMPLETE);
     g_assert_cmpuint(event.context_id, ==,
                      ub_async_load_context_id_make(9, 0, 1));
@@ -182,7 +198,7 @@ static void test_new_pending_precedes_queued_completion(void)
                         async_load, second_token, UB_ASYNC_LOAD_STATUS_SUCCESS,
                         payload, sizeof(payload), 600),
                     ==, UB_ASYNC_LOAD_COMPLETION_ACCEPTED);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, false));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_COMPLETE);
     g_assert_cmpuint(event.sequence, ==, 4);
     g_assert_false(ub_async_load_event_pending(async_load));
@@ -197,14 +213,18 @@ static void test_fault_and_stale_completion(void)
 
     g_assert_cmpint(ub_async_load_load_pending(async_load, 1, &load, &token),
                     ==, UB_ASYNC_LOAD_PENDING_ACCEPTED);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, false));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(ub_async_load_load_complete(
                         async_load, token, UB_ASYNC_LOAD_STATUS_TIMEOUT,
                         NULL, 0, 200),
                     ==, UB_ASYNC_LOAD_COMPLETION_ACCEPTED);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, false));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_FAULT);
     g_assert_cmpint(event.status, ==, UB_ASYNC_LOAD_STATUS_TIMEOUT);
+    g_assert_cmpuint(event.flags & UB_ASYNC_LOAD_EVENT_FLAG_REPLAY_RETIRE,
+                     ==, 0);
+    g_assert_cmphex(event.value, ==, 0);
+    g_assert_cmpuint(ub_async_load_pending_count(async_load), ==, 0);
     g_assert_cmpint(ub_async_load_load_complete(
                         async_load, token, UB_ASYNC_LOAD_STATUS_SUCCESS,
                         NULL, 0, 201),
@@ -227,19 +247,21 @@ static void test_replay_retains_and_consumes_completion_once(void)
     g_assert_cmpint(ub_async_load_load_pending(
                         async_load, context_id, &load, &token),
                     ==, UB_ASYNC_LOAD_PENDING_ACCEPTED);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, true));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(ub_async_load_load_complete(
                         async_load, token, UB_ASYNC_LOAD_STATUS_SUCCESS,
                         payload, sizeof(payload), 500),
                     ==, UB_ASYNC_LOAD_COMPLETION_ACCEPTED);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, true));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_COMPLETE);
     g_assert_cmpuint(event.flags & UB_ASYNC_LOAD_EVENT_FLAG_REPLAY_RETIRE,
                      !=, 0);
     g_assert_true(ub_async_load_replay_expected(async_load, context_id));
     g_assert_cmpuint(ub_async_load_pending_count(async_load), ==, 1);
-    g_assert_cmpint(ub_async_load_replay_consume(
-                        async_load, context_id, &load, &value),
+    g_assert_true(ub_async_load_replay_arm(
+        async_load, context_id, token, load.fault_pc));
+    g_assert_cmpint(ub_async_load_replay_consume_token(
+                        async_load, token, &load, &value),
                     ==, UB_ASYNC_LOAD_REPLAY_CONSUMED);
     g_assert_cmphex(value, ==, 0x1122334455667788ULL);
     g_assert_false(ub_async_load_replay_expected(async_load, context_id));
@@ -248,8 +270,8 @@ static void test_replay_retains_and_consumes_completion_once(void)
     g_assert_cmpuint(ub_async_load_stats(async_load)->replay_mismatch, ==, 0);
     g_assert_cmpuint(ub_async_load_stats(async_load)->replay_ready_high_water,
                      ==, 1);
-    g_assert_cmpint(ub_async_load_replay_consume(
-                        async_load, context_id, &load, &value),
+    g_assert_cmpint(ub_async_load_replay_consume_token(
+                        async_load, token, &load, &value),
                     ==, UB_ASYNC_LOAD_REPLAY_NONE);
 }
 
@@ -267,20 +289,66 @@ static void test_replay_mismatch_fails_closed(void)
     g_assert_cmpint(ub_async_load_load_pending(
                         async_load, context_id, &load, &token),
                     ==, UB_ASYNC_LOAD_PENDING_ACCEPTED);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, true));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
     g_assert_cmpint(ub_async_load_load_complete(
                         async_load, token, UB_ASYNC_LOAD_STATUS_SUCCESS,
                         payload, sizeof(payload), 500),
                     ==, UB_ASYNC_LOAD_COMPLETION_ACCEPTED);
-    g_assert_true(ub_async_load_event_pop(async_load, &event, true));
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
+    g_assert_true(ub_async_load_replay_arm(
+        async_load, context_id, token, load.fault_pc));
     mismatch.effective_va += 8;
     mismatch.remote_offset += 8;
-    g_assert_cmpint(ub_async_load_replay_consume(
-                        async_load, context_id, &mismatch, &value),
+    g_assert_cmpint(ub_async_load_replay_consume_token(
+                        async_load, token, &mismatch, &value),
                     ==, UB_ASYNC_LOAD_REPLAY_MISMATCH);
     g_assert_true(ub_async_load_fail_stop(async_load));
     g_assert_cmpuint(ub_async_load_stats(async_load)->replay_consumed, ==, 0);
     g_assert_cmpuint(ub_async_load_stats(async_load)->replay_mismatch, ==, 1);
+}
+
+static void test_replay_arm_requires_exact_identity(void)
+{
+    g_autoptr(UbAsyncLoad) async_load = ub_async_load_new(
+        1, 9, &default_config);
+    UbAsyncLoadDesc load = test_load(0x1000, 3, 8, false);
+    UbAsyncLoadPltToken token;
+    UbAsyncLoadPltToken stale_token;
+    UbAsyncLoadEvent event;
+    uint64_t context_id = ub_async_load_context_id_make(9, 0, 2);
+    uint64_t value = 0;
+    uint8_t payload[8] = { 0x5a };
+
+    g_assert_cmpint(ub_async_load_load_pending(
+                        async_load, context_id, &load, &token),
+                    ==, UB_ASYNC_LOAD_PENDING_ACCEPTED);
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
+    g_assert_cmpint(ub_async_load_load_complete(
+                        async_load, token, UB_ASYNC_LOAD_STATUS_SUCCESS,
+                        payload, sizeof(payload), 500),
+                    ==, UB_ASYNC_LOAD_COMPLETION_ACCEPTED);
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
+
+    stale_token = token;
+    stale_token.generation++;
+    g_assert_false(ub_async_load_replay_arm(
+        async_load, context_id, stale_token, load.fault_pc));
+    g_assert_false(ub_async_load_replay_arm(
+        async_load, context_id + 1, token, load.fault_pc));
+    g_assert_false(ub_async_load_replay_arm(
+        async_load, context_id, token, load.fault_pc + 4));
+    g_assert_true(ub_async_load_replay_arm(
+        async_load, context_id, token, load.fault_pc));
+    g_assert_false(ub_async_load_replay_arm(
+        async_load, context_id, token, load.fault_pc));
+    g_assert_cmpint(ub_async_load_replay_consume_token(
+                        async_load, stale_token, &load, &value),
+                    ==, UB_ASYNC_LOAD_REPLAY_NONE);
+    g_assert_cmpint(ub_async_load_replay_consume_token(
+                        async_load, token, &load, &value),
+                    ==, UB_ASYNC_LOAD_REPLAY_CONSUMED);
+    g_assert_cmphex(value, ==, 0x5a);
+    g_assert_cmpuint(ub_async_load_stats(async_load)->replay_mismatch, ==, 4);
 }
 
 static void test_capacity_and_fail_stop(void)
@@ -323,6 +391,8 @@ int main(int argc, char **argv)
                     test_replay_retains_and_consumes_completion_once);
     g_test_add_func("/ub/async_load/replay-mismatch",
                     test_replay_mismatch_fails_closed);
+    g_test_add_func("/ub/async_load/replay-arm-identity",
+                    test_replay_arm_requires_exact_identity);
     g_test_add_func("/ub/async_load/capacity-fail-stop",
                     test_capacity_and_fail_stop);
     return g_test_run();

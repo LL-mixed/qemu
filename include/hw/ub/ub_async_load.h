@@ -23,6 +23,7 @@ typedef enum UbAsyncLoadPltState {
     UB_ASYNC_LOAD_PLT_COMPLETE,
     UB_ASYNC_LOAD_PLT_REPLAY_READY,
     UB_ASYNC_LOAD_PLT_FAULTED,
+    UB_ASYNC_LOAD_PLT_REPLAY_ARMED,
 } UbAsyncLoadPltState;
 
 typedef enum UbAsyncLoadEventKind {
@@ -149,14 +150,15 @@ UbAsyncLoadCompletionResult ub_async_load_load_complete(
     UbAsyncLoad *async_load, UbAsyncLoadPltToken plt_token, UbAsyncLoadStatus status,
     const void *payload, uint8_t bytes_done, uint64_t complete_cycle);
 
-bool ub_async_load_event_pop(UbAsyncLoad *async_load, UbAsyncLoadEvent *event,
-                        bool replay_retire);
+bool ub_async_load_event_pop(UbAsyncLoad *async_load, UbAsyncLoadEvent *event);
 bool ub_async_load_event_pending(const UbAsyncLoad *async_load);
 bool ub_async_load_replay_expected(const UbAsyncLoad *async_load,
                               uint64_t context_id);
-UbAsyncLoadReplayResult ub_async_load_replay_consume(
-    UbAsyncLoad *async_load, uint64_t context_id, const UbAsyncLoadDesc *load,
-    uint64_t *value);
+bool ub_async_load_replay_arm(UbAsyncLoad *async_load, uint64_t context_id,
+                        UbAsyncLoadPltToken token, uint64_t fault_pc);
+UbAsyncLoadReplayResult ub_async_load_replay_consume_token(
+    UbAsyncLoad *async_load, UbAsyncLoadPltToken token,
+    const UbAsyncLoadDesc *load, uint64_t *value);
 void ub_async_load_record_direct_upcall(UbAsyncLoad *async_load);
 void ub_async_load_mark_fail_stop(UbAsyncLoad *async_load);
 bool ub_async_load_fail_stop(const UbAsyncLoad *async_load);

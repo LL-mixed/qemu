@@ -7,7 +7,12 @@
 
 #define ASYNC_LOAD_MAX_CLOCK_MHZ 100000U
 
-typedef struct UbAsyncLoadPltEntry {
+/*
+ * Requester-side Normal Non-cacheable Pending Load Table entry.  It retains
+ * the first remote response until the faulting LDR replays with an explicit
+ * token.  Scheduler and architectural context state stay in guest software.
+ */
+typedef struct UbAsyncLoadNcPltEntry {
     uint32_t generation;
     UbAsyncLoadPltState state;
     uint64_t context_id;
@@ -16,13 +21,13 @@ typedef struct UbAsyncLoadPltEntry {
     uint64_t complete_cycle;
     uint8_t bytes_done;
     uint8_t payload[8];
-} UbAsyncLoadPltEntry;
+} UbAsyncLoadNcPltEntry;
 
 struct UbAsyncLoad {
     uint16_t owner_id;
     uint32_t owner_generation;
     UbAsyncLoadConfig config;
-    UbAsyncLoadPltEntry plt[UB_ASYNC_LOAD_MAX_PENDING_LOADS];
+    UbAsyncLoadNcPltEntry nc_plt[UB_ASYNC_LOAD_MAX_PENDING_LOADS];
     UbAsyncLoadEvent events[UB_ASYNC_LOAD_MAX_EVENTS];
     uint16_t event_head;
     uint16_t event_tail;
@@ -127,7 +132,7 @@ UbAsyncLoad *ub_async_load_new(uint16_t owner_id, uint32_t owner_generation,
     async_load->config = *config;
     async_load->next_event_sequence = 1;
     for (slot = 0; slot < config->pending_load_entries; slot++) {
-        async_load->plt[slot].generation = 1;
+        async_load->nc_plt[slot].generation = 1;
     }
     return async_load;
 }
@@ -141,22 +146,22 @@ static UbAsyncLoadPltToken ub_async_load_plt_token(const UbAsyncLoad *async_load
                                           uint16_t slot)
 {
     return (UbAsyncLoadPltToken) {
-        .generation = async_load->plt[slot].generation,
+        .generation = async_load->nc_plt[slot].generation,
         .owner_id = async_load->owner_id,
         .slot = slot,
     };
 }
 
-static UbAsyncLoadPltEntry *ub_async_load_find_plt(UbAsyncLoad *async_load,
+static UbAsyncLoadNcPltEntry *ub_async_load_find_plt(UbAsyncLoad *async_load,
                                           UbAsyncLoadPltToken token)
 {
-    UbAsyncLoadPltEntry *entry;
+    UbAsyncLoadNcPltEntry *entry;
 
     if (!async_load || token.owner_id != async_load->owner_id ||
         token.slot >= async_load->config.pending_load_entries) {
         return NULL;
     }
-    entry = &async_load->plt[token.slot];
+    entry = &async_load->nc_plt[token.slot];
     if (entry->state == UB_ASYNC_LOAD_PLT_FREE ||
         entry->generation != token.generation) {
         return NULL;
@@ -165,7 +170,7 @@ static UbAsyncLoadPltEntry *ub_async_load_find_plt(UbAsyncLoad *async_load,
 }
 
 static bool ub_async_load_event_push(UbAsyncLoad *async_load, UbAsyncLoadEventKind kind,
-                                const UbAsyncLoadPltEntry *entry,
+                                const UbAsyncLoadNcPltEntry *entry,
                                 UbAsyncLoadPltToken token,
                                 UbAsyncLoadStatus status,
                                 uint64_t value, uint64_t guest_cycle)
@@ -209,7 +214,8 @@ static bool ub_async_load_event_push(UbAsyncLoad *async_load, UbAsyncLoadEventKi
     return true;
 }
 
-static void ub_async_load_recycle_plt(UbAsyncLoad *async_load, UbAsyncLoadPltEntry *entry)
+static void ub_async_load_recycle_plt(UbAsyncLoad *async_load,
+                                UbAsyncLoadNcPltEntry *entry)
 {
     uint32_t generation = ub_async_load_next_generation(entry->generation);
 
@@ -218,7 +224,7 @@ static void ub_async_load_recycle_plt(UbAsyncLoad *async_load, UbAsyncLoadPltEnt
     async_load->pending_count--;
 }
 
-static uint64_t ub_async_load_load_value(const UbAsyncLoadPltEntry *entry)
+static uint64_t ub_async_load_load_value(const UbAsyncLoadNcPltEntry *entry)
 {
     uint64_t value = 0;
     uint8_t index;
@@ -247,7 +253,7 @@ UbAsyncLoadPendingResult ub_async_load_load_pending(
     UbAsyncLoad *async_load, uint64_t context_id, const UbAsyncLoadDesc *load,
     UbAsyncLoadPltToken *plt_token)
 {
-    UbAsyncLoadPltEntry *entry = NULL;
+    UbAsyncLoadNcPltEntry *entry = NULL;
     uint16_t slot;
 
     if (!async_load || !context_id || !plt_token ||
@@ -260,8 +266,8 @@ UbAsyncLoadPendingResult ub_async_load_load_pending(
         return UB_ASYNC_LOAD_PENDING_SYNC_STALL;
     }
     for (slot = 0; slot < async_load->config.pending_load_entries; slot++) {
-        if (async_load->plt[slot].state == UB_ASYNC_LOAD_PLT_FREE) {
-            entry = &async_load->plt[slot];
+        if (async_load->nc_plt[slot].state == UB_ASYNC_LOAD_PLT_FREE) {
+            entry = &async_load->nc_plt[slot];
             break;
         }
     }
@@ -287,7 +293,7 @@ UbAsyncLoadCompletionResult ub_async_load_load_complete(
     UbAsyncLoad *async_load, UbAsyncLoadPltToken plt_token, UbAsyncLoadStatus status,
     const void *payload, uint8_t bytes_done, uint64_t complete_cycle)
 {
-    UbAsyncLoadPltEntry *entry = ub_async_load_find_plt(async_load, plt_token);
+    UbAsyncLoadNcPltEntry *entry = ub_async_load_find_plt(async_load, plt_token);
     uint64_t value = 0;
 
     if (!entry) {
@@ -324,10 +330,11 @@ UbAsyncLoadCompletionResult ub_async_load_load_complete(
     return UB_ASYNC_LOAD_COMPLETION_ACCEPTED;
 }
 
-bool ub_async_load_event_pop(UbAsyncLoad *async_load, UbAsyncLoadEvent *event,
-                        bool replay_retire)
+bool ub_async_load_event_pop(UbAsyncLoad *async_load, UbAsyncLoadEvent *event)
 {
-    UbAsyncLoadPltEntry *entry;
+    UbAsyncLoadNcPltEntry *entry;
+    uint16_t slot;
+    uint16_t replay_ready = 0;
 
     if (!async_load || !event || !async_load->event_count) {
         return false;
@@ -351,24 +358,22 @@ bool ub_async_load_event_pop(UbAsyncLoad *async_load, UbAsyncLoadEvent *event,
         }
         if (event->kind == UB_ASYNC_LOAD_EVENT_COMPLETE) {
             async_load->stats.completion_events_delivered++;
-            if (replay_retire) {
-                uint16_t slot;
-                uint16_t replay_ready = 0;
-
-                entry->state = UB_ASYNC_LOAD_PLT_REPLAY_READY;
-                event->flags |= UB_ASYNC_LOAD_EVENT_FLAG_REPLAY_RETIRE;
-                for (slot = 0;
-                     slot < async_load->config.pending_load_entries; slot++) {
-                    replay_ready +=
-                        async_load->plt[slot].state ==
-                        UB_ASYNC_LOAD_PLT_REPLAY_READY;
-                }
-                async_load->stats.replay_ready_high_water = MAX(
-                    async_load->stats.replay_ready_high_water, replay_ready);
-                return true;
-            }
+            entry->state = UB_ASYNC_LOAD_PLT_REPLAY_READY;
+        } else {
+            ub_async_load_recycle_plt(async_load, entry);
+            event->value = 0;
+            return true;
         }
-        ub_async_load_recycle_plt(async_load, entry);
+        event->flags |= UB_ASYNC_LOAD_EVENT_FLAG_REPLAY_RETIRE;
+        /* The architectural value and terminal status stay in the NC PLT. */
+        event->value = 0;
+        for (slot = 0;
+             slot < async_load->config.pending_load_entries; slot++) {
+            replay_ready += async_load->nc_plt[slot].state ==
+                UB_ASYNC_LOAD_PLT_REPLAY_READY;
+        }
+        async_load->stats.replay_ready_high_water = MAX(
+            async_load->stats.replay_ready_high_water, replay_ready);
     }
     return true;
 }
@@ -387,9 +392,10 @@ bool ub_async_load_replay_expected(const UbAsyncLoad *async_load,
         return false;
     }
     for (slot = 0; slot < async_load->config.pending_load_entries; slot++) {
-        const UbAsyncLoadPltEntry *entry = &async_load->plt[slot];
+        const UbAsyncLoadNcPltEntry *entry = &async_load->nc_plt[slot];
 
-        if (entry->state == UB_ASYNC_LOAD_PLT_REPLAY_READY &&
+        if ((entry->state == UB_ASYNC_LOAD_PLT_REPLAY_READY ||
+             entry->state == UB_ASYNC_LOAD_PLT_REPLAY_ARMED) &&
             entry->context_id == context_id) {
             return true;
         }
@@ -413,39 +419,46 @@ static bool ub_async_load_replay_load_matches(
         expected->big_endian == actual->big_endian;
 }
 
-UbAsyncLoadReplayResult ub_async_load_replay_consume(
-    UbAsyncLoad *async_load, uint64_t context_id, const UbAsyncLoadDesc *load,
-    uint64_t *value)
+bool ub_async_load_replay_arm(UbAsyncLoad *async_load, uint64_t context_id,
+                        UbAsyncLoadPltToken token, uint64_t fault_pc)
 {
-    UbAsyncLoadPltEntry *entry = NULL;
-    uint16_t slot;
+    UbAsyncLoadNcPltEntry *entry = ub_async_load_find_plt(async_load, token);
 
-    if (!async_load || !context_id || !load || !value || async_load->fail_stop) {
-        return UB_ASYNC_LOAD_REPLAY_NONE;
-    }
-    for (slot = 0; slot < async_load->config.pending_load_entries; slot++) {
-        if (async_load->plt[slot].state == UB_ASYNC_LOAD_PLT_REPLAY_READY &&
-            async_load->plt[slot].context_id == context_id) {
-            if (entry) {
-                async_load->stats.replay_mismatch++;
-                async_load->fail_stop = true;
-                return UB_ASYNC_LOAD_REPLAY_MISMATCH;
-            }
-            entry = &async_load->plt[slot];
+    if (!entry || !context_id || !fault_pc || async_load->fail_stop ||
+        entry->state != UB_ASYNC_LOAD_PLT_REPLAY_READY ||
+        entry->context_id != context_id || entry->load.fault_pc != fault_pc) {
+        if (async_load) {
+            async_load->stats.replay_mismatch++;
         }
+        return false;
     }
-    if (!entry) {
+    entry->state = UB_ASYNC_LOAD_PLT_REPLAY_ARMED;
+    return true;
+}
+
+UbAsyncLoadReplayResult ub_async_load_replay_consume_token(
+    UbAsyncLoad *async_load, UbAsyncLoadPltToken token,
+    const UbAsyncLoadDesc *load, uint64_t *value)
+{
+    UbAsyncLoadNcPltEntry *entry = ub_async_load_find_plt(async_load, token);
+    UbAsyncLoadReplayResult result;
+
+    if (!async_load || !load || !value ||
+        async_load->fail_stop || !entry) {
         return UB_ASYNC_LOAD_REPLAY_NONE;
     }
-    if (!ub_async_load_replay_load_matches(&entry->load, load)) {
+    if (entry->state != UB_ASYNC_LOAD_PLT_REPLAY_ARMED ||
+        !ub_async_load_replay_load_matches(&entry->load, load)) {
         async_load->stats.replay_mismatch++;
         async_load->fail_stop = true;
         return UB_ASYNC_LOAD_REPLAY_MISMATCH;
     }
+    g_assert(entry->status == UB_ASYNC_LOAD_STATUS_SUCCESS);
     *value = ub_async_load_load_value(entry);
     async_load->stats.replay_consumed++;
+    result = UB_ASYNC_LOAD_REPLAY_CONSUMED;
     ub_async_load_recycle_plt(async_load, entry);
-    return UB_ASYNC_LOAD_REPLAY_CONSUMED;
+    return result;
 }
 
 void ub_async_load_record_direct_upcall(UbAsyncLoad *async_load)

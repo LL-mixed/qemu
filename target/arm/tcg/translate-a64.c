@@ -27,10 +27,6 @@
 #include "semihosting/semihost.h"
 #include "cpregs.h"
 
-#define UB_ASYNC_LOAD_RESUME_IMM 0x5343
-#define UB_ASYNC_LOAD_WAIT_IMM 0x5344
-#define UB_ASYNC_LOAD_SCHEDULER_ENTER_IMM 0x5345
-
 static TCGv_i64 cpu_X[32];
 static TCGv_i64 cpu_pc;
 
@@ -2426,21 +2422,7 @@ static bool trans_HLT(DisasContext *s, arg_i *a)
      * it is required for halting debug disabled: it will UNDEF.
      * Secondly, "HLT 0xf000" is the A64 semihosting syscall instruction.
      */
-    if (s->async_load_active && s->current_el == 0 &&
-        a->imm == UB_ASYNC_LOAD_RESUME_IMM) {
-        gen_helper_async_load_resume(tcg_env, cpu_reg(s, 0));
-        s->base.is_jmp = DISAS_NORETURN;
-    } else if (s->async_load_active && s->current_el == 0 &&
-               a->imm == UB_ASYNC_LOAD_WAIT_IMM) {
-        gen_a64_update_pc(s, 4);
-        gen_helper_async_load_wait(tcg_env);
-        s->base.is_jmp = DISAS_NORETURN;
-    } else if (s->async_load_active && s->current_el == 0 &&
-               a->imm == UB_ASYNC_LOAD_SCHEDULER_ENTER_IMM) {
-        gen_a64_update_pc(s, 4);
-        gen_helper_async_load_scheduler_enter(tcg_env);
-        s->base.is_jmp = DISAS_NORETURN;
-    } else if (semihosting_enabled(s->current_el == 0) &&
+    if (semihosting_enabled(s->current_el == 0) &&
                a->imm == 0xf000) {
         gen_exception_internal_insn(s, EXCP_SEMIHOST);
     } else {

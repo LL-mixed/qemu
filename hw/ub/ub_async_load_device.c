@@ -42,13 +42,16 @@
 #define ASYNC_LOAD_REG_EVENT_PRODUCER_SEQUENCE 0x160
 #define ASYNC_LOAD_REG_EVENT_CONSUMER_SEQUENCE 0x168
 #define ASYNC_LOAD_REG_EVENT_RING_PUBLISHED 0x170
-#define ASYNC_LOAD_REG_EVENT_WAIT_HALTS 0x178
 #define ASYNC_LOAD_REG_EVENT_WAIT_WAKEUPS 0x180
 #define ASYNC_LOAD_REG_SCHEDULER_ENTERS 0x188
 #define ASYNC_LOAD_REG_SESSION_FLAGS 0x190
 #define ASYNC_LOAD_REG_CAPABILITIES 0x198
 #define ASYNC_LOAD_REG_IRQ_STATUS 0x1a0
 #define ASYNC_LOAD_REG_IRQ_ACK 0x1a8
+#define ASYNC_LOAD_REG_REPLAY_CONTEXT_ID 0x1b0
+#define ASYNC_LOAD_REG_REPLAY_TOKEN 0x1b8
+#define ASYNC_LOAD_REG_REPLAY_PC 0x1c0
+#define ASYNC_LOAD_REG_REPLAY_COMMAND 0x1c8
 #define ASYNC_LOAD_REG_STATS_BASE 0x200
 #define ASYNC_LOAD_REG_REPLAY_STATS_BASE 0x400
 
@@ -151,7 +154,6 @@ struct UbAsyncLoadDeviceState {
     bool enabled;
     bool session_active;
     bool upcall_active;
-    bool scheduler_waiting;
     uint64_t last_error;
     uint64_t map_gsva_base;
     uint64_t map_local_pa;
@@ -172,10 +174,14 @@ struct UbAsyncLoadDeviceState {
     uint64_t event_producer_sequence;
     uint64_t event_consumer_sequence;
     uint64_t event_ring_published;
-    uint64_t event_wait_halts;
     uint64_t event_wait_wakeups;
     uint64_t scheduler_enters;
     uint64_t irq_status;
+    uint64_t replay_context_id;
+    uint64_t replay_token;
+    uint64_t replay_pc;
+    bool replay_armed;
+    UbAsyncLoadPltToken armed_replay_token;
     uint16_t logical_context_count;
     uint64_t context_next_ordinal[UB_ASYNC_LOAD_MAX_CONTEXTS];
     uint64_t context_cookies[UB_ASYNC_LOAD_MAX_CONTEXTS];
@@ -256,7 +262,8 @@ static bool ub_async_load_ring_sync_consumer(UbAsyncLoadDeviceState *state)
     }
     owner_generation = le64_to_cpu(consumer.owner_generation);
     sequence = le64_to_cpu(consumer.consumer_sequence);
-    if (le32_to_cpu(consumer.abi_version) != UB_ASYNC_LOAD_ABI_VERSION ||
+    if (le32_to_cpu(consumer.abi_version) !=
+            UB_ASYNC_LOAD_EVENT_ABI_VERSION ||
         le32_to_cpu(consumer.flags) ||
         owner_generation != state->owner_generation ||
         sequence < state->event_consumer_sequence ||
@@ -271,7 +278,7 @@ static bool ub_async_load_ring_sync_consumer(UbAsyncLoadDeviceState *state)
 static bool ub_async_load_ring_start(UbAsyncLoadDeviceState *state)
 {
     UbAsyncLoadEventProducerV3 producer = {
-        .abi_version = cpu_to_le32(UB_ASYNC_LOAD_ABI_VERSION),
+        .abi_version = cpu_to_le32(UB_ASYNC_LOAD_EVENT_ABI_VERSION),
         .event_depth = cpu_to_le16(state->config.event_queue_depth),
         .event_slot_bytes = cpu_to_le16(ASYNC_LOAD_EVENT_SLOT_BYTES),
         .owner_generation = cpu_to_le64(state->owner_generation),
@@ -287,7 +294,6 @@ static bool ub_async_load_ring_start(UbAsyncLoadDeviceState *state)
     state->event_producer_sequence = 0;
     state->event_consumer_sequence = 0;
     state->event_ring_published = 0;
-    state->event_wait_halts = 0;
     state->event_wait_wakeups = 0;
     state->scheduler_enters = 0;
     return ub_async_load_ring_sync_consumer(state);
@@ -357,9 +363,7 @@ static bool ub_async_load_ring_publish_one(UbAsyncLoadDeviceState *state,
         ub_async_load_ring_fail_stop(state, UB_ASYNC_LOAD_ERROR_BUSY);
         return false;
     }
-    if (!ub_async_load_event_pop(
-            state->model, &event,
-            state->session_flags & UB_ASYNC_LOAD_START_REPLAY_RETIRE) ||
+    if (!ub_async_load_event_pop(state->model, &event) ||
         event.sequence != state->event_producer_sequence + 1) {
         ub_async_load_ring_fail_stop(state, UB_ASYNC_LOAD_ERROR_STALE);
         return false;
@@ -396,6 +400,15 @@ static uint64_t ub_async_load_plt_token_pack(UbAsyncLoadPltToken token)
 {
     return (uint64_t)token.generation << 32 |
         (uint64_t)token.owner_id << 16 | token.slot;
+}
+
+static UbAsyncLoadPltToken ub_async_load_plt_token_unpack(uint64_t token)
+{
+    return (UbAsyncLoadPltToken) {
+        .generation = token >> 32,
+        .owner_id = token >> 16,
+        .slot = token,
+    };
 }
 
 static UbAsyncLoadStatus ub_async_load_status_from_backend(
@@ -574,7 +587,6 @@ static bool ub_async_load_reset(UbAsyncLoadDeviceState *state)
     memset(state->context_cookie_used, 0,
            sizeof(state->context_cookie_used));
     state->upcall_active = false;
-    state->scheduler_waiting = false;
     state->active_context_id = 0;
     state->logical_context_count = 0;
     state->upcall_entry = 0;
@@ -586,10 +598,15 @@ static bool ub_async_load_reset(UbAsyncLoadDeviceState *state)
     state->event_producer_sequence = 0;
     state->event_consumer_sequence = 0;
     state->event_ring_published = 0;
-    state->event_wait_halts = 0;
     state->event_wait_wakeups = 0;
     state->scheduler_enters = 0;
     state->irq_status = 0;
+    state->replay_context_id = 0;
+    state->replay_token = 0;
+    state->replay_pc = 0;
+    state->replay_armed = false;
+    memset(&state->armed_replay_token, 0,
+           sizeof(state->armed_replay_token));
     state->load_timeout_ns = 0;
     state->owner_ttbr0 = 0;
     state->last_error = 0;
@@ -812,10 +829,22 @@ uint64_t ub_async_load_device_read(UbAsyncLoadDeviceState *state, hwaddr reg,
             UB_ASYNC_LOAD_CAP_KERNEL_FREE_EVENT_RING |
             UB_ASYNC_LOAD_CAP_EL0_WAIT_WAKE |
             UB_ASYNC_LOAD_CAP_EL0_SCHEDULER_ENTER |
-            UB_ASYNC_LOAD_CAP_KERNEL_TASK_REPLAY;
+            UB_ASYNC_LOAD_CAP_KERNEL_TASK_REPLAY |
+            UB_ASYNC_LOAD_CAP_NC_REPLAY_TOKEN |
+            UB_ASYNC_LOAD_CAP_SVC_CONTEXT_RESUME |
+            UB_ASYNC_LOAD_CAP_WFE_WAIT;
         break;
     case ASYNC_LOAD_REG_IRQ_STATUS:
         value = state->irq_status;
+        break;
+    case ASYNC_LOAD_REG_REPLAY_CONTEXT_ID:
+        value = state->replay_context_id;
+        break;
+    case ASYNC_LOAD_REG_REPLAY_TOKEN:
+        value = state->replay_token;
+        break;
+    case ASYNC_LOAD_REG_REPLAY_PC:
+        value = state->replay_pc;
         break;
     case ASYNC_LOAD_REG_ACTIVE_CONTEXT_ID:
         value = state->active_context_id;
@@ -843,9 +872,6 @@ uint64_t ub_async_load_device_read(UbAsyncLoadDeviceState *state, hwaddr reg,
         break;
     case ASYNC_LOAD_REG_EVENT_RING_PUBLISHED:
         value = state->event_ring_published;
-        break;
-    case ASYNC_LOAD_REG_EVENT_WAIT_HALTS:
-        value = state->event_wait_halts;
         break;
     case ASYNC_LOAD_REG_EVENT_WAIT_WAKEUPS:
         value = state->event_wait_wakeups;
@@ -928,7 +954,6 @@ static void ub_async_load_session_command(UbAsyncLoadDeviceState *state,
         state->session_active = true;
         state->active_context_id = 0;
         state->upcall_active = false;
-        state->scheduler_waiting = false;
         if (!ub_async_load_ring_start(state)) {
             state->session_active = false;
             state->home_cpu = NULL;
@@ -941,7 +966,6 @@ static void ub_async_load_session_command(UbAsyncLoadDeviceState *state,
             arm_async_load_set_active(state->home_cpu, false);
         }
         state->session_active = false;
-        state->scheduler_waiting = false;
         state->home_cpu = NULL;
         if (!ub_async_load_reset(state)) {
             state->last_error = UB_ASYNC_LOAD_ERROR_REMOTE;
@@ -949,6 +973,36 @@ static void ub_async_load_session_command(UbAsyncLoadDeviceState *state,
     } else {
         state->last_error = UB_ASYNC_LOAD_ERROR_INVALID;
     }
+}
+
+static void ub_async_load_replay_command(UbAsyncLoadDeviceState *state,
+                                  uint64_t command)
+{
+    bool accepted = false;
+
+    state->last_error = UB_ASYNC_LOAD_ERROR_NONE;
+    if (!state->session_active || !current_cpu ||
+        state->home_cpu != current_cpu) {
+        state->last_error = UB_ASYNC_LOAD_ERROR_CPU;
+        goto out;
+    }
+    if (command == 1) {
+        accepted = ub_async_load_cpu_resume(
+            current_cpu, state->replay_context_id,
+            state->replay_token, state->replay_pc);
+    } else if (command == 2) {
+        accepted = ub_async_load_cpu_scheduler_enter(current_cpu);
+    }
+    if (!accepted) {
+        state->last_error = command == 1 || command == 2 ?
+            UB_ASYNC_LOAD_ERROR_CPU : UB_ASYNC_LOAD_ERROR_INVALID;
+        ub_async_load_mark_fail_stop(state->model);
+    }
+
+out:
+    state->replay_context_id = 0;
+    state->replay_token = 0;
+    state->replay_pc = 0;
 }
 
 bool ub_async_load_device_write(UbAsyncLoadDeviceState *state, hwaddr reg,
@@ -1027,8 +1081,7 @@ bool ub_async_load_device_write(UbAsyncLoadDeviceState *state, hwaddr reg,
         if (state->session_active ||
             value & ~(UB_ASYNC_LOAD_START_REPLAY_RETIRE |
                       UB_ASYNC_LOAD_START_KERNEL_TASK) ||
-            (value & UB_ASYNC_LOAD_START_KERNEL_TASK &&
-             !(value & UB_ASYNC_LOAD_START_REPLAY_RETIRE))) {
+            !(value & UB_ASYNC_LOAD_START_REPLAY_RETIRE)) {
             state->last_error = UB_ASYNC_LOAD_ERROR_INVALID;
         } else {
             state->session_flags = value;
@@ -1045,6 +1098,21 @@ bool ub_async_load_device_write(UbAsyncLoadDeviceState *state, hwaddr reg,
             state->irq_status |= ASYNC_LOAD_IRQ_COMPLETION;
         }
         ubc_async_load_irq_set(state->ubc_dev, state->irq_status != 0);
+        return true;
+    case ASYNC_LOAD_REG_REPLAY_CONTEXT_ID:
+        state->replay_context_id = ub_async_load_access_merge(
+            state->replay_context_id, reg, value, size);
+        return true;
+    case ASYNC_LOAD_REG_REPLAY_TOKEN:
+        state->replay_token = ub_async_load_access_merge(
+            state->replay_token, reg, value, size);
+        return true;
+    case ASYNC_LOAD_REG_REPLAY_PC:
+        state->replay_pc = ub_async_load_access_merge(
+            state->replay_pc, reg, value, size);
+        return true;
+    case ASYNC_LOAD_REG_REPLAY_COMMAND:
+        ub_async_load_replay_command(state, value);
         return true;
     case ASYNC_LOAD_REG_EVENT_RING_BASE:
         if (state->session_active) {
@@ -1235,7 +1303,6 @@ bool ub_async_load_cpu_take_upcall(CPUState *cpu, uint64_t interrupted_pc,
     if (!state || !upcall_entry || !state->session_active ||
         state->session_flags & UB_ASYNC_LOAD_START_KERNEL_TASK ||
         state->home_cpu != cpu || state->upcall_active ||
-        state->scheduler_waiting ||
         !ub_async_load_ring_publish_one(state, interrupted_pc)) {
         return false;
     }
@@ -1245,13 +1312,15 @@ bool ub_async_load_cpu_take_upcall(CPUState *cpu, uint64_t interrupted_pc,
     return true;
 }
 
-bool ub_async_load_cpu_resume(CPUState *cpu, uint64_t context_id)
+bool ub_async_load_cpu_resume(CPUState *cpu, uint64_t context_id,
+                         uint64_t replay_token, uint64_t replay_pc)
 {
     UbAsyncLoadDeviceState *state = ub_async_load_global;
+    UbAsyncLoadPltToken token;
     uint16_t slot;
 
     if (!state || !state->session_active || state->home_cpu != cpu ||
-        !context_id || state->scheduler_waiting ||
+        !context_id ||
         !ub_async_load_ring_sync_consumer(state) ||
         state->event_consumer_sequence != state->event_producer_sequence) {
         return false;
@@ -1265,38 +1334,25 @@ bool ub_async_load_cpu_resume(CPUState *cpu, uint64_t context_id)
         slot >= state->logical_context_count) {
         return false;
     }
+    if (state->replay_armed) {
+        return false;
+    }
+    if (replay_token) {
+        token = ub_async_load_plt_token_unpack(replay_token);
+        if (!replay_pc || !ub_async_load_replay_arm(
+                state->model, context_id, token, replay_pc)) {
+            return false;
+        }
+        state->armed_replay_token = token;
+        state->replay_armed = true;
+    } else if (replay_pc ||
+               ub_async_load_replay_expected(state->model, context_id)) {
+        return false;
+    }
     state->active_context_id = context_id;
     state->upcall_active = false;
-    state->scheduler_waiting = false;
     cpu->halted = 0;
     return true;
-}
-
-UbAsyncLoadWaitResult ub_async_load_cpu_wait(CPUState *cpu)
-{
-    UbAsyncLoadDeviceState *state = ub_async_load_global;
-
-    if (!state || !state->session_active || state->home_cpu != cpu ||
-        !state->upcall_active) {
-        if (state && state->home_cpu == cpu) {
-            ub_async_load_ring_fail_stop(state, UB_ASYNC_LOAD_ERROR_CPU);
-        }
-        return UB_ASYNC_LOAD_WAIT_FAIL_STOP;
-    }
-    state->scheduler_waiting = false;
-    if (!ub_async_load_ring_sync_consumer(state) ||
-        state->event_consumer_sequence != state->event_producer_sequence) {
-        ub_async_load_ring_fail_stop(state, UB_ASYNC_LOAD_ERROR_CPU);
-        return UB_ASYNC_LOAD_WAIT_FAIL_STOP;
-    }
-    state->active_context_id = 0;
-    if (ub_async_load_event_pending(state->model)) {
-        return ub_async_load_ring_publish_one(state, 0) ?
-            UB_ASYNC_LOAD_WAIT_READY : UB_ASYNC_LOAD_WAIT_FAIL_STOP;
-    }
-    state->scheduler_waiting = true;
-    state->event_wait_halts++;
-    return UB_ASYNC_LOAD_WAIT_HALT;
 }
 
 bool ub_async_load_cpu_scheduler_enter(CPUState *cpu)
@@ -1304,7 +1360,7 @@ bool ub_async_load_cpu_scheduler_enter(CPUState *cpu)
     UbAsyncLoadDeviceState *state = ub_async_load_global;
 
     if (!state || !state->session_active || state->home_cpu != cpu ||
-        state->upcall_active || state->scheduler_waiting ||
+        state->upcall_active ||
         !state->active_context_id ||
         !ub_async_load_ring_sync_consumer(state) ||
         state->event_consumer_sequence != state->event_producer_sequence) {
@@ -1328,7 +1384,6 @@ void ub_async_load_cpu_fail_stop(CPUState *cpu)
         state->last_error = UB_ASYNC_LOAD_ERROR_CPU;
         ub_async_load_mark_fail_stop(state->model);
         state->session_active = false;
-        state->scheduler_waiting = false;
     }
 }
 
@@ -1385,20 +1440,10 @@ static void ub_async_load_remote_complete(void *opaque,
     ub_async_load_complete_plt(future, result->status, result->payload,
                         result->bytes_done, result->model_publish_ns);
     future->active = false;
-    if (state->session_flags & UB_ASYNC_LOAD_START_KERNEL_TASK &&
-        ub_async_load_event_pending(state->model)) {
+    if (ub_async_load_event_pending(state->model)) {
         if (ub_async_load_ring_publish_one(state, 0)) {
             state->irq_status |= ASYNC_LOAD_IRQ_COMPLETION;
             ubc_async_load_irq_set(state->ubc_dev, true);
-        } else {
-            ub_async_load_ring_fail_stop(
-                state, UB_ASYNC_LOAD_ERROR_REMOTE);
-        }
-    }
-    if (state->scheduler_waiting &&
-        ub_async_load_event_pending(state->model)) {
-        if (ub_async_load_ring_publish_one(state, 0)) {
-            state->scheduler_waiting = false;
             state->event_wait_wakeups++;
             ub_async_load_ring_update_u64(
                 state,
@@ -1437,7 +1482,7 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
     uint16_t context_slot;
     UbAsyncLoadReplayResult replay;
 
-    if (!state || !load || !state->session_active ||
+    if (!state || !load || !replay_value || !state->session_active ||
         state->home_cpu != cpu || !state->active_context_id ||
         state->upcall_active) {
         return UB_ASYNC_LOAD_TRY_NOT_REMOTE;
@@ -1453,10 +1498,13 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
     resolved_load.map_generation = map->generation;
     resolved_load.map_model_generation = map->model_generation;
     resolved_load.remote_offset = remote_offset;
-    if (state->session_flags & UB_ASYNC_LOAD_START_REPLAY_RETIRE) {
-        replay = ub_async_load_replay_consume(
-            state->model, state->active_context_id,
+    if (state->replay_armed) {
+        replay = ub_async_load_replay_consume_token(
+            state->model, state->armed_replay_token,
             &resolved_load, replay_value);
+        state->replay_armed = false;
+        memset(&state->armed_replay_token, 0,
+               sizeof(state->armed_replay_token));
         if (replay == UB_ASYNC_LOAD_REPLAY_CONSUMED) {
             trace_async_load_load_replay(
                 state->owner_generation, state->active_context_id,
@@ -1466,6 +1514,12 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
         if (replay == UB_ASYNC_LOAD_REPLAY_MISMATCH) {
             return UB_ASYNC_LOAD_TRY_FAIL_STOP;
         }
+        return UB_ASYNC_LOAD_TRY_FAIL_STOP;
+    }
+    if (ub_async_load_replay_expected(
+            state->model, state->active_context_id)) {
+        ub_async_load_mark_fail_stop(state->model);
+        return UB_ASYNC_LOAD_TRY_FAIL_STOP;
     }
     context_slot = ub_async_load_context_id_slot(state->active_context_id);
     if (context_slot >= state->logical_context_count ||
