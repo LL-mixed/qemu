@@ -1707,6 +1707,7 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define UBC_SIM_DEC_READ_WAIT_USEC  1000
 #define UBC_SIM_DEC_SHM_READ_WAIT_USEC 50
 #define UBC_SIM_DEC_READ_WAIT_LOOPS 30000
+#define UBC_SIM_DEC_SHM_READ_MAX_ATTEMPTS 3
 #define UBC_OBMM_ASYNC_CHILD_CAPACITY \
     (OBMM_REMOTE_PARENT_CAPACITY * OBMM_REMOTE_MAX_CHILDREN)
 
@@ -8334,6 +8335,10 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
         uint32_t chunk = MIN(len - done, UBC_SIM_DEC_READ_CHUNK_MAX);
         int rc;
         int loop;
+        int attempt = 0;
+
+retry_chunk:
+        attempt++;
         if (ubc_dev->sim_dec_sync_read.pending) {
             qemu_log("ubc sim_dec read: another sync read pending req=%u\n",
                      ubc_dev->sim_dec_sync_read.req_id);
@@ -8421,6 +8426,15 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
             }
             ubc_dev->sim_dec_sync_read.pending = false;
             ubc_dev->sim_dec_sync_read.peer_cna = 0;
+            if (link->shmem_ready &&
+                !ubc_dev->remote_memory_model.loaded &&
+                attempt < UBC_SIM_DEC_SHM_READ_MAX_ATTEMPTS) {
+                qemu_log("ubc sim_dec read: retry req=%u"
+                         " next_attempt=%d/%d transport=shared-memory\n",
+                         req.req_id, attempt + 1,
+                         UBC_SIM_DEC_SHM_READ_MAX_ATTEMPTS);
+                goto retry_chunk;
+            }
             return MEMTX_DECODE_ERROR;
         }
         if (ubc_dev->sim_dec_sync_read.status != 0 ||
