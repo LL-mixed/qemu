@@ -374,6 +374,59 @@ static void test_capacity_and_fail_stop(void)
                     ==, UB_ASYNC_LOAD_PENDING_INVALID);
 }
 
+static void test_cacheable_events_bypass_nc_plt(void)
+{
+    g_autoptr(UbAsyncLoad) async_load = ub_async_load_new(
+        1, 9, &default_config);
+    UbAsyncLoadDesc load = test_load(0x3000, 5, 8, false);
+    UbAsyncLoadPltToken wait_key = {
+        .generation = 7,
+        .owner_id = 3,
+        .slot = 4,
+    };
+    UbAsyncLoadEvent event;
+    uint64_t context_id = ub_async_load_context_id_make(9, 0, 3);
+
+    load.normal_cacheable = true;
+    g_assert_cmpint(ub_async_load_cacheable_pending(
+                        async_load, context_id, &load, wait_key),
+                    ==, UB_ASYNC_LOAD_PENDING_ACCEPTED);
+    g_assert_cmpuint(ub_async_load_pending_count(async_load), ==, 0);
+    g_assert_cmpuint(ub_async_load_stats(async_load)->nc_plt_allocations, ==, 0);
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
+    g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_PENDING);
+    g_assert_cmpuint(event.flags, ==,
+                     UB_ASYNC_LOAD_EVENT_FLAG_CACHEABLE_FILL);
+    g_assert_cmpuint(event.plt_token.owner_id, ==, wait_key.owner_id);
+    g_assert_cmpuint(event.plt_token.slot, ==, wait_key.slot);
+
+    ub_async_load_record_cacheable_fill_bytes(async_load, 64);
+    g_assert_cmpint(ub_async_load_cacheable_complete(
+                        async_load, context_id, &load, wait_key,
+                        UB_ASYNC_LOAD_STATUS_SUCCESS, 500),
+                    ==, UB_ASYNC_LOAD_COMPLETION_ACCEPTED);
+    g_assert_true(ub_async_load_event_pop(async_load, &event));
+    g_assert_cmpint(event.kind, ==, UB_ASYNC_LOAD_EVENT_COMPLETE);
+    g_assert_cmpuint(event.flags, ==,
+                     UB_ASYNC_LOAD_EVENT_FLAG_CACHEABLE_FILL |
+                     UB_ASYNC_LOAD_EVENT_FLAG_REPLAY_RETIRE);
+    g_assert_cmphex(event.value, ==, 0);
+    ub_async_load_record_cacheable_replay_hit(async_load);
+
+    g_assert_cmpuint(ub_async_load_pending_count(async_load), ==, 0);
+    g_assert_cmpuint(ub_async_load_stats(async_load)->nc_plt_allocations, ==, 0);
+    g_assert_cmpuint(ub_async_load_stats(async_load)->cacheable_fill_pending,
+                     ==, 1);
+    g_assert_cmpuint(ub_async_load_stats(async_load)->cacheable_fill_completed,
+                     ==, 1);
+    g_assert_cmpuint(ub_async_load_stats(async_load)->cacheable_replay_hits,
+                     ==, 1);
+    g_assert_cmpuint(ub_async_load_stats(async_load)->cacheable_fill_bytes,
+                     ==, 64);
+    g_assert_cmpuint(ub_async_load_stats(async_load)->replay_consumed, ==, 0);
+    g_assert_false(ub_async_load_event_pending(async_load));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -395,5 +448,7 @@ int main(int argc, char **argv)
                     test_replay_arm_requires_exact_identity);
     g_test_add_func("/ub/async_load/capacity-fail-stop",
                     test_capacity_and_fail_stop);
+    g_test_add_func("/ub/async_load/cacheable-bypass-nc-plt",
+                    test_cacheable_events_bypass_nc_plt);
     return g_test_run();
 }

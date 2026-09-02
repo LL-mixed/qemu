@@ -169,11 +169,14 @@ static UbAsyncLoadNcPltEntry *ub_async_load_find_plt(UbAsyncLoad *async_load,
     return entry;
 }
 
-static bool ub_async_load_event_push(UbAsyncLoad *async_load, UbAsyncLoadEventKind kind,
-                                const UbAsyncLoadNcPltEntry *entry,
+static bool ub_async_load_event_push(UbAsyncLoad *async_load,
+                                UbAsyncLoadEventKind kind,
+                                uint64_t context_id,
+                                const UbAsyncLoadDesc *load,
                                 UbAsyncLoadPltToken token,
                                 UbAsyncLoadStatus status,
-                                uint64_t value, uint64_t guest_cycle)
+                                uint64_t value, uint64_t guest_cycle,
+                                uint32_t flags)
 {
     UbAsyncLoadEvent *event;
 
@@ -193,19 +196,20 @@ static bool ub_async_load_event_push(UbAsyncLoad *async_load, UbAsyncLoadEventKi
             async_load->config.event_queue_depth;
     }
     *event = (UbAsyncLoadEvent) {
-        .context_id = entry->context_id,
-        .context_cookie = entry->load.context_cookie,
+        .context_id = context_id,
+        .context_cookie = load->context_cookie,
         .plt_token = token,
-        .fault_pc = entry->load.fault_pc,
-        .effective_va = entry->load.effective_va,
+        .fault_pc = load->fault_pc,
+        .effective_va = load->effective_va,
         .value = value,
-        .map_id = entry->load.map_id,
-        .map_generation = entry->load.map_generation,
-        .map_model_generation = entry->load.map_model_generation,
+        .map_id = load->map_id,
+        .map_generation = load->map_generation,
+        .map_model_generation = load->map_model_generation,
         .kind = kind,
         .status = status,
-        .rt = entry->load.rt,
-        .access_bytes = entry->load.access_bytes,
+        .flags = flags,
+        .rt = load->rt,
+        .access_bytes = load->access_bytes,
         .guest_cycle = guest_cycle,
     };
     async_load->event_count++;
@@ -278,11 +282,13 @@ UbAsyncLoadPendingResult ub_async_load_load_pending(
     *plt_token = ub_async_load_plt_token(async_load, slot);
     async_load->pending_count++;
     async_load->stats.pending_loads++;
+    async_load->stats.nc_plt_allocations++;
     async_load->stats.pending_high_water = MAX(async_load->stats.pending_high_water,
                                         async_load->pending_count);
-    if (!ub_async_load_event_push(async_load, UB_ASYNC_LOAD_EVENT_PENDING, entry,
-                             *plt_token, UB_ASYNC_LOAD_STATUS_SUCCESS, 0,
-                             load->submit_cycle)) {
+    if (!ub_async_load_event_push(async_load, UB_ASYNC_LOAD_EVENT_PENDING,
+                             context_id, load, *plt_token,
+                             UB_ASYNC_LOAD_STATUS_SUCCESS, 0,
+                             load->submit_cycle, 0)) {
         ub_async_load_recycle_plt(async_load, entry);
         return UB_ASYNC_LOAD_PENDING_INVALID;
     }
@@ -315,8 +321,9 @@ UbAsyncLoadCompletionResult ub_async_load_load_complete(
         entry->state = UB_ASYNC_LOAD_PLT_COMPLETE;
         value = ub_async_load_load_value(entry);
         async_load->stats.completed_loads++;
-        ub_async_load_event_push(async_load, UB_ASYNC_LOAD_EVENT_COMPLETE, entry,
-                            plt_token, status, value, complete_cycle);
+        ub_async_load_event_push(async_load, UB_ASYNC_LOAD_EVENT_COMPLETE,
+                            entry->context_id, &entry->load, plt_token,
+                            status, value, complete_cycle, 0);
     } else {
         if (status == UB_ASYNC_LOAD_STATUS_SUCCESS) {
             status = UB_ASYNC_LOAD_STATUS_INTERNAL;
@@ -324,8 +331,62 @@ UbAsyncLoadCompletionResult ub_async_load_load_complete(
         entry->status = status;
         entry->state = UB_ASYNC_LOAD_PLT_FAULTED;
         async_load->stats.faulted_loads++;
-        ub_async_load_event_push(async_load, UB_ASYNC_LOAD_EVENT_FAULT, entry,
-                            plt_token, status, 0, complete_cycle);
+        ub_async_load_event_push(async_load, UB_ASYNC_LOAD_EVENT_FAULT,
+                            entry->context_id, &entry->load, plt_token,
+                            status, 0, complete_cycle, 0);
+    }
+    return UB_ASYNC_LOAD_COMPLETION_ACCEPTED;
+}
+
+UbAsyncLoadPendingResult ub_async_load_cacheable_pending(
+    UbAsyncLoad *async_load, uint64_t context_id, const UbAsyncLoadDesc *load,
+    UbAsyncLoadPltToken wait_key)
+{
+    if (!async_load || !context_id || !wait_key.generation ||
+        !wait_key.owner_id || !ub_async_load_load_valid(load) ||
+        !load->normal_cacheable || async_load->fail_stop) {
+        return UB_ASYNC_LOAD_PENDING_INVALID;
+    }
+    if (async_load->event_count == async_load->config.event_queue_depth) {
+        async_load->stats.capacity_stalls++;
+        return UB_ASYNC_LOAD_PENDING_SYNC_STALL;
+    }
+    if (!ub_async_load_event_push(
+            async_load, UB_ASYNC_LOAD_EVENT_PENDING, context_id, load,
+            wait_key, UB_ASYNC_LOAD_STATUS_SUCCESS, 0, load->submit_cycle,
+            UB_ASYNC_LOAD_EVENT_FLAG_CACHEABLE_FILL)) {
+        return UB_ASYNC_LOAD_PENDING_INVALID;
+    }
+    async_load->stats.pending_loads++;
+    async_load->stats.cacheable_fill_pending++;
+    return UB_ASYNC_LOAD_PENDING_ACCEPTED;
+}
+
+UbAsyncLoadCompletionResult ub_async_load_cacheable_complete(
+    UbAsyncLoad *async_load, uint64_t context_id, const UbAsyncLoadDesc *load,
+    UbAsyncLoadPltToken wait_key, UbAsyncLoadStatus status,
+    uint64_t complete_cycle)
+{
+    UbAsyncLoadEventKind kind;
+    uint32_t flags = UB_ASYNC_LOAD_EVENT_FLAG_CACHEABLE_FILL;
+
+    if (!async_load || !context_id || !wait_key.generation ||
+        !wait_key.owner_id || !ub_async_load_load_valid(load) ||
+        !load->normal_cacheable || async_load->fail_stop) {
+        return UB_ASYNC_LOAD_COMPLETION_STALE;
+    }
+    if (status == UB_ASYNC_LOAD_STATUS_SUCCESS) {
+        kind = UB_ASYNC_LOAD_EVENT_COMPLETE;
+        flags |= UB_ASYNC_LOAD_EVENT_FLAG_REPLAY_RETIRE;
+        async_load->stats.completed_loads++;
+        async_load->stats.cacheable_fill_completed++;
+    } else {
+        kind = UB_ASYNC_LOAD_EVENT_FAULT;
+        async_load->stats.faulted_loads++;
+    }
+    if (!ub_async_load_event_push(async_load, kind, context_id, load,
+                             wait_key, status, 0, complete_cycle, flags)) {
+        return UB_ASYNC_LOAD_COMPLETION_STALE;
     }
     return UB_ASYNC_LOAD_COMPLETION_ACCEPTED;
 }
@@ -346,6 +407,15 @@ bool ub_async_load_event_pop(UbAsyncLoad *async_load, UbAsyncLoadEvent *event)
     event->sequence = async_load->next_event_sequence++;
     if (!async_load->next_event_sequence) {
         async_load->next_event_sequence = 1;
+    }
+    if ((event->flags & UB_ASYNC_LOAD_EVENT_FLAG_CACHEABLE_FILL) &&
+        (event->kind == UB_ASYNC_LOAD_EVENT_COMPLETE ||
+         event->kind == UB_ASYNC_LOAD_EVENT_FAULT)) {
+        if (event->kind == UB_ASYNC_LOAD_EVENT_COMPLETE) {
+            async_load->stats.completion_events_delivered++;
+        }
+        event->value = 0;
+        return true;
     }
     if (event->kind == UB_ASYNC_LOAD_EVENT_COMPLETE ||
         event->kind == UB_ASYNC_LOAD_EVENT_FAULT) {
@@ -416,7 +486,8 @@ static bool ub_async_load_replay_load_matches(
         expected->access_bytes == actual->access_bytes &&
         expected->mmu_index == actual->mmu_index &&
         expected->sign_extend == actual->sign_extend &&
-        expected->big_endian == actual->big_endian;
+        expected->big_endian == actual->big_endian &&
+        expected->normal_cacheable == actual->normal_cacheable;
 }
 
 bool ub_async_load_replay_arm(UbAsyncLoad *async_load, uint64_t context_id,
@@ -465,6 +536,21 @@ void ub_async_load_record_direct_upcall(UbAsyncLoad *async_load)
 {
     if (async_load) {
         async_load->stats.direct_upcalls++;
+    }
+}
+
+void ub_async_load_record_cacheable_replay_hit(UbAsyncLoad *async_load)
+{
+    if (async_load) {
+        async_load->stats.cacheable_replay_hits++;
+    }
+}
+
+void ub_async_load_record_cacheable_fill_bytes(UbAsyncLoad *async_load,
+                                          uint64_t bytes)
+{
+    if (async_load) {
+        async_load->stats.cacheable_fill_bytes += bytes;
     }
 }
 

@@ -40,21 +40,36 @@
 #include "hw/ub/ub_async_load_device.h"
 #include "qemu/timer.h"
 
-static void async_load_probe_access_range(CPUARMState *env,
+static bool async_load_probe_access_range(CPUARMState *env,
                                         target_ulong address,
                                         uint32_t bytes,
                                         MMUAccessType access_type,
                                         int mmu_index,
                                         uintptr_t retaddr)
 {
+    uint8_t first_attrs = 0;
+    bool first = true;
+
     while (bytes) {
+        CPUTLBEntryFull *full;
         target_ulong bytes_in_page = -(address | TARGET_PAGE_MASK);
         uint32_t chunk = MIN((target_ulong)bytes, bytes_in_page);
+        void *host;
 
-        probe_access(env, address, chunk, access_type, mmu_index, retaddr);
+        probe_access_full(env, address, chunk, access_type, mmu_index,
+                          false, &host, &full, retaddr);
+        if (first) {
+            first_attrs = full->extra.arm.pte_attrs;
+            first = false;
+        } else if (full->extra.arm.pte_attrs != first_attrs) {
+            cpu_abort(env_cpu(env),
+                      "OBMM async LDR crosses unlike memory attributes");
+        }
         address += chunk;
         bytes -= chunk;
     }
+    return (first_attrs & 0xf0) != 0 && first_attrs != 0x44 &&
+        first_attrs != 0x40;
 }
 
 void arm_async_load_set_active(CPUState *cs, bool active)
@@ -168,8 +183,6 @@ uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
             cpu_abort(cs, "OBMM kernel-task context selection failed");
         }
     }
-    async_load_probe_access_range(env, va, bytes, MMU_DATA_LOAD, mmu_index,
-                                retaddr);
     load = (UbAsyncLoadDesc) {
         .context_cookie = env->cp15.tpidr_el[0],
         .fault_pc = fault_pc,
@@ -181,6 +194,8 @@ uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
         .sign_extend = memop & MO_SIGN,
         .big_endian = (memop & MO_BSWAP) == MO_BE,
     };
+    load.normal_cacheable = async_load_probe_access_range(
+        env, va, bytes, MMU_DATA_LOAD, mmu_index, retaddr);
     need_lock = !qemu_mutex_iothread_locked();
     if (need_lock) {
         qemu_mutex_lock_iothread();

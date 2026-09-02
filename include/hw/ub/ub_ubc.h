@@ -381,6 +381,17 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
 bool ubc_obmm_resolve_async_map(BusControllerDev *ubc_dev,
                                 uint64_t local_pa, uint64_t length,
                                 UbcObmmResolvedMap *resolved);
+int ubc_obmm_cacheable_fill_lookup(BusControllerDev *ubc_dev,
+                                   const UbcObmmResolvedMap *map,
+                                   uint64_t remote_offset,
+                                   uint32_t access_bytes,
+                                   uint64_t *fill_remote_offset,
+                                   uint32_t *fill_bytes);
+bool ubc_obmm_cacheable_fill_complete(BusControllerDev *ubc_dev,
+                                      const UbcObmmResolvedMap *map,
+                                      uint64_t fill_remote_offset,
+                                      const void *payload,
+                                      uint32_t fill_bytes);
 bool ubc_sim_dec_remote_read_async_submit(
     BusControllerDev *ubc_dev, const UbcObmmResolvedMap *map,
     uint64_t remote_offset, uint32_t length,

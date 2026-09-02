@@ -505,6 +505,7 @@ typedef struct QEMU_PACKED ObmmRegionDirentWire {
 /* Decoder map entry for simulation backend */
 /* Page cache for SIM_DEC imported-PA CPU window reads */
 #define SIM_DEC_PAGE_SIZE           4096
+#define SIM_DEC_CACHE_LINE_SIZE     64
 #define SIM_DEC_CACHE_MAX_PER_MAP   0
 #define SIM_DEC_CACHE_MAX_GLOBAL    8192
 
@@ -512,6 +513,7 @@ typedef struct SimDecPageCacheEntry {
     uint64_t page_index;
     uint8_t *page_buf;
     uint64_t last_used;
+    uint64_t valid_line_mask;
     bool dirty;
     uint64_t dirty_off;
     uint64_t dirty_len;
@@ -903,6 +905,7 @@ static void sim_dec_page_cache_insert(SimDecPageCache *cache,
     ce->page_buf = g_malloc(SIM_DEC_PAGE_SIZE);
     memcpy(ce->page_buf, data, SIM_DEC_PAGE_SIZE);
     ce->last_used = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    ce->valid_line_mask = UINT64_MAX;
 
     key = g_malloc(sizeof(*key));
     *key = page_index;
@@ -928,6 +931,34 @@ static SimDecPageCacheEntry *sim_dec_page_cache_lookup(SimDecPageCache *cache,
         QTAILQ_INSERT_HEAD(&cache->lru_list, ce, lru_next);
     }
     return ce;
+}
+
+static uint64_t sim_dec_page_cache_line_mask(uint64_t page_offset,
+                                             uint32_t length)
+{
+    uint32_t first_line = page_offset / SIM_DEC_CACHE_LINE_SIZE;
+    uint32_t last_line = (page_offset + length - 1) /
+                         SIM_DEC_CACHE_LINE_SIZE;
+    uint64_t through_last = last_line == 63 ? UINT64_MAX :
+                            (UINT64_C(1) << (last_line + 1)) - 1;
+    uint64_t before_first = first_line == 0 ? 0 :
+                            (UINT64_C(1) << first_line) - 1;
+
+    return through_last & ~before_first;
+}
+
+static bool sim_dec_page_cache_range_valid(const SimDecPageCacheEntry *ce,
+                                           uint64_t page_offset,
+                                           uint32_t length)
+{
+    uint64_t line_mask;
+
+    if (!ce || !length || page_offset >= SIM_DEC_PAGE_SIZE ||
+        length > SIM_DEC_PAGE_SIZE - page_offset) {
+        return false;
+    }
+    line_mask = sim_dec_page_cache_line_mask(page_offset, length);
+    return (ce->valid_line_mask & line_mask) == line_mask;
 }
 
 static void sim_dec_page_cache_invalidate_all(SimDecPageCache *cache)
@@ -1202,7 +1233,7 @@ static uint64_t sim_dec_cpu_window_read(void *opaque, hwaddr addr,
         page_off = addr % SIM_DEC_PAGE_SIZE;
         qemu_mutex_lock(&entry->page_cache->lock);
         ce = sim_dec_page_cache_lookup(entry->page_cache, page_index);
-        if (ce) {
+        if (sim_dec_page_cache_range_valid(ce, page_off, size)) {
             memcpy(buf, ce->page_buf + page_off, size);
             qemu_mutex_unlock(&entry->page_cache->lock);
             g_sim_decoder->stats.page_cache_hits++;
@@ -8191,6 +8222,131 @@ bool ubc_obmm_resolve_async_map(BusControllerDev *ubc_dev,
 out:
     qemu_mutex_unlock(&g_sim_decoder->lock);
     return found;
+}
+
+int ubc_obmm_cacheable_fill_lookup(BusControllerDev *ubc_dev,
+                                   const UbcObmmResolvedMap *map,
+                                   uint64_t remote_offset,
+                                   uint32_t access_bytes,
+                                   uint64_t *fill_remote_offset,
+                                   uint32_t *fill_bytes)
+{
+    SimDecMapEntry *entry;
+    SimDecPageCacheEntry *cache_entry;
+    uint64_t map_entry_offset;
+    uint64_t access_offset;
+    uint64_t line_base;
+    uint64_t page_index;
+    uint64_t page_offset;
+    int result = -EINVAL;
+
+    if (!ubc_dev || !map || !fill_remote_offset || !fill_bytes ||
+        !access_bytes || remote_offset > map->length ||
+        access_bytes > map->length - remote_offset || !g_sim_decoder ||
+        g_sim_decoder->bcs->ubc_dev != ubc_dev) {
+        return -EINVAL;
+    }
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    entry = sim_dec_find_entry_by_pa(map->local_pa + remote_offset);
+    if (!entry || !entry->active || entry->map_id != map->map_id ||
+        map->local_pa < entry->local_pa || !entry->page_cache ||
+        !entry->page_cache->max_pages) {
+        result = -EOPNOTSUPP;
+        goto out;
+    }
+    map_entry_offset = map->local_pa - entry->local_pa;
+    access_offset = map_entry_offset + remote_offset;
+    if (access_offset > entry->size ||
+        access_bytes > entry->size - access_offset ||
+        access_offset / SIM_DEC_PAGE_SIZE !=
+            (access_offset + access_bytes - 1) / SIM_DEC_PAGE_SIZE) {
+        goto out;
+    }
+    line_base = QEMU_ALIGN_DOWN(access_offset, SIM_DEC_CACHE_LINE_SIZE);
+    if (line_base < map_entry_offset) {
+        goto out;
+    }
+    page_index = line_base / SIM_DEC_PAGE_SIZE;
+    page_offset = access_offset % SIM_DEC_PAGE_SIZE;
+    *fill_remote_offset = line_base - map_entry_offset;
+    *fill_bytes = MIN((uint64_t)SIM_DEC_CACHE_LINE_SIZE,
+                      entry->size - line_base);
+    if (*fill_remote_offset > map->length ||
+        *fill_bytes > map->length - *fill_remote_offset) {
+        goto out;
+    }
+
+    qemu_mutex_lock(&entry->page_cache->lock);
+    cache_entry = sim_dec_page_cache_lookup(entry->page_cache, page_index);
+    result = sim_dec_page_cache_range_valid(cache_entry, page_offset,
+                                            access_bytes) ? 1 : 0;
+    qemu_mutex_unlock(&entry->page_cache->lock);
+out:
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+    return result;
+}
+
+bool ubc_obmm_cacheable_fill_complete(BusControllerDev *ubc_dev,
+                                      const UbcObmmResolvedMap *map,
+                                      uint64_t fill_remote_offset,
+                                      const void *payload,
+                                      uint32_t fill_bytes)
+{
+    SimDecMapEntry *entry;
+    SimDecPageCacheEntry *cache_entry;
+    uint8_t page[SIM_DEC_PAGE_SIZE] = { 0 };
+    uint64_t map_entry_offset;
+    uint64_t line_base;
+    uint64_t page_base;
+    uint64_t page_index;
+    uint64_t page_offset;
+    uint64_t line_mask;
+    bool completed = false;
+
+    if (!ubc_dev || !map || !payload || !fill_bytes ||
+        fill_bytes > SIM_DEC_CACHE_LINE_SIZE ||
+        fill_remote_offset > map->length ||
+        fill_bytes > map->length - fill_remote_offset || !g_sim_decoder ||
+        g_sim_decoder->bcs->ubc_dev != ubc_dev) {
+        return false;
+    }
+
+    qemu_mutex_lock(&g_sim_decoder->lock);
+    entry = sim_dec_find_entry_by_pa(map->local_pa + fill_remote_offset);
+    if (!entry || !entry->active || entry->map_id != map->map_id ||
+        map->local_pa < entry->local_pa || !entry->page_cache ||
+        !entry->page_cache->max_pages) {
+        goto out;
+    }
+    map_entry_offset = map->local_pa - entry->local_pa;
+    line_base = map_entry_offset + fill_remote_offset;
+    if (!QEMU_IS_ALIGNED(line_base, SIM_DEC_CACHE_LINE_SIZE) ||
+        line_base > entry->size || fill_bytes > entry->size - line_base) {
+        goto out;
+    }
+    page_base = QEMU_ALIGN_DOWN(line_base, SIM_DEC_PAGE_SIZE);
+    page_index = page_base / SIM_DEC_PAGE_SIZE;
+    page_offset = line_base - page_base;
+    line_mask = sim_dec_page_cache_line_mask(page_offset, fill_bytes);
+    qemu_mutex_lock(&entry->page_cache->lock);
+    cache_entry = sim_dec_page_cache_lookup(entry->page_cache, page_index);
+    if (!cache_entry) {
+        sim_dec_page_cache_insert(entry->page_cache, page_index, page);
+        cache_entry = sim_dec_page_cache_lookup(entry->page_cache, page_index);
+        if (cache_entry) {
+            cache_entry->valid_line_mask = 0;
+        }
+    }
+    if (cache_entry) {
+        memcpy(cache_entry->page_buf + page_offset, payload, fill_bytes);
+        cache_entry->valid_line_mask |= line_mask;
+    }
+    qemu_mutex_unlock(&entry->page_cache->lock);
+    completed = cache_entry != NULL;
+out:
+    qemu_mutex_unlock(&g_sim_decoder->lock);
+    return completed;
 }
 
 bool ubc_sim_dec_remote_read_async_submit(

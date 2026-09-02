@@ -14,6 +14,7 @@
 #define UB_ASYNC_LOAD_MAX_PENDING_LOADS 64
 #define UB_ASYNC_LOAD_MAX_EVENTS 128
 #define UB_ASYNC_LOAD_EVENT_FLAG_REPLAY_RETIRE (1U << 1)
+#define UB_ASYNC_LOAD_EVENT_FLAG_CACHEABLE_FILL (1U << 2)
 
 typedef struct UbAsyncLoad UbAsyncLoad;
 
@@ -89,6 +90,7 @@ typedef struct UbAsyncLoadDesc {
     uint8_t mmu_index;
     bool sign_extend;
     bool big_endian;
+    bool normal_cacheable;
 } UbAsyncLoadDesc;
 
 typedef struct UbAsyncLoadEvent {
@@ -133,6 +135,11 @@ typedef struct UbAsyncLoadStats {
     uint64_t replay_consumed;
     uint64_t replay_mismatch;
     uint16_t replay_ready_high_water;
+    uint64_t nc_plt_allocations;
+    uint64_t cacheable_fill_pending;
+    uint64_t cacheable_fill_completed;
+    uint64_t cacheable_replay_hits;
+    uint64_t cacheable_fill_bytes;
 } UbAsyncLoadStats;
 
 bool ub_async_load_config_parse(const char *spec, bool *enabled,
@@ -149,6 +156,13 @@ UbAsyncLoadPendingResult ub_async_load_load_pending(
 UbAsyncLoadCompletionResult ub_async_load_load_complete(
     UbAsyncLoad *async_load, UbAsyncLoadPltToken plt_token, UbAsyncLoadStatus status,
     const void *payload, uint8_t bytes_done, uint64_t complete_cycle);
+UbAsyncLoadPendingResult ub_async_load_cacheable_pending(
+    UbAsyncLoad *async_load, uint64_t context_id, const UbAsyncLoadDesc *load,
+    UbAsyncLoadPltToken wait_key);
+UbAsyncLoadCompletionResult ub_async_load_cacheable_complete(
+    UbAsyncLoad *async_load, uint64_t context_id, const UbAsyncLoadDesc *load,
+    UbAsyncLoadPltToken wait_key, UbAsyncLoadStatus status,
+    uint64_t complete_cycle);
 
 bool ub_async_load_event_pop(UbAsyncLoad *async_load, UbAsyncLoadEvent *event);
 bool ub_async_load_event_pending(const UbAsyncLoad *async_load);
@@ -160,6 +174,9 @@ UbAsyncLoadReplayResult ub_async_load_replay_consume_token(
     UbAsyncLoad *async_load, UbAsyncLoadPltToken token,
     const UbAsyncLoadDesc *load, uint64_t *value);
 void ub_async_load_record_direct_upcall(UbAsyncLoad *async_load);
+void ub_async_load_record_cacheable_replay_hit(UbAsyncLoad *async_load);
+void ub_async_load_record_cacheable_fill_bytes(UbAsyncLoad *async_load,
+                                          uint64_t bytes);
 void ub_async_load_mark_fail_stop(UbAsyncLoad *async_load);
 bool ub_async_load_fail_stop(const UbAsyncLoad *async_load);
 uint16_t ub_async_load_pending_count(const UbAsyncLoad *async_load);
