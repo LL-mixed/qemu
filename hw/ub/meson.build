@@ -16,6 +16,7 @@ ub_ss.add(files(
   'ub_obmm_async.c',
   'ub_obmm_remote.c',
   'ub_obmm_remote_model.c',
+  'ub_void_response_policy.c',
   'ub_async_load.c',
   'ub_async_load_device.c',
   'gsva_key.c',

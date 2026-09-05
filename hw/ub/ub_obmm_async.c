@@ -414,8 +414,6 @@ static ObmmProviderChildDisposition ub_obmm_async_submit_child(
     UbObmmAsyncMap *map;
     UbObmmRemoteOperation operation;
 
-    (void)inline_payload;
-
     if (!ub_obmm_async_map_valid(state, map_id, map_generation)) {
         *inline_status = OBMM_REMOTE_STATUS_STALE_MAP;
         return OBMM_PROVIDER_CHILD_REJECTED;
@@ -428,14 +426,11 @@ static ObmmProviderChildDisposition ub_obmm_async_submit_child(
         .length = length,
         .per_range_ordinal = operation_ordinal,
     };
-    if (!ubc_sim_dec_remote_read_async_submit(
-            state->ubc_dev, &map->resolved, remote_offset, length,
-            &operation, token, child_index,
-            ub_obmm_async_child_complete, state)) {
-        *inline_status = OBMM_REMOTE_STATUS_REMOTE_IO;
-        return OBMM_PROVIDER_CHILD_REJECTED;
-    }
-    return OBMM_PROVIDER_CHILD_PENDING;
+    return ubc_sim_dec_remote_read_async_submit(
+        state->ubc_dev, &map->resolved, remote_offset, length,
+        &operation, token, child_index,
+        ub_obmm_async_child_complete, state, false,
+        inline_payload, inline_status);
 }
 
 static void ub_obmm_async_cancel_provider(void *opaque,

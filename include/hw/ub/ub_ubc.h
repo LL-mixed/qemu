@@ -26,6 +26,7 @@
 #include "hw/ub/gsva_key.h"
 #include "hw/ub/ub_obmm_remote.h"
 #include "hw/ub/ub_obmm_remote_model.h"
+#include "hw/ub/ub_void_response_policy.h"
 #include "hw/ub/ub_async_load_device.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
@@ -147,13 +148,19 @@ typedef struct BusControllerDev {
     uint32_t entity_count;  /* Number of entities (FEs), default=1 */
     char *remote_memory_model_manifest;
     char *async_load_model;
+    char *void_response_policy_spec;
+    char *source_void_response_policy_spec;
     uint32_t pto_device_cna;
     uint64_t pto_authorization_delay_ns;
     uint64_t pto_authorization_timeout_ns;
     bool pto_authorization_inject_duplicate_completion;
     bool pto_authorization_inject_late_completion;
     UbObmmRemoteModelState remote_memory_model;
+    UbVoidResponsePolicy void_response_policy;
+    UbVoidResponsePolicy source_void_response_policy;
     QEMUTimer *remote_memory_model_timer;
+    struct UbcVoidPendingResponse *void_pending_responses;
+    QEMUBH *voided_transaction_bh;
     struct UbcObmmAsyncChild *obmm_async_children;
     struct UbObmmAsyncState *obmm_async;
     struct UbAsyncLoadDeviceState *ub_async_load;
@@ -392,14 +399,20 @@ bool ubc_obmm_cacheable_fill_complete(BusControllerDev *ubc_dev,
                                       uint64_t fill_remote_offset,
                                       const void *payload,
                                       uint32_t fill_bytes);
-bool ubc_sim_dec_remote_read_async_submit(
+ObmmProviderChildDisposition ubc_sim_dec_remote_read_async_submit(
     BusControllerDev *ubc_dev, const UbcObmmResolvedMap *map,
     uint64_t remote_offset, uint32_t length,
     const UbObmmRemoteOperation *operation, ObmmRemoteToken token,
     uint16_t child_index, UbcObmmAsyncReadCompleteFn complete,
-    void *opaque);
+    void *opaque, bool void_eligible, void *inline_payload,
+    ObmmRemoteStatus *inline_status);
 void ubc_sim_dec_remote_read_async_cancel(BusControllerDev *ubc_dev,
                                           ObmmRemoteToken token);
+bool ubc_void_response_policy_enabled(const BusControllerDev *ubc_dev);
+bool ubc_remote_void_response_policy_enabled(
+    const BusControllerDev *ubc_dev);
+bool ubc_source_void_response_policy_enabled(
+    const BusControllerDev *ubc_dev);
 void ubc_obmm_async_irq_notify(BusControllerDev *ubc_dev);
 void ubc_async_load_irq_set(BusControllerDev *ubc_dev, bool level);
 
@@ -455,6 +468,11 @@ void ubc_handle_read_response(BusControllerDev *ubc_dev, const UBCReadRespPld *r
 #define UBC_MSG_SUB_UB_SSD_READ_RESP  UBC_MSG_SUB_SIM_DEC_BATCH
 #define UBC_UB_SSD_READ_REQ_MAGIC     0x53534452U
 #define UBC_UB_SSD_READ_RESP_MAGIC    0x53534472U
+
+#define UBC_SIM_DEC_READ_FLAG_VOID_ELIGIBLE (1U << 0)
+#define UBC_SIM_DEC_READ_STATUS_SUCCESS 0U
+#define UBC_SIM_DEC_READ_STATUS_ERROR 1U
+#define UBC_SIM_DEC_READ_STATUS_VOID 2U
 
 /* OBMM coherence protocol messages (msg_code=7, sub_msg_code 5+). */
 #define UBC_MSG_SUB_COH_GETS          5
@@ -567,7 +585,7 @@ typedef struct QEMU_PACKED UBCSimDecReadReqPld {
     uint32_t token_id;
     uint64_t remote_uba;
     uint32_t read_len;
-    uint32_t rsvd;
+    uint32_t flags;
 } UBCSimDecReadReqPld;
 
 typedef struct QEMU_PACKED UBCSimDecReadRespPldHdr {

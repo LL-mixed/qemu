@@ -582,6 +582,7 @@ const char *obmm_remote_status_name(ObmmRemoteStatus status)
         [OBMM_REMOTE_STATUS_CHECKSUM] = "checksum",
         [OBMM_REMOTE_STATUS_TIMEOUT] = "timeout",
         [OBMM_REMOTE_STATUS_CANCELLED] = "cancelled",
+        [OBMM_REMOTE_STATUS_VOIDED] = "voided",
         [OBMM_REMOTE_STATUS_RETIRED] = "retired",
         [OBMM_REMOTE_STATUS_UNSUPPORTED] = "unsupported",
         [OBMM_REMOTE_STATUS_INTERNAL] = "internal",

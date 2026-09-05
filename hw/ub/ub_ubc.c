@@ -811,6 +811,7 @@ static void sim_dec_print_global_stats(void)
 /* Forward declarations for SIM decoder */
 static void sim_dec_init(BusControllerState *bcs);
 static void sim_dec_cleanup(void);
+static void ubc_void_pending_responses_cleanup(BusControllerDev *ubc_dev);
 static uint32_t sim_dec_reset_mappings(BusControllerDev *ubc_dev);
 MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
                                      uint64_t remote_uba,
@@ -1742,18 +1743,41 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define UBC_OBMM_ASYNC_CHILD_CAPACITY \
     (OBMM_REMOTE_PARENT_CAPACITY * OBMM_REMOTE_MAX_CHILDREN)
 
+typedef enum UbcVoidTrigger {
+    UBC_VOID_TRIGGER_NONE,
+    UBC_VOID_TRIGGER_SOURCE_POLICY,
+    UBC_VOID_TRIGGER_REMOTE_WIRE,
+} UbcVoidTrigger;
+
 typedef struct UbcObmmAsyncChild {
     bool active;
     bool model_queued;
+    bool wait_first_response;
+    bool first_response_seen;
+    bool voided;
+    bool late_real_seen;
+    UbcVoidTrigger void_trigger;
     uint32_t req_id;
     uint32_t peer_cna;
     uint32_t expected_len;
+    uint32_t inline_bytes;
+    ObmmRemoteStatus inline_status;
+    void *inline_payload;
     ObmmRemoteToken token;
     uint16_t child_index;
     UbObmmRemoteOperation operation;
     UbcObmmAsyncReadCompleteFn complete;
     void *opaque;
 } UbcObmmAsyncChild;
+
+typedef struct UbcVoidPendingResponse {
+    struct UbcVoidPendingResponse *next;
+    BusControllerDev *ubc_dev;
+    QEMUTimer *timer;
+    uint32_t dcna;
+    uint32_t payload_len;
+    uint8_t payload[];
+} UbcVoidPendingResponse;
 
 /* Doorbell/MMIO region constants (matches UAPI) */
 #define UDMA_JETTY_DSQE_OFFSET   0x1000
@@ -6587,6 +6611,11 @@ static void ub_bus_controller_dev_reset(DeviceState *device)
     bool had_authorization = authorization != NULL;
     bool obmm_async_reset = false;
 
+    ubc_void_pending_responses_cleanup(ubc_dev);
+    memset(&ubc_dev->void_response_policy.stats, 0,
+           sizeof(ubc_dev->void_response_policy.stats));
+    memset(&ubc_dev->source_void_response_policy.stats, 0,
+           sizeof(ubc_dev->source_void_response_policy.stats));
     linqu_uapi_authorization_discard(ubc_dev);
     if (had_authorization &&
         ubc_dev->pto_authorization_inject_late_completion) {
@@ -7466,16 +7495,120 @@ void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
     }
 }
 
+bool ubc_void_response_policy_enabled(const BusControllerDev *ubc_dev)
+{
+    return ubc_remote_void_response_policy_enabled(ubc_dev) ||
+        ubc_source_void_response_policy_enabled(ubc_dev);
+}
+
+bool ubc_remote_void_response_policy_enabled(
+    const BusControllerDev *ubc_dev)
+{
+    return ubc_dev && ubc_dev->void_response_policy.config.enabled;
+}
+
+bool ubc_source_void_response_policy_enabled(
+    const BusControllerDev *ubc_dev)
+{
+    return ubc_dev &&
+        ubc_dev->source_void_response_policy.config.enabled;
+}
+
+static void ubc_void_pending_response_unlink(
+    UbcVoidPendingResponse *response)
+{
+    UbcVoidPendingResponse **cursor;
+
+    cursor = &response->ubc_dev->void_pending_responses;
+    while (*cursor && *cursor != response) {
+        cursor = &(*cursor)->next;
+    }
+    if (*cursor == response) {
+        *cursor = response->next;
+    }
+}
+
+static void ubc_void_pending_response_timer(void *opaque)
+{
+    UbcVoidPendingResponse *response = opaque;
+    BusControllerDev *ubc_dev = response->ubc_dev;
+    UBLinkState *link;
+    uint32_t dcna = response->dcna;
+    int rc = -ENODEV;
+
+    link = ubc_find_active_link(ubc_dev, &dcna);
+    if (link) {
+        rc = ubc_send_msg_over_link(
+            ubc_dev, link, dcna, UBC_MSG_SUB_SIM_DEC_READ_RESP,
+            response->payload, response->payload_len);
+    }
+    if (rc < 0) {
+        const UBCSimDecReadRespPldHdr *header =
+            (const UBCSimDecReadRespPldHdr *)response->payload;
+
+        qemu_log("UB_VOID_RESPONSE_REAL_TX_FAILED req=%u dcna=%#x\n",
+                 header->req_id, dcna);
+    }
+    ubc_void_pending_response_unlink(response);
+    timer_free(response->timer);
+    g_free(response);
+}
+
+static bool ubc_void_schedule_real_response(
+    BusControllerDev *ubc_dev, uint32_t dcna, const void *payload,
+    uint32_t payload_len, uint64_t delay_ns)
+{
+    UbcVoidPendingResponse *response;
+    uint64_t now_ns;
+    uint64_t due_ns;
+
+    response = g_malloc0(sizeof(*response) + payload_len);
+    response->ubc_dev = ubc_dev;
+    response->dcna = dcna;
+    response->payload_len = payload_len;
+    memcpy(response->payload, payload, payload_len);
+    response->next = ubc_dev->void_pending_responses;
+    ubc_dev->void_pending_responses = response;
+    response->timer = timer_new_ns(
+        QEMU_CLOCK_VIRTUAL, ubc_void_pending_response_timer, response);
+    if (!response->timer) {
+        ubc_void_pending_response_unlink(response);
+        g_free(response);
+        return false;
+    }
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    due_ns = delay_ns > UINT64_MAX - now_ns ? UINT64_MAX :
+        now_ns + delay_ns;
+    timer_mod_ns(response->timer, due_ns);
+    return true;
+}
+
+static void ubc_void_pending_responses_cleanup(BusControllerDev *ubc_dev)
+{
+    UbcVoidPendingResponse *response;
+
+    while ((response = ubc_dev->void_pending_responses) != NULL) {
+        ubc_dev->void_pending_responses = response->next;
+        timer_del(response->timer);
+        timer_free(response->timer);
+        g_free(response);
+    }
+}
+
 void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
                                     const UBCSimDecReadReqPld *req,
                                     uint32_t dcna)
 {
+    UbVoidResponseDecision decision = { 0 };
+    UbVoidResponseRequest policy_request;
+    UBCSimDecReadRespPldHdr void_response = { 0 };
     UBLinkState *link;
     uint32_t payload_len;
     uint32_t eff_tid;
     uint8_t *payload;
     UBCSimDecReadRespPldHdr *resp;
     MemTxResult ret;
+    bool void_eligible;
     int rc;
 
     if (!ubc_dev || !req || req->read_len == 0 ||
@@ -7489,11 +7622,47 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
         return;
     }
 
+    void_eligible = req->flags & UBC_SIM_DEC_READ_FLAG_VOID_ELIGIBLE;
+    if (void_eligible &&
+        ubc_remote_void_response_policy_enabled(ubc_dev)) {
+        policy_request = (UbVoidResponseRequest) {
+            .source_cna = dcna,
+            .request_id = req->req_id,
+            .remote_address = req->remote_uba,
+            .length = req->read_len,
+            .arrival_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+        };
+        decision = ub_void_response_policy_decide(
+            &ubc_dev->void_response_policy, &policy_request);
+        qemu_log("UB_VOID_RESPONSE_DECISION req=%u source=%#x uba=%#" PRIx64
+                 " len=%u delay_ns=%" PRIu64 " jitter_ns=%" PRId64
+                 " action=%s reason=%s\n",
+                 req->req_id, dcna, (uint64_t)req->remote_uba,
+                 req->read_len, decision.completion_delay_ns,
+                 decision.jitter_ns,
+                 decision.send_void ? "void" : "real",
+                 ub_void_response_reason_name(decision.reason));
+        if (decision.send_void) {
+            void_response.req_id = req->req_id;
+            void_response.status = UBC_SIM_DEC_READ_STATUS_VOID;
+            rc = ubc_send_msg_over_link(
+                ubc_dev, link, dcna, UBC_MSG_SUB_SIM_DEC_READ_RESP,
+                &void_response, sizeof(void_response));
+            if (rc < 0) {
+                qemu_log("UB_VOID_RESPONSE_TX_FAILED req=%u dcna=%#x\n",
+                         req->req_id, dcna);
+                return;
+            }
+            qemu_log("UB_VOID_RESPONSE_TX req=%u dcna=%#x\n",
+                     req->req_id, dcna);
+        }
+    }
+
     payload_len = sizeof(*resp) + req->read_len;
     payload = g_malloc0(payload_len);
     resp = (UBCSimDecReadRespPldHdr *)payload;
     resp->req_id = req->req_id;
-    resp->status = 0;
+    resp->status = UBC_SIM_DEC_READ_STATUS_SUCCESS;
     resp->data_len = req->read_len;
     eff_tid = ubc_tid_or_auto(req->token_id);
     if (ubc_trace_data_path_enabled()) {
@@ -7575,7 +7744,7 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
         }
     }
     if (ret != MEMTX_OK) {
-        resp->status = 1;
+        resp->status = UBC_SIM_DEC_READ_STATUS_ERROR;
         resp->data_len = 0;
         qemu_log("ubc sim_dec rx read_req dma_failed req=%u uba=%#" PRIx64
                  " len=%u tid=%u ret=%d\n",
@@ -7583,9 +7752,17 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
                  req->read_len, eff_tid, ret);
     }
 
-    rc = ubc_send_msg_over_link(ubc_dev, link, dcna,
-                                UBC_MSG_SUB_SIM_DEC_READ_RESP,
-                                payload, sizeof(*resp) + resp->data_len);
+    payload_len = sizeof(*resp) + resp->data_len;
+    if (void_eligible && ubc_void_response_policy_enabled(ubc_dev) &&
+        decision.completion_delay_ns > 0) {
+        rc = ubc_void_schedule_real_response(
+            ubc_dev, dcna, payload, payload_len,
+            decision.completion_delay_ns) ? 0 : -ENOMEM;
+    } else {
+        rc = ubc_send_msg_over_link(ubc_dev, link, dcna,
+                                    UBC_MSG_SUB_SIM_DEC_READ_RESP,
+                                    payload, payload_len);
+    }
     if (rc < 0) {
         qemu_log("ubc sim_dec rx read_req: send resp failed req=%u\n",
                  req->req_id);
@@ -7771,6 +7948,62 @@ static void ubc_obmm_async_model_publish(
     memset(child, 0, sizeof(*child));
 }
 
+static const char *ubc_void_trigger_name(UbcVoidTrigger trigger);
+
+static void ubc_voided_transaction_bh(void *opaque)
+{
+    BusControllerDev *ubc_dev = opaque;
+    uint32_t child_slot;
+
+    for (child_slot = 0; child_slot < UBC_OBMM_ASYNC_CHILD_CAPACITY;
+         child_slot++) {
+        UbcObmmAsyncChild *child =
+            &ubc_dev->obmm_async_children[child_slot];
+
+        if (!child->active || !child->voided ||
+            !child->late_real_seen || child->wait_first_response) {
+            continue;
+        }
+        qemu_log("UB_VOID_RESPONSE_LATE_DROP req=%u peer=%#x cause=%s\n",
+                 child->req_id, child->peer_cna,
+                 ubc_void_trigger_name(child->void_trigger));
+        child->complete(child->opaque, child->token, child->child_index,
+                        OBMM_REMOTE_STATUS_VOIDED, NULL, 0,
+                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        memset(child, 0, sizeof(*child));
+    }
+}
+
+static const char *ubc_void_trigger_name(UbcVoidTrigger trigger)
+{
+    switch (trigger) {
+    case UBC_VOID_TRIGGER_SOURCE_POLICY:
+        return "source-policy";
+    case UBC_VOID_TRIGGER_REMOTE_WIRE:
+        return "remote-wire";
+    case UBC_VOID_TRIGGER_NONE:
+    default:
+        return "real-response";
+    }
+}
+
+static bool ubc_obmm_async_child_try_void(UbcObmmAsyncChild *child,
+                                          UbcVoidTrigger trigger)
+{
+    if (!child || !child->active || child->first_response_seen ||
+        child->voided || trigger == UBC_VOID_TRIGGER_NONE) {
+        return false;
+    }
+    child->voided = true;
+    child->first_response_seen = true;
+    child->void_trigger = trigger;
+    qemu_log("UB_VOID_RESPONSE_CPU_RAISE req=%u peer=%#x cause=%s "
+             "transaction=voided\n",
+             child->req_id, child->peer_cna,
+             ubc_void_trigger_name(trigger));
+    return true;
+}
+
 static bool ubc_handle_sim_dec_async_read_resp(
     BusControllerDev *ubc_dev, const UBCSimDecReadRespPldHdr *header,
     const uint8_t *data, uint32_t data_len, uint32_t peer_cna)
@@ -7797,6 +8030,38 @@ static bool ubc_handle_sim_dec_async_read_resp(
     }
     if (!child) {
         return false;
+    }
+    if (header->status == UBC_SIM_DEC_READ_STATUS_VOID) {
+        if (!child->wait_first_response ||
+            !ubc_obmm_async_child_try_void(
+                child, UBC_VOID_TRIGGER_REMOTE_WIRE)) {
+            qemu_log("UB_VOID_RESPONSE_TRIGGER_RACE_LOST req=%u peer=%#x "
+                     "incoming=remote-wire winner=%s\n",
+                     header->req_id, peer_cna,
+                     ubc_void_trigger_name(child->void_trigger));
+            return true;
+        }
+        qemu_log("UB_VOID_RESPONSE_RX req=%u peer=%#x transaction=voided\n",
+                 header->req_id, peer_cna);
+        return true;
+    }
+    if (child->voided) {
+        child->late_real_seen = true;
+        qemu_bh_schedule(ubc_dev->voided_transaction_bh);
+        return true;
+    }
+    if (child->wait_first_response) {
+        child->inline_status = header->status ==
+            UBC_SIM_DEC_READ_STATUS_SUCCESS ?
+            OBMM_REMOTE_STATUS_SUCCESS : OBMM_REMOTE_STATUS_REMOTE_IO;
+        child->inline_bytes = child->inline_status ==
+            OBMM_REMOTE_STATUS_SUCCESS ?
+            MIN(header->data_len, data_len) : 0;
+        if (child->inline_bytes && child->inline_payload) {
+            memcpy(child->inline_payload, data, child->inline_bytes);
+        }
+        child->first_response_seen = true;
+        return true;
     }
     if (child->model_queued) {
         trace_ub_obmm_p1_late(header->req_id, "wire-duplicate", 0);
@@ -8349,28 +8614,41 @@ out:
     return completed;
 }
 
-bool ubc_sim_dec_remote_read_async_submit(
+ObmmProviderChildDisposition ubc_sim_dec_remote_read_async_submit(
     BusControllerDev *ubc_dev, const UbcObmmResolvedMap *map,
     uint64_t remote_offset, uint32_t length,
     const UbObmmRemoteOperation *operation, ObmmRemoteToken token,
     uint16_t child_index, UbcObmmAsyncReadCompleteFn complete,
-    void *opaque)
+    void *opaque, bool void_eligible, void *inline_payload,
+    ObmmRemoteStatus *inline_status)
 {
     UbcObmmAsyncChild *child = NULL;
     UBCSimDecReadReqPld request = { 0 };
     UBLinkState *link;
+    BusControllerState *bcs;
     uint32_t peer_cna;
     uint32_t index;
+    UbVoidResponseDecision source_decision = { 0 };
+    UbVoidResponseRequest source_policy_request;
+    bool remote_predicated;
+    bool source_predicated;
+    bool predicated;
+    int loop;
     int rc;
 
-    if (!ubc_dev || !map || !operation || !complete || length == 0 ||
+    if (!ubc_dev || !map || !operation || !complete || !inline_payload ||
+        !inline_status || length == 0 ||
         remote_offset > map->length || length > map->length - remote_offset) {
-        return false;
+        return OBMM_PROVIDER_CHILD_REJECTED;
     }
     peer_cna = map->peer_cna;
     link = ubc_find_active_link(ubc_dev, &peer_cna);
     if (!link) {
-        return false;
+        return OBMM_PROVIDER_CHILD_REJECTED;
+    }
+    bcs = container_of_ubbus(ub_get_bus(&ubc_dev->parent));
+    if (!bcs) {
+        return OBMM_PROVIDER_CHILD_REJECTED;
     }
     for (index = 0; index < UBC_OBMM_ASYNC_CHILD_CAPACITY; index++) {
         if (!ubc_dev->obmm_async_children[index].active) {
@@ -8379,8 +8657,13 @@ bool ubc_sim_dec_remote_read_async_submit(
         }
     }
     if (!child) {
-        return false;
+        return OBMM_PROVIDER_CHILD_REJECTED;
     }
+    remote_predicated = void_eligible &&
+        ubc_remote_void_response_policy_enabled(ubc_dev);
+    source_predicated = void_eligible &&
+        ubc_source_void_response_policy_enabled(ubc_dev);
+    predicated = remote_predicated || source_predicated;
     request.req_id = ++ubc_dev->next_sim_dec_read_req_id;
     if (request.req_id == 0) {
         request.req_id = ++ubc_dev->next_sim_dec_read_req_id;
@@ -8388,11 +8671,16 @@ bool ubc_sim_dec_remote_read_async_submit(
     request.token_id = map->token_id;
     request.remote_uba = map->remote_uba + remote_offset;
     request.read_len = length;
+    request.flags = remote_predicated ?
+        UBC_SIM_DEC_READ_FLAG_VOID_ELIGIBLE : 0;
     *child = (UbcObmmAsyncChild) {
         .active = true,
+        .wait_first_response = predicated,
         .req_id = request.req_id,
         .peer_cna = peer_cna,
         .expected_len = length,
+        .inline_status = OBMM_REMOTE_STATUS_REMOTE_IO,
+        .inline_payload = inline_payload,
         .token = token,
         .child_index = child_index,
         .operation = *operation,
@@ -8404,9 +8692,86 @@ bool ubc_sim_dec_remote_read_async_submit(
                                 &request, sizeof(request));
     if (rc < 0) {
         memset(child, 0, sizeof(*child));
-        return false;
+        return OBMM_PROVIDER_CHILD_REJECTED;
     }
-    return true;
+    if (source_predicated) {
+        source_policy_request = (UbVoidResponseRequest) {
+            .source_cna = ubc_dev->parent.cna,
+            .request_id = request.req_id,
+            .remote_address = request.remote_uba,
+            .length = request.read_len,
+            .arrival_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+        };
+        source_decision = ub_void_response_policy_decide(
+            &ubc_dev->source_void_response_policy,
+            &source_policy_request);
+        qemu_log("UB_VOID_RESPONSE_SOURCE_DECISION req=%u peer=%#x "
+                 "uba=%#" PRIx64 " len=%u delay_ns=%" PRIu64
+                 " jitter_ns=%" PRId64 " action=%s reason=%s\n",
+                 request.req_id, peer_cna, (uint64_t)request.remote_uba,
+                 request.read_len, source_decision.completion_delay_ns,
+                 source_decision.jitter_ns,
+                 source_decision.send_void ? "void" : "wait",
+                 ub_void_response_reason_name(source_decision.reason));
+        if (source_decision.send_void) {
+            if (ubc_obmm_async_child_try_void(
+                    child, UBC_VOID_TRIGGER_SOURCE_POLICY)) {
+                qemu_log("UB_VOID_RESPONSE_LOCAL_TRIGGER req=%u peer=%#x "
+                         "transaction=voided\n",
+                         request.req_id, peer_cna);
+            } else {
+                qemu_log("UB_VOID_RESPONSE_TRIGGER_RACE_LOST req=%u "
+                         "peer=%#x incoming=source-policy winner=%s\n",
+                         request.req_id, peer_cna,
+                         ubc_void_trigger_name(child->void_trigger));
+            }
+        }
+    }
+    if (!predicated) {
+        child->inline_payload = NULL;
+        return OBMM_PROVIDER_CHILD_PENDING;
+    }
+
+    for (loop = 0; loop < UBC_SIM_DEC_READ_WAIT_LOOPS; loop++) {
+        if (child->first_response_seen) {
+            break;
+        }
+        ub_fm_poll_rx_links_now();
+        if (child->first_response_seen) {
+            break;
+        }
+        ubc_sim_dec_process_wait_links(bcs, ubc_dev, link);
+        if (child->first_response_seen) {
+            break;
+        }
+        qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+        if (child->first_response_seen) {
+            break;
+        }
+        g_usleep(link->shmem_ready ? UBC_SIM_DEC_SHM_READ_WAIT_USEC :
+                                     UBC_SIM_DEC_READ_WAIT_USEC);
+    }
+    child->wait_first_response = false;
+    child->inline_payload = NULL;
+    if (!child->first_response_seen) {
+        qemu_log("UB_VOID_RESPONSE_FIRST_TIMEOUT req=%u peer=%#x\n",
+                 child->req_id, child->peer_cna);
+        memset(child, 0, sizeof(*child));
+        return OBMM_PROVIDER_CHILD_REJECTED;
+    }
+    if (child->voided) {
+        if (child->late_real_seen) {
+            qemu_bh_schedule(ubc_dev->voided_transaction_bh);
+        }
+        return OBMM_PROVIDER_CHILD_PENDING;
+    }
+    *inline_status = child->inline_status;
+    if (child->inline_bytes != length &&
+        *inline_status == OBMM_REMOTE_STATUS_SUCCESS) {
+        *inline_status = OBMM_REMOTE_STATUS_REMOTE_IO;
+    }
+    memset(child, 0, sizeof(*child));
+    return OBMM_PROVIDER_CHILD_INLINE;
 }
 
 void ubc_sim_dec_remote_read_async_cancel(BusControllerDev *ubc_dev,
@@ -10895,6 +11260,21 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
 
     vms->ub_bus = bus;
 
+    ub_void_response_policy_init(
+        &BUS_CONTROLLER_DEV(dev)->void_response_policy);
+    if (!ub_void_response_policy_configure(
+            &BUS_CONTROLLER_DEV(dev)->void_response_policy,
+            BUS_CONTROLLER_DEV(dev)->void_response_policy_spec, errp)) {
+        return;
+    }
+    ub_void_response_policy_init(
+        &BUS_CONTROLLER_DEV(dev)->source_void_response_policy);
+    if (!ub_void_response_policy_configure(
+            &BUS_CONTROLLER_DEV(dev)->source_void_response_policy,
+            BUS_CONTROLLER_DEV(dev)->source_void_response_policy_spec,
+            errp)) {
+        return;
+    }
     ub_obmm_remote_model_init(&BUS_CONTROLLER_DEV(dev)->remote_memory_model);
     if (BUS_CONTROLLER_DEV(dev)->remote_memory_model_manifest &&
         !ub_obmm_remote_model_load(
@@ -10907,6 +11287,9 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
         BUS_CONTROLLER_DEV(dev));
     BUS_CONTROLLER_DEV(dev)->obmm_async_children = g_new0(
         UbcObmmAsyncChild, UBC_OBMM_ASYNC_CHILD_CAPACITY);
+    BUS_CONTROLLER_DEV(dev)->voided_transaction_bh = qemu_bh_new_guarded(
+        ubc_voided_transaction_bh, BUS_CONTROLLER_DEV(dev),
+        &DEVICE(dev)->mem_reentrancy_guard);
     BUS_CONTROLLER_DEV(dev)->obmm_async = ub_obmm_async_new(
         BUS_CONTROLLER_DEV(dev));
     if (!BUS_CONTROLLER_DEV(dev)->obmm_async) {
@@ -10931,6 +11314,29 @@ static void ub_bus_controller_dev_realize(UBDevice *dev, Error **errp)
                  BUS_CONTROLLER_DEV(dev)->remote_memory_model_manifest,
                  BUS_CONTROLLER_DEV(dev)->remote_memory_model.manifest_hash,
                  BUS_CONTROLLER_DEV(dev)->remote_memory_model.config.enabled);
+    }
+    if (ubc_remote_void_response_policy_enabled(
+            BUS_CONTROLLER_DEV(dev))) {
+        const UbVoidResponsePolicyConfig *config =
+            &BUS_CONTROLLER_DEV(dev)->void_response_policy.config;
+
+        qemu_log("UB_VOID_RESPONSE_POLICY scope=destination enabled=1 "
+                 "threshold_ns=%" PRIu64
+                 " latency_ns=%" PRIu64 " jitter_ns=%" PRIu64
+                 " fault_voids=%" PRIu64 " seed=%" PRIu64 "\n",
+                 config->threshold_ns, config->latency_ns,
+                 config->jitter_ns, config->fault_voids, config->seed);
+    }
+    if (ubc_source_void_response_policy_enabled(BUS_CONTROLLER_DEV(dev))) {
+        const UbVoidResponsePolicyConfig *config =
+            &BUS_CONTROLLER_DEV(dev)->source_void_response_policy.config;
+
+        qemu_log("UB_VOID_RESPONSE_POLICY scope=source enabled=1 "
+                 "threshold_ns=%" PRIu64
+                 " latency_ns=%" PRIu64 " jitter_ns=%" PRIu64
+                 " fault_voids=%" PRIu64 " seed=%" PRIu64 "\n",
+                 config->threshold_ns, config->latency_ns,
+                 config->jitter_ns, config->fault_voids, config->seed);
     }
 
     if (!ub_ubc_is_empty(bus)) {
@@ -11020,6 +11426,10 @@ static Property ub_bus_controller_dev_properties[] = {
                        remote_memory_model_manifest),
     DEFINE_PROP_STRING("async-load-model", BusControllerDev,
                        async_load_model),
+    DEFINE_PROP_STRING("void-response-policy", BusControllerDev,
+                       void_response_policy_spec),
+    DEFINE_PROP_STRING("source-void-response-policy", BusControllerDev,
+                       source_void_response_policy_spec),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -11038,6 +11448,11 @@ static void ub_bus_controller_dev_finalize(Object *object)
 {
     BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(object);
 
+    ubc_void_pending_responses_cleanup(ubc_dev);
+    if (ubc_dev->voided_transaction_bh) {
+        qemu_bh_delete(ubc_dev->voided_transaction_bh);
+        ubc_dev->voided_transaction_bh = NULL;
+    }
     linqu_uapi_authorization_discard(ubc_dev);
     if (ubc_dev->linqu_uapi_authorization_timer) {
         timer_free(ubc_dev->linqu_uapi_authorization_timer);

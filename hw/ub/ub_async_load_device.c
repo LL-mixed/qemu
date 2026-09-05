@@ -551,7 +551,6 @@ static ObmmProviderChildDisposition ub_async_load_submit_child(
     UbAsyncLoadMap *map;
     UbObmmRemoteOperation operation;
 
-    (void)inline_payload;
     if (!ub_async_load_map_valid(state, map_id, map_generation)) {
         *inline_status = OBMM_REMOTE_STATUS_STALE_MAP;
         return OBMM_PROVIDER_CHILD_REJECTED;
@@ -564,14 +563,11 @@ static ObmmProviderChildDisposition ub_async_load_submit_child(
         .length = length,
         .per_range_ordinal = operation_ordinal,
     };
-    if (!ubc_sim_dec_remote_read_async_submit(
-            state->ubc_dev, &map->resolved, remote_offset, length,
-            &operation, token, child_index, ub_async_load_child_complete,
-            state)) {
-        *inline_status = OBMM_REMOTE_STATUS_REMOTE_IO;
-        return OBMM_PROVIDER_CHILD_REJECTED;
-    }
-    return OBMM_PROVIDER_CHILD_PENDING;
+    return ubc_sim_dec_remote_read_async_submit(
+        state->ubc_dev, &map->resolved, remote_offset, length,
+        &operation, token, child_index, ub_async_load_child_complete,
+        state, ub_async_load_cpu_kernel_task_mode(current_cpu),
+        inline_payload, inline_status);
 }
 
 static void ub_async_load_cancel_provider(void *opaque, ObmmRemoteToken token)
@@ -938,6 +934,9 @@ uint64_t ub_async_load_device_read(UbAsyncLoadDeviceState *state, hwaddr reg,
             UB_ASYNC_LOAD_CAP_SVC_CONTEXT_RESUME |
             UB_ASYNC_LOAD_CAP_WFE_WAIT |
             UB_ASYNC_LOAD_CAP_CACHEABLE_FILL_REPLAY;
+        if (ubc_void_response_policy_enabled(state->ubc_dev)) {
+            value |= UB_ASYNC_LOAD_CAP_VOID_RESPONSE_RETRY;
+        }
         break;
     case ASYNC_LOAD_REG_IRQ_STATUS:
         value = state->irq_status;
@@ -1385,6 +1384,10 @@ bool ub_async_load_cpu_take_kernel_fault(CPUState *cpu,
     UbAsyncLoadDeviceState *state = ub_async_load_global;
     bool completion_ready;
 
+    if (ub_async_load_cpu_kernel_task_mode(cpu) &&
+        ubc_void_response_policy_enabled(state->ubc_dev)) {
+        return true;
+    }
     if (!ub_async_load_cpu_kernel_task_mode(cpu) ||
         !ub_async_load_ring_publish_one(state, interrupted_pc)) {
         return false;
@@ -1590,6 +1593,10 @@ static void ub_async_load_remote_complete(void *opaque,
     if (!future->active) {
         return;
     }
+    if (result->status == OBMM_REMOTE_STATUS_VOIDED) {
+        ub_async_load_future_release(future);
+        return;
+    }
     ub_async_load_complete_future(
         future, result->status, result->payload,
         result->bytes_done, result->model_publish_ns);
@@ -1615,6 +1622,33 @@ static void ub_async_load_remote_complete(void *opaque,
     }
 }
 
+static bool ub_async_load_inline_value(const UbAsyncLoadDesc *load,
+                                       const void *payload,
+                                       uint32_t bytes_done,
+                                       uint64_t *value)
+{
+    const uint8_t *bytes = payload;
+    uint64_t result = 0;
+    uint8_t index;
+
+    if (!load || !payload || !value || bytes_done != load->access_bytes ||
+        (bytes_done != 1 && bytes_done != 2 && bytes_done != 4 &&
+         bytes_done != 8)) {
+        return false;
+    }
+    if (load->big_endian) {
+        for (index = 0; index < bytes_done; index++) {
+            result = result << 8 | bytes[index];
+        }
+    } else {
+        for (index = 0; index < bytes_done; index++) {
+            result |= (uint64_t)bytes[index] << (index * 8);
+        }
+    }
+    *value = result;
+    return true;
+}
+
 UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
     CPUState *cpu, const UbAsyncLoadDesc *load, uint64_t *replay_value)
 {
@@ -1636,6 +1670,7 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
     uint64_t request_remote_offset;
     uint32_t request_bytes;
     uint16_t context_slot;
+    bool predicated_void;
     int cache_lookup;
     UbAsyncLoadReplayResult replay;
 
@@ -1723,7 +1758,19 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
     }
     future->context_id = state->active_context_id;
     future->load = resolved_load;
-    if (resolved_load.normal_cacheable) {
+    predicated_void = ubc_void_response_policy_enabled(state->ubc_dev) &&
+        ub_async_load_cpu_kernel_task_mode(cpu);
+    if (predicated_void) {
+        if (resolved_load.normal_cacheable) {
+            future->kind = UB_ASYNC_LOAD_FUTURE_CACHEABLE;
+            future->fill_remote_offset = request_remote_offset;
+            future->fill_bytes = request_bytes;
+        } else {
+            future->kind = UB_ASYNC_LOAD_FUTURE_NC;
+            request_remote_offset = remote_offset;
+            request_bytes = load->access_bytes;
+        }
+    } else if (resolved_load.normal_cacheable) {
         future->kind = UB_ASYNC_LOAD_FUTURE_CACHEABLE;
         future->wait_key = ub_async_load_future_cacheable_wait_key(future);
         future->fill_remote_offset = request_remote_offset;
@@ -1752,7 +1799,7 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
         return UB_ASYNC_LOAD_TRY_FAIL_STOP;
     }
     state->context_next_ordinal[context_slot]++;
-    if (resolved_load.normal_cacheable) {
+    if (!predicated_void && resolved_load.normal_cacheable) {
         qemu_log("ASYNC_LOAD_CACHEABLE_PENDING context=%#" PRIx64
                  " wait_key=%#" PRIx64 " pc=%#" PRIx64
                  " va=%#" PRIx64 " fill_offset=%#" PRIx64
@@ -1762,7 +1809,7 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
                  resolved_load.fault_pc, resolved_load.effective_va,
                  request_remote_offset, request_bytes,
                  ub_async_load_pending_count(state->model));
-    } else {
+    } else if (!predicated_void) {
         trace_async_load_load_pending(
             state->owner_generation, state->active_context_id,
             plt_token.generation, plt_token.slot, load->submit_cycle);
@@ -1772,7 +1819,7 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
         .map_generation = map->generation,
         .remote_offset = request_remote_offset,
         .length = request_bytes,
-        .deadline_model_ns = state->load_timeout_ns ?
+        .deadline_model_ns = !predicated_void && state->load_timeout_ns ?
             (now_ns > UINT64_MAX - state->load_timeout_ns ?
              UINT64_MAX : now_ns + state->load_timeout_ns) : 0,
         .operation_ordinal = operation_ordinal,
@@ -1800,9 +1847,41 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
         state->backend, &request, now_ns, &backend_token,
         &inline_result, &status);
     if (disposition == OBMM_SUBMIT_REJECTED) {
-        ub_async_load_complete_future(future, status, NULL, 0, now_ns);
+        if (!predicated_void) {
+            ub_async_load_complete_future(future, status, NULL, 0, now_ns);
+        }
         ub_async_load_future_release(future);
+        if (predicated_void) {
+            return UB_ASYNC_LOAD_TRY_FAIL_STOP;
+        }
     } else if (disposition == OBMM_SUBMIT_INLINE) {
+        if (predicated_void && resolved_load.normal_cacheable) {
+            bool filled = inline_result.status == OBMM_REMOTE_STATUS_SUCCESS &&
+                inline_result.bytes_done == future->fill_bytes &&
+                ubc_obmm_cacheable_fill_complete(
+                    state->ubc_dev,
+                    &state->maps[future->load.map_id - 1].resolved,
+                    future->fill_remote_offset, inline_result.payload,
+                    inline_result.bytes_done);
+
+            if (filled) {
+                ub_async_load_record_cacheable_fill_bytes(
+                    state->model, inline_result.bytes_done);
+            }
+            ub_async_load_future_release(future);
+            return filled ? UB_ASYNC_LOAD_TRY_NOT_REMOTE :
+                UB_ASYNC_LOAD_TRY_FAIL_STOP;
+        }
+        if (predicated_void) {
+            bool valid = inline_result.status == OBMM_REMOTE_STATUS_SUCCESS &&
+                ub_async_load_inline_value(
+                    &resolved_load, inline_result.payload,
+                    inline_result.bytes_done, replay_value);
+
+            ub_async_load_future_release(future);
+            return valid ? UB_ASYNC_LOAD_TRY_REPLAYED :
+                UB_ASYNC_LOAD_TRY_FAIL_STOP;
+        }
         if (!resolved_load.normal_cacheable) {
             trace_async_load_load_inline(
                 state->owner_generation, state->active_context_id,
@@ -1816,6 +1895,10 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
         future->backend_token = backend_token;
     }
     ub_async_load_arm_deadline(state);
+    if (predicated_void) {
+        return disposition == OBMM_SUBMIT_PENDING ?
+            UB_ASYNC_LOAD_TRY_PENDING : UB_ASYNC_LOAD_TRY_FAIL_STOP;
+    }
     return ub_async_load_fail_stop(state->model) ?
         UB_ASYNC_LOAD_TRY_FAIL_STOP : UB_ASYNC_LOAD_TRY_PENDING;
 }
