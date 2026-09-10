@@ -6190,6 +6190,7 @@ static void linqu_uapi_flush_cq(BusControllerDev *ubc_dev)
 
 static void linqu_uapi_kick(BusControllerDev *ubc_dev, uint32_t batch)
 {
+    g_autoptr(LinquBridgeLock) guard = linqu_bridge_lock(&ubc_dev->linqu_uapi_lock);
     uint8_t slot[LINQU_UAPI_DESC_BYTES];
     uint64_t ub_gm_ops[LINQU_UAPI_DEFAULT_CMDQ_DEPTH] = { 0 };
     uint32_t ub_gm_op_count = 0;
@@ -6416,6 +6417,7 @@ static uint64_t linqu_uapi_access_merge(uint64_t current_value, hwaddr reg,
 static uint64_t linqu_uapi_reg_read(BusControllerDev *ubc_dev, hwaddr reg,
                                     unsigned len)
 {
+    g_autoptr(LinquBridgeLock) guard = linqu_bridge_lock(&ubc_dev->linqu_uapi_lock);
     uint64_t value = 0;
 
     if (reg == LINQU_UAPI_REG_VERSION) {
@@ -6495,6 +6497,7 @@ static uint64_t linqu_uapi_reg_read(BusControllerDev *ubc_dev, hwaddr reg,
 static bool linqu_uapi_reg_write(BusControllerDev *ubc_dev, hwaddr reg,
                                  uint64_t value, unsigned len)
 {
+    g_autoptr(LinquBridgeLock) guard = linqu_bridge_lock(&ubc_dev->linqu_uapi_lock);
     hwaddr base_reg = reg & ~0x7ULL;
     uint64_t current;
 
@@ -6601,6 +6604,7 @@ static bool linqu_uapi_reg_write(BusControllerDev *ubc_dev, hwaddr reg,
 static void ub_bus_controller_dev_reset(DeviceState *device)
 {
     BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(device);
+    g_autoptr(LinquBridgeLock) guard = linqu_bridge_lock(&ubc_dev->linqu_uapi_lock);
     LinquPtoAuthorizationState *authorization =
         ubc_dev->linqu_uapi_authorization;
     uint64_t op_id = authorization ? authorization->op_id : 0;
@@ -11444,9 +11448,17 @@ static void ub_bus_controller_dev_class_init(ObjectClass *class, void *data)
     dc->vmsd = &vmstate_ub_bus_controller_dev;
 }
 
+static void ub_bus_controller_dev_instance_init(Object *object)
+{
+    BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(object);
+
+    qemu_rec_mutex_init(&ubc_dev->linqu_uapi_lock);
+}
+
 static void ub_bus_controller_dev_finalize(Object *object)
 {
     BusControllerDev *ubc_dev = BUS_CONTROLLER_DEV(object);
+    g_autoptr(LinquBridgeLock) guard = linqu_bridge_lock(&ubc_dev->linqu_uapi_lock);
 
     ubc_void_pending_responses_cleanup(ubc_dev);
     if (ubc_dev->voided_transaction_bh) {
@@ -11475,12 +11487,15 @@ static void ub_bus_controller_dev_finalize(Object *object)
     ub_obmm_remote_model_cleanup(&ubc_dev->remote_memory_model);
     g_free(ubc_dev->obmm_async_children);
     ubc_dev->obmm_async_children = NULL;
+    g_clear_pointer(&guard, qemu_rec_mutex_unlock);
+    qemu_rec_mutex_destroy(&ubc_dev->linqu_uapi_lock);
 }
 
 static const TypeInfo ub_bus_controller_dev_type_info = {
     .name = TYPE_BUS_CONTROLLER_DEV,
     .parent = TYPE_UB_DEVICE,
     .instance_size = sizeof(BusControllerDev),
+    .instance_init = ub_bus_controller_dev_instance_init,
     .instance_finalize = ub_bus_controller_dev_finalize,
     .class_size = sizeof(BusControllerDevClass),
     .class_init = ub_bus_controller_dev_class_init,

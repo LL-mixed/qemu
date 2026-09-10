@@ -28,6 +28,7 @@
 #include "hw/ub/ub_obmm_remote_model.h"
 #include "hw/ub/ub_void_response_policy.h"
 #include "hw/ub/ub_async_load_device.h"
+#include "hw/ub/linqu_bridge_lock.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
 
@@ -267,6 +268,7 @@ typedef struct BusControllerDev {
     } coh_sync_wait;
     uint32_t next_coh_req_id;
 
+    LinquBridgeLock linqu_uapi_lock;
     void *linqu_uapi_bridge;
     bool linqu_uapi_bridge_ready;
     uint64_t linqu_uapi_cmdq_iova;

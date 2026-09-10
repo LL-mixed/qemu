@@ -55,6 +55,7 @@ tests = {
   'test-ub-obmm-remote-model': [
     meson.project_source_root() / 'hw/ub/ub_obmm_remote_model.c'
   ],
+  'test-linqu-bridge-lock': [],
   'test-ub-void-response-policy': [
     meson.project_source_root() / 'hw/ub/ub_void_response_policy.c'
   ],
