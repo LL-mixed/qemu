@@ -60,6 +60,8 @@ typedef struct GsvaRouteEntry {
     uint32_t home_cna;
     uint32_t owner_cna;
     GsvaTokenLease token;
+    /* V2 separates the physical export credential from the GSVA lease. */
+    uint32_t backing_token_id;
     uint64_t map_id;
     MemoryRegion cpu_window;
     bool cpu_window_mapped;

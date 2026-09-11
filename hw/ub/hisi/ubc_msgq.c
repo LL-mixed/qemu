@@ -751,7 +751,10 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
         return;
     }
 
-    while (true) {
+    /* A peer can continuously refill the ring while responses are sent.
+     * Bound each callback so the main loop releases the BQL for vCPUs and
+     * timers. Remaining frames are drained by the next notification/poll. */
+    for (unsigned int processed = 0; processed < 64; processed++) {
         void *buf = NULL;
         size_t len = 0;
         Error *local_err = NULL;
@@ -880,6 +883,12 @@ void ub_link_process_incoming_message(BusControllerState *s, UBLinkState *link)
                     uint32_t magic = 0;
 
                     memcpy(&magic, payload, sizeof(magic));
+                    if (magic == UBC_GSVA_IO_MAGIC) {
+                        ubc_handle_gsva_io(s->ubc_dev, payload, payload_len,
+                                          header->nth.scna);
+                        g_free(buf);
+                        continue;
+                    }
                     if (magic == UBC_UB_SSD_READ_REQ_MAGIC) {
                         if (payload_len >= sizeof(UBCUbSsdReadReqPld)) {
                             const UBCUbSsdReadReqPld *req =

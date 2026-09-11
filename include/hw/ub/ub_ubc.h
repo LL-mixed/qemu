@@ -590,6 +590,21 @@ typedef struct QEMU_PACKED UBCSimDecReadReqPld {
     uint32_t flags;
 } UBCSimDecReadReqPld;
 
+/* Versioned strict CPU-window I/O, carried by the existing batch subcode.
+ * Old peers reject the magic as an invalid batch version. */
+#define UBC_GSVA_IO_MAGIC 0x4753494fU
+typedef struct QEMU_PACKED UBCGsvaIoReq {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t write;
+    uint32_t reserved;
+    UBCSimDecReadReqPld request;
+    /* write request bytes follow; reads have no trailing bytes */
+} UBCGsvaIoReq;
+
+void ubc_handle_gsva_io(BusControllerDev *ubc_dev, const uint8_t *payload,
+                       uint32_t payload_len, uint32_t peer_cna);
+
 typedef struct QEMU_PACKED UBCSimDecReadRespPldHdr {
     uint32_t req_id;
     uint32_t status;
