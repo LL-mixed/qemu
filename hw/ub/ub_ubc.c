@@ -4164,22 +4164,20 @@ static void ubc_process_cmdq(BusControllerDev *ubc_dev)
             UBCCmdqDesc verify;
             uint16_t first = (idx + csq->depth - bd_num) % csq->depth;
             fprintf(stderr, "ubc ue2ue resp write: bd0 op=0x%x flag=0x%x ret=%u"
-                    " data[0..3]=[%08x %08x %08x %08x] data[4..7]=[%08x %08x %08x %08x]\n",
+                    " data[0..3]=[%08x %08x %08x %08x] data[4..5]=[%08x %08x]\n",
                     le16_to_cpu(descs[0].opcode), descs[0].flag,
                     le16_to_cpu(descs[0].ret),
                     le32_to_cpu(descs[0].data[0]), le32_to_cpu(descs[0].data[1]),
                     le32_to_cpu(descs[0].data[2]), le32_to_cpu(descs[0].data[3]),
-                    le32_to_cpu(descs[0].data[4]), le32_to_cpu(descs[0].data[5]),
-                    le32_to_cpu(descs[0].data[6]), le32_to_cpu(descs[0].data[7]));
+                    le32_to_cpu(descs[0].data[4]), le32_to_cpu(descs[0].data[5]));
             if (ubc_read_desc(csq, ubc_dev, first, &verify) == MEMTX_OK) {
                 fprintf(stderr, "ubc ue2ue resp readback[%u]: op=0x%x flag=0x%x ret=%u"
-                        " data[0..3]=[%08x %08x %08x %08x] data[4..7]=[%08x %08x %08x %08x]\n",
+                        " data[0..3]=[%08x %08x %08x %08x] data[4..5]=[%08x %08x]\n",
                         first, le16_to_cpu(verify.opcode), verify.flag,
                         le16_to_cpu(verify.ret),
                         le32_to_cpu(verify.data[0]), le32_to_cpu(verify.data[1]),
                         le32_to_cpu(verify.data[2]), le32_to_cpu(verify.data[3]),
-                        le32_to_cpu(verify.data[4]), le32_to_cpu(verify.data[5]),
-                        le32_to_cpu(verify.data[6]), le32_to_cpu(verify.data[7]));
+                        le32_to_cpu(verify.data[4]), le32_to_cpu(verify.data[5]));
             } else {
                 fprintf(stderr, "ubc ue2ue resp readback FAILED for idx=%u\n", first);
             }
