@@ -84,6 +84,30 @@ typedef struct GsvaRouteTable {
     int tombstone_count;
 } GsvaRouteTable;
 
+/* Value-only PTO identity; never retains a borrowed route/MMIO pointer. */
+typedef struct GsvaRouteAccess {
+    GsvaKeyV1 key;
+    uint64_t map_id;
+    uint64_t local_pa;
+    uint64_t lease_epoch;
+    uint64_t allowed_cna_bitmap;
+    uint32_t home_cna;
+    uint32_t owner_cna;
+    uint32_t source;
+    uint32_t token_id;
+    uint32_t token_value;
+    uint32_t access_flags;
+    uint32_t token_flags;
+    uint32_t backing_token_id;
+} GsvaRouteAccess;
+
+/* Caller holds BQL. Only installed strict V2 windows are PTO-capable. */
+int gsva_route_resolve_pto(GsvaRouteTable *tbl, uint64_t local_pa,
+                           uint64_t length, uint32_t requester_cna,
+                           GsvaRouteAccess *access);
+bool gsva_route_access_equal(const GsvaRouteAccess *a,
+                              const GsvaRouteAccess *b);
+
 /* Initialize route table */
 void gsva_route_table_init(GsvaRouteTable *tbl);
 

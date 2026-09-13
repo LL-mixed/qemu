@@ -260,6 +260,88 @@ GsvaRouteEntry *gsva_route_lookup_va(GsvaRouteTable *tbl,
     return NULL;
 }
 
+int gsva_route_resolve_pto(GsvaRouteTable *tbl, uint64_t local_pa,
+                           uint64_t length, uint32_t requester_cna,
+                           GsvaRouteAccess *access)
+{
+    GsvaRouteEntry *entry, *route = NULL;
+    uint64_t offset;
+
+    if (!tbl || !access || !length || local_pa > UINT64_MAX - length) {
+        return GSVA_ERR_KEY_MISMATCH;
+    }
+    QTAILQ_FOREACH(entry, &tbl->routes, next) {
+        if (local_pa >= entry->local_pa &&
+            local_pa - entry->local_pa < entry->key.size) {
+            if (route) {
+                return GSVA_ERR_KEY_MISMATCH;
+            }
+            route = entry;
+        }
+    }
+    if (!route) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+    offset = local_pa - route->local_pa;
+    if (gsva_key_validate(&route->key) != GSVA_OK || !route->key.epoch ||
+        route->local_pa > UINT64_MAX - route->key.size ||
+        route->key.home_va > UINT64_MAX - route->key.size ||
+        length > route->key.size - offset) {
+        return GSVA_ERR_KEY_MISMATCH;
+    }
+    if (route->address_profile != GSVA_ADDRESS_PROFILE_STRICT_GSVA ||
+        route->local_va != route->key.home_va ||
+        route->remote_uba != route->key.home_va ||
+        !route->backing_token_id || !route->map_id ||
+        !route->cpu_window_initialized || !route->cpu_window_mapped) {
+        return GSVA_ERR_FEATURE_MISSING;
+    }
+    if (route->state != GSVA_ROUTE_ACTIVE ||
+        route->token.state != GSVA_TOKEN_ACTIVE || !route->token.active ||
+        route->token.pending_token_value || !route->token.lease_epoch ||
+        !route->home_cna || !route->owner_cna || !requester_cna ||
+        !route->token.access_flags || (route->token.access_flags & ~3u) ||
+        (route->token.allowed_cna_bitmap && requester_cna >= 64) ||
+        gsva_route_validate_token(route, requester_cna,
+                                  route->token.token_id,
+                                  route->token.token_value, 0) != GSVA_OK) {
+        return GSVA_ERR_TOKEN_DENIED;
+    }
+    *access = (GsvaRouteAccess) {
+        .key = route->key,
+        .map_id = route->map_id,
+        .local_pa = route->local_pa,
+        .lease_epoch = route->token.lease_epoch,
+        .allowed_cna_bitmap = route->token.allowed_cna_bitmap,
+        .home_cna = route->home_cna,
+        .owner_cna = route->owner_cna,
+        .source = route->source,
+        .token_id = route->token.token_id,
+        .token_value = route->token.token_value,
+        .access_flags = route->token.access_flags,
+        .token_flags = route->token.flags,
+        .backing_token_id = route->backing_token_id,
+    };
+    return GSVA_OK;
+}
+
+bool gsva_route_access_equal(const GsvaRouteAccess *a,
+                              const GsvaRouteAccess *b)
+{
+    return a && b && gsva_key_base_equal(&a->key, &b->key) &&
+           a->key.version == b->key.version && a->key.flags == b->key.flags &&
+           a->key.size == b->key.size && a->key.epoch == b->key.epoch &&
+           a->map_id == b->map_id && a->local_pa == b->local_pa &&
+           a->lease_epoch == b->lease_epoch &&
+           a->allowed_cna_bitmap == b->allowed_cna_bitmap &&
+           a->home_cna == b->home_cna && a->owner_cna == b->owner_cna &&
+           a->source == b->source && a->token_id == b->token_id &&
+           a->token_value == b->token_value &&
+           a->access_flags == b->access_flags &&
+           a->token_flags == b->token_flags &&
+           a->backing_token_id == b->backing_token_id;
+}
+
 GsvaRouteEntry *gsva_route_lookup_base(GsvaRouteTable *tbl,
                                        const GsvaKeyV1 *key)
 {

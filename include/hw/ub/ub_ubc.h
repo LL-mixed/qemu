@@ -23,7 +23,7 @@
 #include "hw/ub/hisi/ubc.h"
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_link.h"
-#include "hw/ub/gsva_key.h"
+#include "hw/ub/gsva_route.h"
 #include "hw/ub/ub_obmm_remote.h"
 #include "hw/ub/ub_obmm_remote_model.h"
 #include "hw/ub/ub_void_response_policy.h"
@@ -304,7 +304,35 @@ typedef struct UbcObmmResolvedMap {
     uint32_t token_id;
     uint32_t peer_cna;
     uint32_t access_flags;
+    uint32_t pto_access;
+    bool strict_gsva;
+    GsvaRouteAccess gsva;
 } UbcObmmResolvedMap;
+
+/* Range/offset checks are separate; route and lease identity must stay exact. */
+static inline bool ubc_obmm_map_identity_equal(const UbcObmmResolvedMap *a,
+                                               const UbcObmmResolvedMap *b)
+{
+    return a && b && a->map_id == b->map_id &&
+           a->map_generation == b->map_generation &&
+           a->token_id == b->token_id && a->peer_cna == b->peer_cna &&
+           a->access_flags == b->access_flags &&
+           a->pto_access == b->pto_access &&
+           a->strict_gsva == b->strict_gsva &&
+           (!a->strict_gsva || gsva_route_access_equal(&a->gsva, &b->gsva));
+}
+
+static inline bool ubc_obmm_strict_pto_access(const UbcObmmResolvedMap *map,
+                                              uint64_t vma_access,
+                                              uint32_t *access_out)
+{
+    if (!map || !access_out || !map->strict_gsva || !vma_access ||
+        (vma_access & ~UINT64_C(3)) || !(vma_access & map->pto_access)) {
+        return false;
+    }
+    *access_out = vma_access & map->pto_access;
+    return true;
+}
 
 typedef void (*UbcObmmAsyncReadCompleteFn)(
     void *opaque, ObmmRemoteToken token, uint16_t child_index,

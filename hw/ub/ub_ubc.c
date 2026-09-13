@@ -160,6 +160,7 @@ typedef struct LinquUbGmBindingState {
     uint32_t token_id;
     uint32_t peer_cna;
     uint32_t access;
+    UbcObmmResolvedMap identity;
     bool dirty;
     bool active;
 } LinquUbGmBindingState;
@@ -4895,11 +4896,8 @@ static bool linqu_ub_gm_mapping_still_authorized(
             resolved)) {
         return false;
     }
-    return resolved->map_id == binding->map_id &&
-           resolved->map_generation == binding->map_generation &&
-           resolved->remote_uba == binding->remote_base + offset &&
-           resolved->token_id == binding->token_id &&
-           resolved->peer_cna == binding->peer_cna;
+    return ubc_obmm_map_identity_equal(resolved, &binding->identity) &&
+           resolved->remote_uba == binding->remote_base + offset;
 }
 
 static void linqu_ub_gm_account_access(BusControllerDev *ubc_dev,
@@ -4950,6 +4948,7 @@ static int linqu_ub_gm_read(void *opaque, uint64_t request_id,
     BusControllerDev *ubc_dev = opaque;
     LinquUbGmBindingState binding;
     UbcObmmResolvedMap resolved;
+    MemTxResult ret;
 
     /* Simpler invokes this callback from its PTO worker thread. */
     QEMU_IOTHREAD_LOCK_GUARD();
@@ -4958,16 +4957,25 @@ static int linqu_ub_gm_read(void *opaque, uint64_t request_id,
                     ubc_dev, request_id, binding_id, ub_gm_addr, length,
                     LINGQU_PTO_UB_GM_READ, &binding) ||
         !linqu_ub_gm_mapping_still_authorized(
-            ubc_dev, &binding, ub_gm_addr, length, &resolved)) {
+            ubc_dev, &binding, ub_gm_addr, length, &resolved) ||
+        !(resolved.pto_access & LINGQU_PTO_UB_GM_READ)) {
         qemu_log("QEMU_UB_GM_LOAD denied request=%" PRIu64
                  " binding=%" PRIu64 " addr=0x%" PRIx64
                  " length=%" PRIu64 "\n",
                  request_id, binding_id, ub_gm_addr, length);
         return -LINGQU_PTO_UB_GM_UNBOUND;
     }
-    if (ubc_sim_dec_remote_read(ubc_dev, resolved.remote_uba,
-                                resolved.token_id, resolved.peer_cna,
-                                dst, (uint32_t)length) != MEMTX_OK) {
+    if (resolved.strict_gsva) {
+        ret = ubc_sim_dec_remote_io(ubc_dev, resolved.remote_uba,
+                                    resolved.gsva.backing_token_id,
+                                    resolved.peer_cna, dst, (uint32_t)length,
+                                    true, false);
+    } else {
+        ret = ubc_sim_dec_remote_read(ubc_dev, resolved.remote_uba,
+                                      resolved.token_id, resolved.peer_cna,
+                                      dst, (uint32_t)length);
+    }
+    if (ret != MEMTX_OK) {
         return -LINGQU_PTO_UB_GM_CALLBACK_FAILED;
     }
     linqu_ub_gm_account_access(ubc_dev, request_id, binding_id,
@@ -4987,6 +4995,7 @@ static int linqu_ub_gm_write(void *opaque, uint64_t request_id,
     BusControllerDev *ubc_dev = opaque;
     LinquUbGmBindingState binding;
     UbcObmmResolvedMap resolved;
+    MemTxResult ret;
 
     /* Simpler invokes this callback from its PTO worker thread. */
     QEMU_IOTHREAD_LOCK_GUARD();
@@ -4996,16 +5005,25 @@ static int linqu_ub_gm_write(void *opaque, uint64_t request_id,
                     LINGQU_PTO_UB_GM_WRITE, &binding) ||
         !linqu_ub_gm_mapping_still_authorized(
             ubc_dev, &binding, ub_gm_addr, length, &resolved) ||
-        (resolved.access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY)) {
+        (resolved.access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY) ||
+        !(resolved.pto_access & LINGQU_PTO_UB_GM_WRITE)) {
         qemu_log("QEMU_UB_GM_STORE denied request=%" PRIu64
                  " binding=%" PRIu64 " addr=0x%" PRIx64
                  " length=%" PRIu64 "\n",
                  request_id, binding_id, ub_gm_addr, length);
         return -LINGQU_PTO_UB_GM_ACCESS_DENIED;
     }
-    if (ubc_sim_dec_remote_write(ubc_dev, resolved.remote_uba,
-                                 resolved.token_id, resolved.peer_cna,
-                                 src, (uint32_t)length) != MEMTX_OK) {
+    if (resolved.strict_gsva) {
+        ret = ubc_sim_dec_remote_io(ubc_dev, resolved.remote_uba,
+                                    resolved.gsva.backing_token_id,
+                                    resolved.peer_cna, (uint8_t *)src,
+                                    (uint32_t)length, true, true);
+    } else {
+        ret = ubc_sim_dec_remote_write(ubc_dev, resolved.remote_uba,
+                                       resolved.token_id, resolved.peer_cna,
+                                       src, (uint32_t)length);
+    }
+    if (ret != MEMTX_OK) {
         return -LINGQU_PTO_UB_GM_CALLBACK_FAILED;
     }
     linqu_ub_gm_account_access(ubc_dev, request_id, binding_id,
@@ -5908,18 +5926,18 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
             (!ub_obmm_async_resolve_mapping_ref(
                  ubc_dev->obmm_async, memref->opaque_mapping_ref,
                  view_start, memref->byte_length, &current) ||
-             current.map_id != resolved.map_id ||
-             current.map_generation != resolved.map_generation ||
+             !ubc_obmm_map_identity_equal(&current, &resolved) ||
              current.local_pa != resolved.local_pa ||
-             current.remote_uba != resolved.remote_uba ||
-             current.token_id != resolved.token_id ||
-             current.peer_cna != resolved.peer_cna ||
-             current.access_flags != resolved.access_flags)) {
+             current.remote_uba != resolved.remote_uba)) {
             error = LINGQU_PTO_UB_GM_UNBOUND;
             goto out;
         }
         if ((memref->access & LINGQU_PTO_UB_GM_WRITE) &&
             (resolved.access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY)) {
+            error = LINGQU_PTO_UB_GM_ACCESS_DENIED;
+            goto out;
+        }
+        if (memref->access & ~resolved.pto_access) {
             error = LINGQU_PTO_UB_GM_ACCESS_DENIED;
             goto out;
         }
@@ -5952,6 +5970,7 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
             .token_id = resolved.token_id,
             .peer_cna = resolved.peer_cna,
             .access = memref->access,
+            .identity = resolved,
             .active = true,
         };
         aperture = next_aperture;
@@ -5971,6 +5990,17 @@ static int linqu_uapi_submit_ub_gm_v2(BusControllerDev *ubc_dev,
                  control.requester_cna, binding->local_base,
                  memref->byte_length, binding->map_id,
                  binding->map_generation, binding->peer_cna);
+        if (binding->identity.strict_gsva) {
+            const GsvaRouteAccess *gsva = &binding->identity.gsva;
+
+            qemu_log("QEMU_UB_GM_GSVA_BIND request=%" PRIu64
+                     " binding=%" PRIu64 " segment=%#" PRIx64
+                     " home_va=%#" PRIx64 " epoch=%" PRIu64
+                     " lease_epoch=%" PRIu64 " backing_token=%u\n",
+                     control.request_id, binding->binding_id,
+                     gsva->key.segment_id, gsva->key.home_va, gsva->key.epoch,
+                     gsva->lease_epoch, gsva->backing_token_id);
+        }
     }
     if (!linqu_ub_gm_register_dispatch(
             ubc_dev, op_id, control.request_id, bindings,
@@ -8516,11 +8546,39 @@ bool ubc_obmm_resolve_async_map(BusControllerDev *ubc_dev,
                                 UbcObmmResolvedMap *resolved)
 {
     SimDecMapEntry *entry;
+    GsvaRouteAccess gsva;
     uint64_t offset;
+    int gsva_rc;
     bool found = false;
 
     if (!ubc_dev || !resolved || !g_sim_decoder || length == 0 ||
+        !g_sim_decoder->bcs || g_sim_decoder->bcs->ubc_dev != ubc_dev ||
         local_pa > UINT64_MAX - length) {
+        return false;
+    }
+    /* MMIO registration and PTO callbacks are serialized by BQL. */
+    gsva_tables_init();
+    gsva_rc = gsva_route_resolve_pto(&g_gsva_routes, local_pa, length,
+                                     ubc_dev->parent.cna, &gsva);
+    if (gsva_rc == GSVA_OK) {
+        offset = local_pa - gsva.local_pa;
+        *resolved = (UbcObmmResolvedMap) {
+            .map_id = gsva.map_id,
+            .map_generation = gsva.key.epoch,
+            .local_pa = local_pa,
+            .remote_uba = gsva.key.home_va + offset,
+            .length = length,
+            .token_id = gsva.token_id,
+            .peer_cna = gsva.home_cna,
+            .access_flags = (gsva.access_flags & 2) ? 0 :
+                            SIM_DEC_GVA_ACCESS_READ_ONLY,
+            .pto_access = gsva.access_flags,
+            .strict_gsva = true,
+            .gsva = gsva,
+        };
+        return true;
+    }
+    if (gsva_rc != GSVA_ERR_ROUTE_MISSING) {
         return false;
     }
     qemu_mutex_lock(&g_sim_decoder->lock);
@@ -8559,6 +8617,8 @@ bool ubc_obmm_resolve_async_map(BusControllerDev *ubc_dev,
         .token_id = entry->token_id,
         .peer_cna = entry->dcna,
         .access_flags = entry->access_flags,
+        .pto_access = (entry->access_flags & SIM_DEC_GVA_ACCESS_READ_ONLY) ?
+                      LINGQU_PTO_UB_GM_READ : LINGQU_PTO_UB_GM_READ_WRITE,
     };
     found = true;
 out:

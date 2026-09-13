@@ -41,6 +41,7 @@
 #define OBMM_ASYNC_REG_CANCEL_TOKEN 0x150
 #define OBMM_ASYNC_REG_CANCEL_CMD 0x158
 #define OBMM_ASYNC_REG_GUEST_MONOTONIC_NS 0x160
+#define OBMM_ASYNC_REG_MAP_ACCESS 0x168
 #define OBMM_ASYNC_REG_OBSERVABILITY_RESET 0x1f8
 #define OBMM_ASYNC_REG_OBSERVABILITY_BASE 0x200
 
@@ -72,6 +73,7 @@ typedef struct UbObmmAsyncMap {
     uint64_t generation;
     uint64_t length;
     uint64_t next_ordinal;
+    uint32_t pto_access;
     UbcObmmResolvedMap resolved;
 } UbObmmAsyncMap;
 
@@ -135,6 +137,7 @@ struct UbObmmAsyncState {
     uint64_t map_length;
     uint64_t map_id;
     uint64_t map_generation;
+    uint64_t map_access;
     uint64_t buffer_base;
     uint64_t buffer_length;
     uint64_t buffer_id;
@@ -321,16 +324,13 @@ bool ub_obmm_async_resolve_mapping_ref(UbObmmAsyncState *state,
                                     &current)) {
         return false;
     }
-    if (current.map_id != map->resolved.map_id ||
-        current.map_generation != map->resolved.map_generation ||
+    if (!ubc_obmm_map_identity_equal(&current, &map->resolved) ||
         current.local_pa != local_pa ||
-        current.remote_uba != map->resolved.remote_uba + offset ||
-        current.token_id != map->resolved.token_id ||
-        current.peer_cna != map->resolved.peer_cna ||
-        current.access_flags != map->resolved.access_flags) {
+        current.remote_uba != map->resolved.remote_uba + offset) {
         return false;
     }
     *resolved = current;
+    resolved->pto_access &= map->pto_access;
     return true;
 }
 
@@ -658,6 +658,11 @@ static bool ub_obmm_async_future_prepare(
     map = &state->maps[entry->map_id - 1];
     if (!map->active || map->generation != entry->map_generation) {
         *status = OBMM_REMOTE_STATUS_STALE_MAP;
+        return false;
+    }
+    /* Strict V2 registration currently authorizes PTO, not the legacy queue. */
+    if (map->resolved.strict_gsva) {
+        *status = OBMM_REMOTE_STATUS_UNSUPPORTED;
         return false;
     }
     if (entry->remote_offset > map->length ||
@@ -1047,13 +1052,26 @@ static void ub_obmm_async_map_command(UbObmmAsyncState *state,
         return;
     }
     map = &state->maps[state->map_id - 1];
-    if (command == 1) {
+    if (command == 1 || command == 3) {
         if (map->active || state->map_length == 0 ||
             !ubc_obmm_resolve_async_map(
                 state->ubc_dev, state->map_local_pa,
                 state->map_length, &map->resolved)) {
             state->last_error = UB_OBMM_ASYNC_NO_MAP;
             return;
+        }
+        if (command == 3) {
+            if (!ubc_obmm_strict_pto_access(&map->resolved, state->map_access,
+                                            &map->pto_access)) {
+                state->last_error = UB_OBMM_ASYNC_PERMISSION;
+                return;
+            }
+        } else {
+            if (map->resolved.strict_gsva) {
+                state->last_error = UB_OBMM_ASYNC_UNSUPPORTED;
+                return;
+            }
+            map->pto_access = map->resolved.pto_access;
         }
         map->active = true;
         map->generation = state->map_generation;
@@ -1216,6 +1234,9 @@ bool ub_obmm_async_write(UbObmmAsyncState *state, hwaddr reg,
         return true;
     case OBMM_ASYNC_REG_MAP_GENERATION:
         state->map_generation = value;
+        return true;
+    case OBMM_ASYNC_REG_MAP_ACCESS:
+        state->map_access = value;
         return true;
     case OBMM_ASYNC_REG_MAP_CMD:
         ub_obmm_async_map_command(state, value);
