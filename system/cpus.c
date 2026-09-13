@@ -274,11 +274,10 @@ void cpu_interrupt(CPUState *cpu, int mask)
     }
 }
 
-static int do_vm_stop(RunState state, bool send_stop)
+static int do_vm_stop(RunState state, bool send_stop, MigrationState *s)
 {
     int ret = 0;
     int64_t start_time;
-    MigrationState *s = migrate_get_current();
 
     if (runstate_is_running()) {
         runstate_set(state);
@@ -286,7 +285,9 @@ static int do_vm_stop(RunState state, bool send_stop)
         start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         pause_all_vcpus();
         qemu_log("stop vcpu cost time: %ld ms\n", qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - start_time);
-        migration_downtime_start(migrate_get_current());
+        if (s) {
+            migration_downtime_start(s);
+        }
         trace_all_vcpus_paused();
 
         start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -294,14 +295,18 @@ static int do_vm_stop(RunState state, bool send_stop)
         if (send_stop) {
             qapi_event_send_stop();
         }
-        s->notify_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - start_time;
+        if (s) {
+            s->notify_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - start_time;
+        }
     }
 
     start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     bdrv_drain_all();
     ret = bdrv_flush_all();
     trace_vm_stop_flush_all(ret);
-    s->bdrv_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - start_time;
+    if (s) {
+        s->bdrv_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - start_time;
+    }
 
     return ret;
 }
@@ -311,7 +316,8 @@ static int do_vm_stop(RunState state, bool send_stop)
  */
 int vm_shutdown(void)
 {
-    return do_vm_stop(RUN_STATE_SHUTDOWN, false);
+    /* qemu_cleanup() has already destroyed the migration object. */
+    return do_vm_stop(RUN_STATE_SHUTDOWN, false, NULL);
 }
 
 bool cpu_can_run(CPUState *cpu)
@@ -722,7 +728,7 @@ int vm_stop(RunState state)
         return 0;
     }
 
-    return do_vm_stop(state, true);
+    return do_vm_stop(state, true, migrate_get_current());
 }
 
 /**
@@ -875,4 +881,3 @@ void qmp_inject_nmi(Error **errp)
 {
     nmi_monitor_handle(monitor_get_cpu_index(monitor_cur()), errp);
 }
-
