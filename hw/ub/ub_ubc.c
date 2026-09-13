@@ -1768,6 +1768,9 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
     (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)sizeof(UBCSimDecWritePldHdr))
 #define UBC_SIM_DEC_READ_CHUNK_MAX \
     (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)sizeof(UBCSimDecReadRespPldHdr))
+#define UBC_GSVA_IO_CHUNK_MAX \
+    (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)MAX(sizeof(UBCGsvaIoReq), \
+                                               sizeof(UBCSimDecReadRespPldHdr)))
 #define UBC_SIM_DEC_READ_WAIT_USEC  1000
 #define UBC_SIM_DEC_SHM_READ_WAIT_USEC 50
 #define UBC_SIM_DEC_READ_WAIT_LOOPS 30000
@@ -7563,7 +7566,7 @@ void ubc_handle_gsva_io(BusControllerDev *ubc_dev, const uint8_t *payload,
 {
     const UBCGsvaIoReq *io = (const UBCGsvaIoReq *)payload;
     UBCSimDecReadRespPldHdr *response;
-    uint8_t reply[sizeof(*response) + 8] = {0};
+    uint8_t reply[UBC_SIM_DEC_MAX_MSG_PAYLOAD];
     UBLinkState *link;
     MemTxResult result;
     uint32_t len;
@@ -7576,7 +7579,8 @@ void ubc_handle_gsva_io(BusControllerDev *ubc_dev, const uint8_t *payload,
         return;
     }
     len = io->request.read_len;
-    if (!len || len > 8 || len > UINT64_MAX - io->request.remote_uba ||
+    if (!len || len > UBC_GSVA_IO_CHUNK_MAX ||
+        len > UINT64_MAX - io->request.remote_uba ||
         payload_len != sizeof(*io) + (io->write ? len : 0)) {
         return;
     }
@@ -7585,6 +7589,7 @@ void ubc_handle_gsva_io(BusControllerDev *ubc_dev, const uint8_t *payload,
         return;
     }
     response = (UBCSimDecReadRespPldHdr *)reply;
+    memset(response, 0, sizeof(*response));
     response->req_id = io->request.req_id;
     if (io->write) {
         memcpy(reply + sizeof(*response), payload + sizeof(*io), len);
@@ -8993,7 +8998,8 @@ static MemTxResult ubc_sim_dec_remote_io(BusControllerDev *ubc_dev,
     while (done < len) {
         UBCSimDecReadReqPld req = { 0 };
         SimDecMapEntry *model_entry;
-        uint32_t chunk = MIN(len - done, UBC_SIM_DEC_READ_CHUNK_MAX);
+        uint32_t chunk = MIN(len - done, strict ? UBC_GSVA_IO_CHUNK_MAX :
+                                                 UBC_SIM_DEC_READ_CHUNK_MAX);
         int rc;
         int loop;
         int attempt = 0;
