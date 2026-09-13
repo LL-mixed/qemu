@@ -56,6 +56,10 @@ tests = {
     meson.project_source_root() / 'hw/ub/ub_obmm_remote_model.c'
   ],
   'test-linqu-bridge-lock': [],
+  'test-gsva-route-lifetime': [qom,
+    meson.project_source_root() / 'hw/ub/gsva_route.c',
+    meson.project_source_root() / 'hw/ub/gsva_key.c'
+  ],
   'test-ub-void-response-policy': [
     meson.project_source_root() / 'hw/ub/ub_void_response_policy.c'
   ],

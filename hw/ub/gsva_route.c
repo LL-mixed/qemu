@@ -8,6 +8,50 @@
 #include "qemu/osdep.h"
 #include "hw/ub/gsva_route.h"
 #include "qemu/log.h"
+#include "qemu/module.h"
+
+static void gsva_route_finalize(Object *obj)
+{
+    GsvaRouteEntry *route = (GsvaRouteEntry *)obj;
+
+    assert(!route->cpu_window_mapped);
+    if (route->cpu_window_initialized) {
+        object_unparent(OBJECT(&route->cpu_window));
+    }
+}
+
+static const TypeInfo gsva_route_type = {
+    .name = TYPE_GSVA_ROUTE,
+    .parent = TYPE_OBJECT,
+    .instance_size = sizeof(GsvaRouteEntry),
+    .instance_finalize = gsva_route_finalize,
+};
+
+static void gsva_route_register_types(void)
+{
+    type_register_static(&gsva_route_type);
+}
+
+type_init(gsva_route_register_types)
+
+void gsva_route_init_cpu_window(GsvaRouteEntry *route,
+                                const MemoryRegionOps *ops)
+{
+    assert(!route->cpu_window_initialized);
+    memory_region_init_io(&route->cpu_window, OBJECT(route), ops, route,
+                          "gsva-cpu-window", route->key.size);
+    route->cpu_window_initialized = true;
+}
+
+static void gsva_route_detach_cpu_window(GsvaRouteEntry *route)
+{
+    route->state = GSVA_ROUTE_RETIRED;
+    if (route->cpu_window_mapped) {
+        memory_region_del_subregion(route->cpu_window.container,
+                                    &route->cpu_window);
+        route->cpu_window_mapped = false;
+    }
+}
 
 void gsva_route_table_init(GsvaRouteTable *tbl)
 {
@@ -23,12 +67,13 @@ void gsva_route_table_destroy(GsvaRouteTable *tbl)
     GsvaRouteEntry *entry;
     while ((entry = QTAILQ_FIRST(&tbl->routes)) != NULL) {
         QTAILQ_REMOVE(&tbl->routes, entry, next);
-        g_free(entry);
+        gsva_route_detach_cpu_window(entry);
+        object_unref(OBJECT(entry));
         tbl->route_count--;
     }
     while ((entry = QTAILQ_FIRST(&tbl->tombstones)) != NULL) {
         QTAILQ_REMOVE(&tbl->tombstones, entry, next);
-        g_free(entry);
+        object_unref(OBJECT(entry));
         tbl->tombstone_count--;
     }
 }
@@ -98,13 +143,13 @@ int gsva_route_map(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
             }
             /* New epoch is higher -- remove tombstone, allow reuse */
             QTAILQ_REMOVE(&tbl->tombstones, existing, next);
-            g_free(existing);
+            object_unref(OBJECT(existing));
             tbl->tombstone_count--;
             break;
         }
     }
 
-    entry = g_new0(GsvaRouteEntry, 1);
+    entry = (GsvaRouteEntry *)object_new(TYPE_GSVA_ROUTE);
     entry->key = *key;
     entry->state = GSVA_ROUTE_ACTIVE;
     entry->local_pa = local_pa;
@@ -156,6 +201,7 @@ int gsva_route_unmap(GsvaRouteTable *tbl, uint64_t map_id, bool keep_tombstone)
         if (entry->map_id == map_id) {
             QTAILQ_REMOVE(&tbl->routes, entry, next);
             tbl->route_count--;
+            gsva_route_detach_cpu_window(entry);
 
             qemu_log("GSVA_UNMAP: map_id=%" PRIu64 " segment_id=%#" PRIx64
                      " home_va=%#" PRIx64 " epoch=%" PRIu64
@@ -168,7 +214,7 @@ int gsva_route_unmap(GsvaRouteTable *tbl, uint64_t map_id, bool keep_tombstone)
                 QTAILQ_INSERT_TAIL(&tbl->tombstones, entry, next);
                 tbl->tombstone_count++;
             } else {
-                g_free(entry);
+                object_unref(OBJECT(entry));
             }
             return GSVA_OK;
         }

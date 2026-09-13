@@ -49,7 +49,9 @@ typedef struct GsvaTokenLease {
 } GsvaTokenLease;
 
 /* GSVA route entry */
+#define TYPE_GSVA_ROUTE "gsva-route"
 typedef struct GsvaRouteEntry {
+    Object parent_obj;
     GsvaKeyV1 key;
     GsvaRouteState state;
     uint64_t local_pa;
@@ -64,9 +66,14 @@ typedef struct GsvaRouteEntry {
     uint32_t backing_token_id;
     uint64_t map_id;
     MemoryRegion cpu_window;
+    bool cpu_window_initialized;
     bool cpu_window_mapped;
     QTAILQ_ENTRY(GsvaRouteEntry) next;
 } GsvaRouteEntry;
+
+/* The route owns its MMIO region until the last address-space reference dies. */
+void gsva_route_init_cpu_window(GsvaRouteEntry *route,
+                                const MemoryRegionOps *ops);
 
 /* GSVA route table */
 typedef struct GsvaRouteTable {

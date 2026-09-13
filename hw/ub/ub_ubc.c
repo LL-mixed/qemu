@@ -14443,10 +14443,7 @@ static int sim_dec_handle_gsva_map(const SimDecGsvaMapReq *req,
             route->backing_token_id = backing_token_id;
         }
         if (route && route->local_pa && req->key.size) {
-            memory_region_init_io(&route->cpu_window,
-                                  OBJECT(DEVICE(g_sim_decoder->bcs->ubc_dev)),
-                                  &sim_dec_gsva_cpu_window_ops, route,
-                                  "gsva-cpu-window", req->key.size);
+            gsva_route_init_cpu_window(route, &sim_dec_gsva_cpu_window_ops);
             memory_region_add_subregion_overlap(get_system_memory(),
                                                 route->local_pa,
                                                 &route->cpu_window, 10);
@@ -14549,7 +14546,6 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
     /* Remove IO memory region before route cleanup */
     if (route && route->cpu_window_mapped) {
         ubc_cpu_window_detach(&route->cpu_window);
-        object_unparent(OBJECT(&route->cpu_window));
         route->cpu_window_mapped = false;
         qemu_log("GSVA_UNMAP: cpu_window removed from pa=%" PRIx64 "\n",
                  route->local_pa);
