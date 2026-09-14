@@ -266,6 +266,12 @@ int gsva_coh_object_remove(GsvaCohTable *tbl, const GsvaKeyV1 *key)
 
     QTAILQ_FOREACH(obj, &tbl->objects, next) {
         if (gsva_key_base_equal(&obj->key, key)) {
+            if (obj->epoch != key->epoch) {
+                return GSVA_ERR_STALE_EPOCH;
+            }
+            if (obj->state == GSVA_COH_TIMEOUT) {
+                return GSVA_ERR_COH_TIMEOUT;
+            }
             if (obj->pending) {
                 return GSVA_ERR_COH_PENDING;
             }
@@ -796,6 +802,10 @@ int gsva_coh_retire_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
         return GSVA_ERR_STALE_EPOCH;
     }
 
+    if (obj->state == GSVA_COH_TIMEOUT) {
+        return GSVA_ERR_COH_TIMEOUT;
+    }
+
     if (obj->pending) {
         return GSVA_ERR_COH_PENDING;
     }
@@ -869,22 +879,13 @@ int gsva_coh_retire_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
             }
         }
 
-        if (gsva_coh_hold_pending_enabled()) {
-            qemu_log("GSVA_COH: pending held seq=%" PRIu64
-                     " segment_id=%#" PRIx64
-                     " timeout_ms=%" PRIu64 "\n",
-                     obj->pending_seq, key->segment_id,
-                     gsva_coh_timeout_ms());
-            return GSVA_ERR_COH_PENDING;
-        }
-
-        gsva_coh_pending_clear(obj);
-        obj->pending = false;
-        obj->pending_start_ms = 0;
+        /* Sending a revoke is not a completion receipt. Keep every holder
+         * pending even with transport disabled or a failed send. Only exact
+         * successful ACKs may finish this transaction. */
+        return GSVA_ERR_COH_PENDING;
     }
 
-    /* V1 sim: directly retire after holder revoke accounting.
-     * Also allow retiring from TIMEOUT state for cleanup. */
+    /* No remote holders need revocation in this transaction. */
     obj->state = GSVA_COH_RETIRED;
     obj->owner_cna = 0;
     gsva_coh_sharers_clear(obj);
@@ -1101,7 +1102,19 @@ int gsva_coh_inv_ack(GsvaCohTable *tbl, const GsvaKeyV1 *key,
         return GSVA_ERR_ROUTE_MISSING;
     }
 
-    if (!obj->pending || obj->pending_seq != seq) {
+    if (obj->epoch != key->epoch) {
+        return GSVA_ERR_STALE_EPOCH;
+    }
+    if (memcmp(&obj->key, key, sizeof(*key)) != 0) {
+        return GSVA_ERR_KEY_MISMATCH;
+    }
+    if (gsva_coh_object_maybe_timeout(obj,
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), gsva_coh_timeout_ms()) ||
+        obj->state == GSVA_COH_TIMEOUT) {
+        return GSVA_ERR_COH_TIMEOUT;
+    }
+    if (!obj->pending || obj->pending_seq != seq ||
+        !gsva_coh_pending_has(obj, ack_cna)) {
         return GSVA_ERR_COH_PENDING;
     }
 
@@ -1294,6 +1307,28 @@ void gsva_coh_handle_rx_inv(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
     gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, GSVA_OK);
 }
 
+static int gsva_coh_receive_ack(BusControllerDev *ubc_dev,
+                               const GsvaCohMsgV1 *msg,
+                               uint32_t opcode, uint32_t pending_op)
+{
+    GsvaCohObject *obj;
+
+    if (!ubc_dev || !msg || msg->version != 1 || msg->op != opcode ||
+        msg->error != GSVA_OK || msg->target_cna != ubc_dev->parent.cna) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+    obj = gsva_coh_lookup(g_gsva_coh_default_table, &msg->key);
+    if (!obj) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+    if (obj->pending_op != pending_op ||
+        obj->pending_target != msg->target_cna) {
+        return GSVA_ERR_COH_PENDING;
+    }
+    return gsva_coh_inv_ack(g_gsva_coh_default_table, &msg->key,
+                           msg->source_cna, msg->seq);
+}
+
 void gsva_coh_handle_rx_inv_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
 {
     int rc = GSVA_ERR_ROUTE_MISSING;
@@ -1302,8 +1337,7 @@ void gsva_coh_handle_rx_inv_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *m
              " seq=%" PRIu64 "\n", msg->source_cna,
              msg->key.segment_id, msg->seq);
     if (g_gsva_coh_default_table) {
-        rc = gsva_coh_inv_ack(g_gsva_coh_default_table, &msg->key,
-                              msg->source_cna, msg->seq);
+        rc = gsva_coh_receive_ack(ubc_dev, msg, GSVA_COH_MSG_INVALIDATE_ACK, 1);
     }
     qemu_log("GSVA_COH: rx INV_ACK applied from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 " rc=%d\n",
@@ -1342,8 +1376,7 @@ void gsva_coh_handle_rx_downgrade_ack(BusControllerDev *ubc_dev, const GsvaCohMs
              " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
              msg->source_cna, msg->key.segment_id, msg->seq);
     if (g_gsva_coh_default_table) {
-        rc = gsva_coh_inv_ack(g_gsva_coh_default_table, &msg->key,
-                              msg->source_cna, msg->seq);
+        rc = gsva_coh_receive_ack(ubc_dev, msg, GSVA_COH_MSG_DOWNGRADE_ACK, 4);
     }
     qemu_log("GSVA_COH: rx DOWNGRADE_ACK applied from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 " rc=%d\n",
@@ -1367,8 +1400,7 @@ void gsva_coh_handle_rx_wb_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *ms
              " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
              msg->source_cna, msg->key.segment_id, msg->seq);
     if (g_gsva_coh_default_table) {
-        rc = gsva_coh_inv_ack(g_gsva_coh_default_table, &msg->key,
-                              msg->source_cna, msg->seq);
+        rc = gsva_coh_receive_ack(ubc_dev, msg, GSVA_COH_MSG_WRITEBACK_ACK, 2);
     }
     qemu_log("GSVA_COH: rx WRITEBACK_ACK applied from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 " rc=%d\n",
@@ -1392,8 +1424,7 @@ void gsva_coh_handle_rx_fence_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 
              " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
              msg->source_cna, msg->key.segment_id, msg->seq);
     if (g_gsva_coh_default_table) {
-        rc = gsva_coh_inv_ack(g_gsva_coh_default_table, &msg->key,
-                              msg->source_cna, msg->seq);
+        rc = gsva_coh_receive_ack(ubc_dev, msg, GSVA_COH_MSG_FENCE_ACK, 5);
     }
     qemu_log("GSVA_COH: rx FENCE_ACK applied from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 " rc=%d\n",
@@ -1433,8 +1464,7 @@ void gsva_coh_handle_rx_retire_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1
              " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
              msg->source_cna, msg->key.segment_id, msg->seq);
     if (g_gsva_coh_default_table) {
-        rc = gsva_coh_inv_ack(g_gsva_coh_default_table, &msg->key,
-                              msg->source_cna, msg->seq);
+        rc = gsva_coh_receive_ack(ubc_dev, msg, GSVA_COH_MSG_RETIRE_ACK, 3);
     }
     qemu_log("GSVA_COH: rx RETIRE_ACK applied from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 " rc=%d\n",
