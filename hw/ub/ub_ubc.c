@@ -8964,7 +8964,34 @@ void ubc_async_load_irq_set(BusControllerDev *ubc_dev, bool level)
     qemu_set_irq(bcs->async_load_irq, level);
 }
 
+static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
+    uint64_t remote_uba, uint32_t token_id, uint32_t dcna, uint8_t *data,
+    uint32_t len, bool strict, bool write);
+
 static MemTxResult ubc_sim_dec_remote_io(BusControllerDev *ubc_dev,
+    uint64_t remote_uba, uint32_t token_id, uint32_t dcna, uint8_t *data,
+    uint32_t len, bool strict, bool write)
+{
+    MemTxResult result;
+
+    if (!strict) {
+        return ubc_sim_dec_remote_io_body(ubc_dev, remote_uba, token_id,
+                                          dcna, data, len, strict, write);
+    }
+    if (!ubc_dev || ubc_dev->gsva_strict_io_depth == UINT32_MAX ||
+        ubc_dev->gsva_unmap_in_progress) {
+        return MEMTX_ACCESS_ERROR;
+    }
+    /* pending may clear during an RX poll before the call or its next chunk
+     * finishes. Hold this guard until all return paths have unwound. */
+    ubc_dev->gsva_strict_io_depth++;
+    result = ubc_sim_dec_remote_io_body(ubc_dev, remote_uba, token_id,
+                                        dcna, data, len, strict, write);
+    ubc_dev->gsva_strict_io_depth--;
+    return result;
+}
+
+static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
     uint64_t remote_uba, uint32_t token_id, uint32_t dcna, uint8_t *data,
     uint32_t len, bool strict, bool write)
 {
@@ -14544,6 +14571,12 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
     gsva_tables_init();
 
     /* Retire coherence object first */
+    BusControllerDev *ubc = g_sim_decoder && g_sim_decoder->bcs ?
+        g_sim_decoder->bcs->ubc_dev : NULL;
+    if (ubc && ubc->gsva_unmap_in_progress) {
+        resp->error = GSVA_ERR_COH_PENDING;
+        return -1;
+    }
     GsvaRouteEntry *route = NULL;
     QTAILQ_FOREACH(route, &g_gsva_routes.routes, next) {
         if (route->map_id == req->map_id) {
@@ -14562,21 +14595,36 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
             resp->error = GSVA_ERR_FEATURE_MISSING;
             return -1;
         }
-        int fence_rc = obmm_coh_send_fence(g_sim_decoder->bcs->ubc_dev,
+        /* Quarantine before any polling: keep the MMIO owner and interval,
+         * but deny fresh CPU/PTO authorization until teardown is confirmed. */
+        route->state = GSVA_ROUTE_STALE;
+        if (ubc->gsva_strict_io_depth) {
+            resp->error = GSVA_ERR_COH_PENDING;
+            return -1;
+        }
+        ubc->gsva_unmap_in_progress = true;
+        int fence_rc = obmm_coh_send_fence(ubc,
             route->home_cna, route->key.home_va, route->key.size,
             route->backing_token_id);
         if (fence_rc != 0) {
+            ubc->gsva_unmap_in_progress = false;
             resp->error = GSVA_ERR_COH_TIMEOUT;
             return -1;
         }
         resp->error = gsva_coh_object_remove(&g_gsva_coh, &route->key);
         if (resp->error != GSVA_OK) {
+            ubc->gsva_unmap_in_progress = false;
             return -1;
         }
         obmm_coh_invalidate_local_range(g_sim_decoder->bcs->ubc_dev,
             route->home_cna, route->key.home_va, route->key.size,
             route->backing_token_id);
+        ubc->gsva_unmap_in_progress = false;
     } else if (route) {
+        if (ubc && ubc->gsva_strict_io_depth) {
+            resp->error = GSVA_ERR_COH_PENDING;
+            return -1;
+        }
         int coh_rc = gsva_coh_retire(&g_gsva_coh, &route->key,
                                       0 /* requester_cna */);
         if (coh_rc != GSVA_OK) {

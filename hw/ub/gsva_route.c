@@ -117,7 +117,9 @@ int gsva_route_map(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
 
     /* Check for overlapping existing route */
     QTAILQ_FOREACH(existing, &tbl->routes, next) {
-        if (existing->state == GSVA_ROUTE_ACTIVE) {
+        /* Quarantined routes still own their interval until unmap completes. */
+        if (existing->state == GSVA_ROUTE_ACTIVE ||
+            existing->state == GSVA_ROUTE_STALE) {
             uint64_t ex_start = existing->key.home_va;
             uint64_t ex_end = ex_start + existing->key.size;
             uint64_t new_start = key->home_va;

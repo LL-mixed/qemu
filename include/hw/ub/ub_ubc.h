@@ -252,6 +252,10 @@ typedef struct BusControllerDev {
         uint8_t *buf;
     } sim_dec_sync_read;
 
+    /* BQL-protected full strict CPU/PTO calls, including reentrant RX polls. */
+    uint32_t gsva_strict_io_depth;
+    bool gsva_unmap_in_progress;
+
     /* OBMM coherence synchronous wait (same pattern as sim_dec_sync_read) */
     struct {
         bool     pending;

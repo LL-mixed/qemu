@@ -325,6 +325,34 @@ static void test_pto_vma_access_intersection(void)
     g_assert_false(ubc_obmm_strict_pto_access(&map, 3, &access));
 }
 
+static void test_quarantine_owns_interval(void)
+{
+    GsvaRouteTable table;
+    GsvaRouteEntry *route;
+    GsvaRouteAccess access;
+    GsvaKeyV1 replacement = key;
+    uint64_t id = 0;
+
+    gsva_route_table_init(&table);
+    route = add_route(&table, true);
+    route->backing_token_id = 97;
+    route->state = GSVA_ROUTE_STALE;
+    g_assert_cmpint(gsva_route_validate_token(route, 7, 2, 3, 1), !=, GSVA_OK);
+    g_assert_cmpint(gsva_route_resolve_pto(&table, route->local_pa, 8, 7,
+                                          &access), !=, GSVA_OK);
+    replacement.segment_id++;
+    g_assert_cmpint(gsva_route_map(&table, &replacement, 0x40000000000,
+        key.home_va, key.home_va, 1, GSVA_ADDRESS_PROFILE_STRICT_GSVA,
+        7, 4, 5, 3, &id), ==, GSVA_ERR_KEY_MISMATCH);
+    g_assert_true(route->cpu_window_mapped);
+    g_assert_cmpint(table.route_count, ==, 1);
+    g_assert_cmpint(gsva_route_unmap(&table, route->map_id, false), ==, GSVA_OK);
+    g_assert_cmpint(gsva_route_map(&table, &replacement, 0x40000000000,
+        key.home_va, key.home_va, 1, GSVA_ADDRESS_PROFILE_STRICT_GSVA,
+        7, 4, 5, 3, &id), ==, GSVA_OK);
+    gsva_route_table_destroy(&table);
+}
+
 int main(int argc, char **argv)
 {
     module_call_init(MODULE_INIT_QOM);
@@ -339,5 +367,6 @@ int main(int argc, char **argv)
     g_test_add_func("/gsva-route/pto-live-revalidation", test_pto_live_revalidation);
     g_test_add_func("/gsva-route/pto-ambiguous-pa", test_pto_ambiguous_pa);
     g_test_add_func("/gsva-route/pto-vma-access", test_pto_vma_access_intersection);
+    g_test_add_func("/gsva-route/quarantine-interval", test_quarantine_owns_interval);
     return g_test_run();
 }
