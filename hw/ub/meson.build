@@ -20,6 +20,7 @@ ub_ss.add(files(
   'ub_async_load.c',
   'ub_async_load_device.c',
   'gsva_key.c',
+  'gsva_home.c',
   'gsva_route.c',
   'gsva_coherence.c',
   'gsva_stats.c',

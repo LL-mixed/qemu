@@ -24,6 +24,7 @@
 #include "hw/ub/ub_bus.h"
 #include "hw/ub/ub_link.h"
 #include "hw/ub/gsva_route.h"
+#include "hw/ub/gsva_home.h"
 #include "hw/ub/ub_obmm_remote.h"
 #include "hw/ub/ub_obmm_remote_model.h"
 #include "hw/ub/ub_void_response_policy.h"
@@ -254,6 +255,7 @@ typedef struct BusControllerDev {
 
     /* BQL-protected full strict CPU/PTO calls, including reentrant RX polls. */
     uint32_t gsva_strict_io_depth;
+    GsvaHomeTable gsva_home;
     bool gsva_unmap_in_progress;
 
     /* OBMM coherence synchronous wait (same pattern as sim_dec_sync_read) */
@@ -633,6 +635,12 @@ typedef struct QEMU_PACKED UBCGsvaIoReq {
     UBCSimDecReadReqPld request;
     /* write request bytes follow; reads have no trailing bytes */
 } UBCGsvaIoReq;
+
+/* Version 2 keeps the V1 prefix; managed accesses require this identity. */
+typedef struct QEMU_PACKED UBCGsvaIoV2Req {
+    UBCGsvaIoReq io;
+    GsvaHomeIdentity identity;
+} UBCGsvaIoV2Req;
 
 void ubc_handle_gsva_io(BusControllerDev *ubc_dev, const uint8_t *payload,
                        uint32_t payload_len, uint32_t peer_cna);

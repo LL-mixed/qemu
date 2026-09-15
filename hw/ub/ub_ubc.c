@@ -230,6 +230,7 @@ typedef struct LinquPtoAuthorizationState {
 #define SIM_DEC_OP_OBMM_EXPORT_RETIRE 0x0d
 #define SIM_DEC_OP_OBMM_MAP_V2      0x0e
 #define SIM_DEC_OP_GSVA_MAP_V2      0x0f
+#define SIM_DEC_OP_GSVA_HOME_V1     0x10
 
 /* SIM_DEC status codes */
 #define SIM_DEC_STATUS_SUCCESS          0x00
@@ -828,7 +829,7 @@ static void ubc_void_pending_responses_cleanup(BusControllerDev *ubc_dev);
 static uint32_t sim_dec_reset_mappings(BusControllerDev *ubc_dev);
 static MemTxResult ubc_sim_dec_remote_io(BusControllerDev *ubc_dev,
     uint64_t remote_uba, uint32_t token_id, uint32_t dcna, uint8_t *data,
-    uint32_t len, bool strict, bool write);
+    uint32_t len, bool strict, bool write, const GsvaHomeIdentity *identity);
 MemTxResult ubc_sim_dec_remote_write(BusControllerDev *ubc_dev,
                                      uint64_t remote_uba,
                                      uint32_t token_id,
@@ -1487,7 +1488,12 @@ static MemTxResult sim_dec_gsva_cpu_window_read(void *opaque, hwaddr addr,
                                 route->backing_token_id ?
                                 route->backing_token_id : route->token.token_id,
                                 route->home_cna, buf, size,
-                                route->backing_token_id != 0, false);
+                                route->backing_token_id != 0, false,
+                                &(GsvaHomeIdentity){.key = route->key,
+                                    .home_cna = route->home_cna,
+                                    .token_id = route->token.token_id,
+                                    .token_value = route->token.token_value,
+                                    .backing_token_id = route->backing_token_id});
     if (ret != MEMTX_OK) {
         qemu_log("GSVA_CPU: read failed map_id=%" PRIx64
                  " remote_uba=%#" PRIx64 " size=%u ret=%d\n",
@@ -1546,7 +1552,12 @@ static MemTxResult sim_dec_gsva_cpu_window_write(void *opaque, hwaddr addr,
     if (route->backing_token_id) {
         ret = ubc_sim_dec_remote_io(g_sim_decoder->bcs->ubc_dev, remote_uba,
                                     route->backing_token_id, route->home_cna,
-                                    buf, size, true, true);
+                                    buf, size, true, true,
+                                    &(GsvaHomeIdentity){.key = route->key,
+                                        .home_cna = route->home_cna,
+                                        .token_id = route->token.token_id,
+                                        .token_value = route->token.token_value,
+                                        .backing_token_id = route->backing_token_id});
     } else {
         ret = ubc_sim_dec_remote_write(g_sim_decoder->bcs->ubc_dev, remote_uba,
                                        route->token.token_id, route->home_cna,
@@ -1769,7 +1780,7 @@ typedef struct QEMU_PACKED UBCCtrlqBaseBlock {
 #define UBC_SIM_DEC_READ_CHUNK_MAX \
     (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)sizeof(UBCSimDecReadRespPldHdr))
 #define UBC_GSVA_IO_CHUNK_MAX \
-    (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)MAX(sizeof(UBCGsvaIoReq), \
+    (UBC_SIM_DEC_MAX_MSG_PAYLOAD - (uint32_t)MAX(sizeof(UBCGsvaIoV2Req), \
                                                sizeof(UBCSimDecReadRespPldHdr)))
 #define UBC_SIM_DEC_READ_WAIT_USEC  1000
 #define UBC_SIM_DEC_SHM_READ_WAIT_USEC 50
@@ -4972,7 +4983,12 @@ static int linqu_ub_gm_read(void *opaque, uint64_t request_id,
         ret = ubc_sim_dec_remote_io(ubc_dev, resolved.remote_uba,
                                     resolved.gsva.backing_token_id,
                                     resolved.peer_cna, dst, (uint32_t)length,
-                                    true, false);
+                                    true, false,
+                                    &(GsvaHomeIdentity){.key = resolved.gsva.key,
+                                        .home_cna = resolved.gsva.home_cna,
+                                        .token_id = resolved.gsva.token_id,
+                                        .token_value = resolved.gsva.token_value,
+                                        .backing_token_id = resolved.gsva.backing_token_id});
     } else {
         ret = ubc_sim_dec_remote_read(ubc_dev, resolved.remote_uba,
                                       resolved.token_id, resolved.peer_cna,
@@ -5020,7 +5036,12 @@ static int linqu_ub_gm_write(void *opaque, uint64_t request_id,
         ret = ubc_sim_dec_remote_io(ubc_dev, resolved.remote_uba,
                                     resolved.gsva.backing_token_id,
                                     resolved.peer_cna, (uint8_t *)src,
-                                    (uint32_t)length, true, true);
+                                    (uint32_t)length, true, true,
+                                    &(GsvaHomeIdentity){.key = resolved.gsva.key,
+                                        .home_cna = resolved.gsva.home_cna,
+                                        .token_id = resolved.gsva.token_id,
+                                        .token_value = resolved.gsva.token_value,
+                                        .backing_token_id = resolved.gsva.backing_token_id});
     } else {
         ret = ubc_sim_dec_remote_write(ubc_dev, resolved.remote_uba,
                                        resolved.token_id, resolved.peer_cna,
@@ -7493,6 +7514,11 @@ void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
         return;
     }
 
+    if (gsva_home_overlaps(&ubc_dev->gsva_home, hdr->remote_uba, data_len)) {
+        qemu_log("GSVA_HOME: legacy write denied\n");
+        return;
+    }
+
     eff_tid = ubc_tid_or_auto(hdr->token_id);
     ret = ubc_dma_write_local_data_tid_strict(ubc_dev, hdr->remote_uba,
                                               data, data_len, eff_tid);
@@ -7570,18 +7596,23 @@ void ubc_handle_gsva_io(BusControllerDev *ubc_dev, const uint8_t *payload,
     UBLinkState *link;
     MemTxResult result;
     uint32_t len;
+    uint32_t header_size;
+    GsvaHomeBinding *pin = NULL;
 
     if (!ubc_dev || !ubc_dev->ummu || !payload || payload_len < sizeof(*io) || !peer_cna ||
-        io->magic != UBC_GSVA_IO_MAGIC || io->version != 1 ||
+        io->magic != UBC_GSVA_IO_MAGIC ||
+        (io->version != 1 && io->version != 2) ||
         io->write > 1 || io->reserved || io->request.flags ||
         !io->request.req_id || !io->request.token_id ||
         io->request.token_id == UINT32_MAX) {
         return;
     }
     len = io->request.read_len;
-    if (!len || len > UBC_GSVA_IO_CHUNK_MAX ||
+    header_size = io->version == 2 ? sizeof(UBCGsvaIoV2Req) : sizeof(*io);
+    if (!len || len > UBC_SIM_DEC_MAX_MSG_PAYLOAD -
+        MAX(header_size, sizeof(UBCSimDecReadRespPldHdr)) ||
         len > UINT64_MAX - io->request.remote_uba ||
-        payload_len != sizeof(*io) + (io->write ? len : 0)) {
+        payload_len != header_size + (io->write ? len : 0)) {
         return;
     }
     link = ubc_find_active_link(ubc_dev, &peer_cna);
@@ -7591,14 +7622,32 @@ void ubc_handle_gsva_io(BusControllerDev *ubc_dev, const uint8_t *payload,
     response = (UBCSimDecReadRespPldHdr *)reply;
     memset(response, 0, sizeof(*response));
     response->req_id = io->request.req_id;
+    result = MEMTX_ACCESS_ERROR;
+    if (io->version == 2) {
+        const UBCGsvaIoV2Req *v2 = (const UBCGsvaIoV2Req *)payload;
+
+        if (v2->identity.backing_token_id != io->request.token_id ||
+            gsva_home_acquire(&ubc_dev->gsva_home, ubc_dev->parent.cna,
+                &v2->identity, io->request.remote_uba, len, io->write,
+                &pin) != GSVA_OK) {
+            goto reply;
+        }
+    } else if (gsva_home_overlaps(&ubc_dev->gsva_home,
+                                  io->request.remote_uba, len)) {
+        goto reply;
+    }
     if (io->write) {
-        memcpy(reply + sizeof(*response), payload + sizeof(*io), len);
+        memcpy(reply + sizeof(*response), payload + header_size, len);
         result = ubc_dma_write_local_data_tid_strict(ubc_dev,
-            io->request.remote_uba, payload + sizeof(*io), len, io->request.token_id);
+            io->request.remote_uba, payload + header_size, len, io->request.token_id);
     } else {
         result = ubc_dma_read_local_data_tid_strict(ubc_dev,
             io->request.remote_uba, reply + sizeof(*response), len, io->request.token_id);
     }
+    if (pin) {
+        gsva_home_release(pin);
+    }
+reply:
     /* No raw-address or alternate-route fallback after authorization failure. */
     response->status = result == MEMTX_OK ? UBC_SIM_DEC_READ_STATUS_SUCCESS :
                                           UBC_SIM_DEC_READ_STATUS_ERROR;
@@ -7735,6 +7784,16 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
     }
 
     void_eligible = req->flags & UBC_SIM_DEC_READ_FLAG_VOID_ELIGIBLE;
+    if (gsva_home_overlaps(&ubc_dev->gsva_home, req->remote_uba, req->read_len)) {
+        UBCSimDecReadRespPldHdr denied = {
+            .req_id = req->req_id,
+            .status = UBC_SIM_DEC_READ_STATUS_ERROR,
+        };
+
+        ubc_send_msg_over_link(ubc_dev, link, dcna,
+                              UBC_MSG_SUB_SIM_DEC_READ_RESP, &denied, sizeof(denied));
+        return;
+    }
     if (void_eligible &&
         ubc_remote_void_response_policy_enabled(ubc_dev)) {
         policy_request = (UbVoidResponseRequest) {
@@ -8966,17 +9025,17 @@ void ubc_async_load_irq_set(BusControllerDev *ubc_dev, bool level)
 
 static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
     uint64_t remote_uba, uint32_t token_id, uint32_t dcna, uint8_t *data,
-    uint32_t len, bool strict, bool write);
+    uint32_t len, bool strict, bool write, const GsvaHomeIdentity *identity);
 
 static MemTxResult ubc_sim_dec_remote_io(BusControllerDev *ubc_dev,
     uint64_t remote_uba, uint32_t token_id, uint32_t dcna, uint8_t *data,
-    uint32_t len, bool strict, bool write)
+    uint32_t len, bool strict, bool write, const GsvaHomeIdentity *identity)
 {
     MemTxResult result;
 
     if (!strict) {
         return ubc_sim_dec_remote_io_body(ubc_dev, remote_uba, token_id,
-                                          dcna, data, len, strict, write);
+                                          dcna, data, len, strict, write, identity);
     }
     if (!ubc_dev || ubc_dev->gsva_strict_io_depth == UINT32_MAX ||
         ubc_dev->gsva_unmap_in_progress) {
@@ -8986,31 +9045,49 @@ static MemTxResult ubc_sim_dec_remote_io(BusControllerDev *ubc_dev,
      * finishes. Hold this guard until all return paths have unwound. */
     ubc_dev->gsva_strict_io_depth++;
     result = ubc_sim_dec_remote_io_body(ubc_dev, remote_uba, token_id,
-                                        dcna, data, len, strict, write);
+                                        dcna, data, len, strict, write, identity);
     ubc_dev->gsva_strict_io_depth--;
     return result;
 }
 
 static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
     uint64_t remote_uba, uint32_t token_id, uint32_t dcna, uint8_t *data,
-    uint32_t len, bool strict, bool write)
+    uint32_t len, bool strict, bool write, const GsvaHomeIdentity *identity)
 {
     UBLinkState *link;
     BusControllerState *bcs;
     uint32_t done = 0;
 
     if (!ubc_dev || !data || !len || dcna == 0 || len > UINT64_MAX - remote_uba ||
-        (strict && (!ubc_dev->ummu || !token_id || token_id == UINT32_MAX)) ||
+        (strict && (!ubc_dev->ummu || !token_id || token_id == UINT32_MAX ||
+                    !identity || identity->home_cna != dcna ||
+                    identity->backing_token_id != token_id)) ||
         (write && !strict)) {
         return MEMTX_DECODE_ERROR;
     }
     if (dcna == ubc_dev->parent.cna) {
-        if (write) {
-            return ubc_dma_write_local_data_tid_strict(
-                ubc_dev, remote_uba, data, len, token_id);
+        GsvaHomeBinding *pin = NULL;
+        MemTxResult result;
+
+        if (strict) {
+            if (gsva_home_acquire(&ubc_dev->gsva_home, dcna, identity,
+                                  remote_uba, len, write, &pin) != GSVA_OK) {
+                return MEMTX_ACCESS_ERROR;
+            }
+        } else if (gsva_home_overlaps(&ubc_dev->gsva_home, remote_uba, len)) {
+            return MEMTX_ACCESS_ERROR;
         }
-        return ubc_dma_read_local_data_tid_strict(
-            ubc_dev, remote_uba, data, len, ubc_tid_or_auto(token_id));
+        if (write) {
+            result = ubc_dma_write_local_data_tid_strict(
+                ubc_dev, remote_uba, data, len, token_id);
+        } else {
+            result = ubc_dma_read_local_data_tid_strict(
+                ubc_dev, remote_uba, data, len, ubc_tid_or_auto(token_id));
+        }
+        if (pin) {
+            gsva_home_release(pin);
+        }
+        return result;
     }
     link = ubc_find_active_link(ubc_dev, &dcna);
     if (!link) {
@@ -9079,12 +9156,13 @@ retry_chunk:
                      done, dcna, token_id, ubc_dev->parent.cna);
         }
         if (strict) {
-            uint32_t payload_len = sizeof(UBCGsvaIoReq) + (write ? chunk : 0);
-            UBCGsvaIoReq *io = g_malloc0(payload_len);
-            io->magic = UBC_GSVA_IO_MAGIC;
-            io->version = 1;
-            io->write = write;
-            io->request = req;
+            uint32_t payload_len = sizeof(UBCGsvaIoV2Req) + (write ? chunk : 0);
+            UBCGsvaIoV2Req *io = g_malloc0(payload_len);
+            io->io.magic = UBC_GSVA_IO_MAGIC;
+            io->io.version = 2;
+            io->io.write = write;
+            io->io.request = req;
+            io->identity = *identity;
             if (write) {
                 memcpy((uint8_t *)io + sizeof(*io), data + done, chunk);
             }
@@ -9171,7 +9249,7 @@ MemTxResult ubc_sim_dec_remote_read(BusControllerDev *ubc_dev,
     uint64_t remote_uba, uint32_t token_id, uint32_t dcna, uint8_t *data, uint32_t len)
 {
     return ubc_sim_dec_remote_io(ubc_dev, remote_uba, token_id, dcna, data, len,
-                                false, false);
+                                false, false, NULL);
 }
 
 /*
@@ -11676,6 +11754,7 @@ static void ub_bus_controller_dev_finalize(Object *object)
     }
     linqu_ub_gm_registry_free(ubc_dev->linqu_uapi_ub_gm_registry);
     ubc_dev->linqu_uapi_ub_gm_registry = NULL;
+    gsva_home_destroy(&ubc_dev->gsva_home);
     if (ubc_dev->linqu_uapi_bridge) {
         linqu_ub_bridge_free(ubc_dev->linqu_uapi_bridge);
         ubc_dev->linqu_uapi_bridge = NULL;
@@ -14711,6 +14790,30 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
     resp_hdr->payload_len = 0;
 
     switch (hdr->opcode) {
+    case SIM_DEC_OP_GSVA_HOME_V1: {
+        const GsvaHomeRequest *request;
+        BusControllerDev *ubc = g_sim_decoder && g_sim_decoder->bcs ?
+            g_sim_decoder->bcs->ubc_dev : NULL;
+        int error;
+
+        G_STATIC_ASSERT(sizeof(GsvaHomeRequest) == 112);
+        if (!ubc || len != sizeof(*hdr) + sizeof(*request) ||
+            hdr->payload_len != sizeof(*request)) {
+            resp_hdr->status = SIM_DEC_STATUS_INVALID_PARAM;
+            break;
+        }
+        request = (const GsvaHomeRequest *)(data + sizeof(*hdr));
+        error = gsva_home_update(&ubc->gsva_home, ubc->parent.cna, request);
+        qemu_log("GSVA_HOME: operation=%u segment=%#" PRIx64
+                 " epoch=%" PRIu64 " export=%" PRIu64 " error=%d\n",
+                 request->operation, (uint64_t)request->identity.key.segment_id,
+                 (uint64_t)request->identity.key.epoch,
+                 (uint64_t)request->export_mem_id, error);
+        resp_hdr->status = error == GSVA_OK ? SIM_DEC_STATUS_SUCCESS :
+            error == GSVA_ERR_COH_PENDING ? SIM_DEC_STATUS_RESOURCE_BUSY :
+                                           SIM_DEC_STATUS_BACKEND_ERROR;
+        break;
+    }
     case SIM_DEC_OP_MAP:
         min_len = sizeof(*hdr) + sizeof(SimDecMapReq);
         if (len < min_len) {
