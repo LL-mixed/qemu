@@ -40,6 +40,8 @@ int gsva_home_acquire(GsvaHomeTable *table, uint32_t local_cna,
                       const GsvaHomeIdentity *identity, uint64_t address,
                       uint64_t length, bool write, GsvaHomeBinding **pin);
 void gsva_home_release(GsvaHomeBinding *pin);
+/* Close admission without dropping identity history or outstanding pins. */
+uint64_t gsva_home_reset(GsvaHomeTable *table);
 /* Legacy traffic must not access even a retired managed address interval. */
 bool gsva_home_overlaps(const GsvaHomeTable *table, uint64_t address,
                         uint64_t length);

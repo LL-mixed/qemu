@@ -6698,6 +6698,8 @@ static void ub_bus_controller_dev_reset(DeviceState *device)
     bool had_authorization = authorization != NULL;
     bool obmm_async_reset = false;
 
+    qemu_log("GSVA_HOME_RESET closed=%" PRIu64 "\n",
+             gsva_home_reset(&ubc_dev->gsva_home));
     ubc_void_pending_responses_cleanup(ubc_dev);
     memset(&ubc_dev->void_response_policy.stats, 0,
            sizeof(ubc_dev->void_response_policy.stats));

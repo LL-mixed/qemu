@@ -165,6 +165,18 @@ bool gsva_home_overlaps(const GsvaHomeTable *table, uint64_t address,
     return false;
 }
 
+uint64_t gsva_home_reset(GsvaHomeTable *table)
+{
+    GsvaHomeBinding *binding;
+    uint64_t closed = 0;
+
+    for (binding = table->bindings; binding; binding = binding->next) {
+        closed += binding->active;
+        binding->active = false;
+    }
+    return closed;
+}
+
 void gsva_home_destroy(GsvaHomeTable *table)
 {
     while (table->bindings) {
