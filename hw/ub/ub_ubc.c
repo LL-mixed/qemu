@@ -14845,6 +14845,100 @@ int ubc_gsva_drain_local_holder(BusControllerDev *ubc,
     return rc;
 }
 
+int ubc_gsva_force_revoke_local_holder(BusControllerDev *ubc,
+                                       const GsvaKeyV1 *key,
+                                       uint32_t requester_cna,
+                                       uint32_t token_id,
+                                       uint32_t token_value)
+{
+    GsvaRouteEntry *route;
+    GsvaCohObject *obj;
+    int rc;
+
+    if (!ubc || !key || !requester_cna ||
+        requester_cna != ubc->parent.cna ||
+        gsva_key_validate(key) != GSVA_OK || !key->epoch ||
+        key->home_va > UINT64_MAX - key->size) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+    if (!token_id || !token_value) {
+        return GSVA_ERR_TOKEN_DENIED;
+    }
+
+    gsva_tables_init();
+    route = gsva_route_lookup_base(&g_gsva_routes, key);
+    if (!route) {
+        route = gsva_route_lookup_tombstone(&g_gsva_routes, key);
+        if (!route) {
+            return GSVA_ERR_ROUTE_MISSING;
+        }
+        if (!sim_dec_gsva_key_exact(&route->key, key)) {
+            return route->key.epoch != key->epoch ?
+                   GSVA_ERR_STALE_EPOCH : GSVA_ERR_KEY_MISMATCH;
+        }
+        if (route->token.token_id != token_id ||
+            route->token.token_value != token_value) {
+            return GSVA_ERR_TOKEN_DENIED;
+        }
+        return route->state == GSVA_ROUTE_RETIRED &&
+               !route->cpu_window_mapped ? GSVA_OK :
+                                           GSVA_ERR_FEATURE_MISSING;
+    }
+    if (!sim_dec_gsva_key_exact(&route->key, key)) {
+        return route->key.epoch != key->epoch ?
+               GSVA_ERR_STALE_EPOCH : GSVA_ERR_KEY_MISMATCH;
+    }
+    if (route->token.token_id != token_id ||
+        route->token.token_value != token_value) {
+        return GSVA_ERR_TOKEN_DENIED;
+    }
+    if (!route->home_cna || route->home_cna == requester_cna) {
+        return GSVA_ERR_KEY_MISMATCH;
+    }
+
+    obj = gsva_coh_lookup(&g_gsva_coh, key);
+    if (!obj) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+    if (!sim_dec_gsva_key_exact(&obj->key, key)) {
+        return obj->key.epoch != key->epoch ?
+               GSVA_ERR_STALE_EPOCH : GSVA_ERR_KEY_MISMATCH;
+    }
+
+    rc = ubc_gsva_quarantine_local_holder(ubc, key, route->home_cna);
+    if (rc != GSVA_OK) {
+        return rc;
+    }
+    if (obj->state == GSVA_COH_TIMEOUT) {
+        return GSVA_ERR_COH_TIMEOUT;
+    }
+    if (obj->pending) {
+        return GSVA_ERR_COH_PENDING;
+    }
+    rc = ubc_gsva_drain_local_holder(ubc, key, route->home_cna);
+    if (rc != GSVA_OK) {
+        return rc;
+    }
+
+    obj->state = GSVA_COH_RETIRED;
+    obj->owner_cna = 0;
+    obj->sharer_bitmap = 0;
+    obj->sharer_count = 0;
+    memset(obj->sharer_cnas, 0, sizeof(obj->sharer_cnas));
+    obj->pending = false;
+    obj->pending_seq = 0;
+    obj->pending_op = 0;
+    obj->pending_target = 0;
+    obj->pending_ack_bitmap = 0;
+    obj->pending_ack_count = 0;
+    memset(obj->pending_ack_cnas, 0, sizeof(obj->pending_ack_cnas));
+    obj->pending_start_ms = 0;
+    qemu_log("GSVA_RECOVERY: local holder revoked cna=%" PRIu32
+             " segment_id=%#" PRIx64 " epoch=%" PRIu64 "\n",
+             requester_cna, key->segment_id, key->epoch);
+    return GSVA_OK;
+}
+
 /*
  * ubc_handle_sim_dec_message - Handle incoming SIM_DEC control message
  * This is called from the control channel/message handler
@@ -15255,6 +15349,12 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
                                       g_sim_decoder->bcs ?
                                       g_sim_decoder->bcs->ubc_dev : NULL,
                                       ev_key, requester_cna);
+            break;
+        case 8: /* LocalRevoke */
+            ev_rc = ubc_gsva_force_revoke_local_holder(
+                g_sim_decoder && g_sim_decoder->bcs ?
+                g_sim_decoder->bcs->ubc_dev : NULL,
+                ev_key, requester_cna, token_id, token_value);
             break;
         default:
             ev_rc = GSVA_ERR_BAD_VERSION;

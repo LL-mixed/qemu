@@ -788,5 +788,13 @@ int ubc_gsva_quarantine_local_holder(BusControllerDev *ubc,
 int ubc_gsva_drain_local_holder(BusControllerDev *ubc,
                                 const GsvaKeyV1 *key,
                                 uint32_t home_cna);
+/* Recovery-only physical proof. The replacement provider may acknowledge an
+ * old holder to the control plane only after this exact-key/token operation
+ * returns GSVA_OK. */
+int ubc_gsva_force_revoke_local_holder(BusControllerDev *ubc,
+                                       const GsvaKeyV1 *key,
+                                       uint32_t requester_cna,
+                                       uint32_t token_id,
+                                       uint32_t token_value);
 
 #endif
