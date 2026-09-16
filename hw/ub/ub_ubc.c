@@ -14744,7 +14744,7 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
         }
         int coh_rc = gsva_coh_retire(&g_gsva_coh, &route->key,
                                       0 /* requester_cna */);
-        if (coh_rc != GSVA_OK) {
+        if (coh_rc != GSVA_OK && coh_rc != GSVA_ERR_SEGMENT_RETIRED) {
             qemu_log("GSVA_UNMAP: coh retire failed: %s\n",
                      gsva_error_name(coh_rc));
         }
@@ -14794,6 +14794,37 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
     gsva_stats_unmap(&g_gsva_stats, true);
     sim_dec_flush_gva_tlbs("gsva_unmap");
     return 0;
+}
+
+int ubc_gsva_complete_home_retire(BusControllerDev *ubc,
+                                  const GsvaKeyV1 *key)
+{
+    GsvaRouteEntry *route;
+    SimDecGsvaUnmapReq unmap_req = {0};
+    SimDecGsvaUnmapResp unmap_resp = {0};
+
+    if (!ubc || !key) {
+        return GSVA_ERR_ROUTE_MISSING;
+    }
+
+    gsva_tables_init();
+    route = gsva_route_lookup_base(&g_gsva_routes, key);
+    if (!route) {
+        return gsva_route_lookup_tombstone(&g_gsva_routes, key) ?
+               GSVA_OK : GSVA_ERR_ROUTE_MISSING;
+    }
+
+    unmap_req.version = 1;
+    unmap_req.key = *key;
+    unmap_req.map_id = route->map_id;
+    if (sim_dec_handle_gsva_unmap(&unmap_req, &unmap_resp) != 0) {
+        return unmap_resp.error ? unmap_resp.error : GSVA_ERR_ROUTE_MISSING;
+    }
+
+    qemu_log("GSVA_COH: home retire route finalized"
+             " segment_id=%#" PRIx64 " map_id=%#" PRIx64 "\n",
+             key->segment_id, unmap_req.map_id);
+    return GSVA_OK;
 }
 
 static bool sim_dec_gsva_key_exact(const GsvaKeyV1 *left,

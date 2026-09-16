@@ -788,6 +788,10 @@ int ubc_gsva_quarantine_local_holder(BusControllerDev *ubc,
 int ubc_gsva_drain_local_holder(BusControllerDev *ubc,
                                 const GsvaKeyV1 *key,
                                 uint32_t home_cna);
+/* Complete the home-side route teardown after every remote holder has
+ * returned an exact successful RETIRE receipt. */
+int ubc_gsva_complete_home_retire(BusControllerDev *ubc,
+                                  const GsvaKeyV1 *key);
 /* Recovery-only physical proof. The replacement provider may acknowledge an
  * old holder to the control plane only after this exact-key/token operation
  * returns GSVA_OK. */

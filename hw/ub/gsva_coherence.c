@@ -1497,6 +1497,7 @@ void gsva_coh_handle_rx_retire(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *ms
 
 void gsva_coh_handle_rx_retire_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
 {
+    GsvaCohObject *obj = NULL;
     int rc = GSVA_ERR_ROUTE_MISSING;
 
     qemu_log("GSVA_COH: rx RETIRE_ACK from cna=%" PRIu32
@@ -1504,6 +1505,17 @@ void gsva_coh_handle_rx_retire_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1
              msg->source_cna, msg->key.segment_id, msg->seq);
     if (g_gsva_coh_default_table) {
         rc = gsva_coh_receive_ack(ubc_dev, msg, GSVA_COH_MSG_RETIRE_ACK, 3);
+        obj = gsva_coh_lookup(g_gsva_coh_default_table, &msg->key);
+    }
+    if (rc == GSVA_OK && obj && !obj->pending &&
+        obj->state == GSVA_COH_RETIRED) {
+        rc = ubc_gsva_complete_home_retire(ubc_dev, &msg->key);
+        if (rc != GSVA_OK) {
+            obj->state = GSVA_COH_TIMEOUT;
+            qemu_log("GSVA_COH: home retire route finalize failed"
+                     " segment_id=%#" PRIx64 " rc=%d\n",
+                     msg->key.segment_id, rc);
+        }
     }
     qemu_log("GSVA_COH: rx RETIRE_ACK applied from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 " rc=%d\n",

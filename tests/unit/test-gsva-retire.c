@@ -10,9 +10,11 @@ static unsigned sends;
 static unsigned receipt_sends;
 static unsigned quarantine_calls;
 static unsigned drain_calls;
+static unsigned home_retire_calls;
 static int send_result;
 static int quarantine_result;
 static int drain_result;
+static int home_retire_result;
 static GsvaCohMsgV1 last_receipt;
 static const GsvaKeyV1 key = {
     .version = 1, .segment_id = 42, .home_va = 0x700000000000,
@@ -64,6 +66,15 @@ int ubc_gsva_drain_local_holder(BusControllerDev *dev,
     return drain_result;
 }
 
+int ubc_gsva_complete_home_retire(BusControllerDev *dev,
+                                  const GsvaKeyV1 *retired)
+{
+    g_assert_true(dev == &ubc);
+    g_assert_cmpmem(retired, sizeof(*retired), &key, sizeof(key));
+    home_retire_calls++;
+    return home_retire_result;
+}
+
 /* Non-retire route entry points are deliberately unavailable in this test. */
 GsvaRouteEntry *gsva_route_lookup_base(GsvaRouteTable *tbl, const GsvaKeyV1 *key)
 {
@@ -95,7 +106,9 @@ static GsvaCohObject *start(bool transport, bool failure)
     now_ms = 100;
     sends = 0;
     receipt_sends = 0;
+    home_retire_calls = 0;
     send_result = failure ? -EIO : 0;
+    home_retire_result = GSVA_OK;
     g_assert_cmpint(gsva_coh_object_create(&table, &key, 7, 99), ==, GSVA_OK);
     obj = gsva_coh_lookup(&table, &key);
     obj->state = GSVA_COH_S;
@@ -161,14 +174,32 @@ static void test_exact_receipts(void)
     deliver(&good);
     g_assert_true(obj->pending);
     g_assert_cmpuint(obj->pending_ack_count, ==, 1);
+    g_assert_cmpuint(home_retire_calls, ==, 0);
     deliver(&good); /* duplicate cannot stand in for the other holder */
     g_assert_cmpuint(obj->pending_ack_count, ==, 1);
+    g_assert_cmpuint(home_retire_calls, ==, 0);
     good = receipt(obj, 100);
     deliver(&good);
     g_assert_false(obj->pending);
     g_assert_cmpint(obj->state, ==, GSVA_COH_RETIRED);
+    g_assert_cmpuint(home_retire_calls, ==, 1);
     g_assert_cmpuint(obj->sharer_count, ==, 0);
     g_assert_cmpuint(obj->owner_cna, ==, 0);
+    gsva_coh_table_destroy(&table);
+}
+
+static void test_home_finalize_failure_is_fail_closed(void)
+{
+    GsvaCohObject *obj = start(true, false);
+    GsvaCohMsgV1 ack = receipt(obj, 8);
+
+    deliver(&ack);
+    home_retire_result = GSVA_ERR_COH_TIMEOUT;
+    ack = receipt(obj, 100);
+    deliver(&ack);
+    g_assert_false(obj->pending);
+    g_assert_cmpint(obj->state, ==, GSVA_COH_TIMEOUT);
+    g_assert_cmpuint(home_retire_calls, ==, 1);
     gsva_coh_table_destroy(&table);
 }
 
@@ -314,6 +345,8 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/gsva-retire/exact-receipts", test_exact_receipts);
+    g_test_add_func("/gsva-retire/home-finalize-fail-closed",
+                    test_home_finalize_failure_is_fail_closed);
     g_test_add_func("/gsva-retire/missing-receipts", test_missing_receipts);
     g_test_add_func("/gsva-retire/late-ack", test_late_ack_without_timeout_poll);
     g_test_add_func("/gsva-retire/no-remote-holders", test_no_remote_holders);
