@@ -1435,25 +1435,64 @@ void gsva_coh_handle_rx_fence_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 
 void gsva_coh_handle_rx_retire(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
 {
     GsvaCohObject *obj = NULL;
+    int rc;
 
+    if (!ubc_dev || !msg || msg->version != 1 ||
+        msg->op != GSVA_COH_MSG_RETIRE || !msg->seq ||
+        !msg->source_cna || msg->source_cna == msg->target_cna ||
+        msg->target_cna != ubc_dev->parent.cna) {
+        qemu_log("GSVA_COH: reject malformed RETIRE envelope\n");
+        return;
+    }
     qemu_log("GSVA_COH: rx RETIRE from cna=%" PRIu32 " segment_id=%#" PRIx64
              " seq=%" PRIu64 "\n", msg->source_cna,
              msg->key.segment_id, msg->seq);
-    if (g_gsva_coh_default_table) {
+    rc = gsva_key_validate(&msg->key);
+    if (rc == GSVA_OK &&
+        (!msg->key.epoch || msg->key.home_va > UINT64_MAX - msg->key.size ||
+         msg->access_va != msg->key.home_va ||
+         msg->access_len != msg->key.size || msg->access_flags || msg->error)) {
+        rc = GSVA_ERR_KEY_MISMATCH;
+    }
+    if (rc == GSVA_OK) {
         obj = gsva_coh_lookup(g_gsva_coh_default_table, &msg->key);
-        if (obj && obj->key.epoch == msg->key.epoch) {
-            obj->state = GSVA_COH_RETIRED;
-            obj->owner_cna = 0;
-            obj->pending = false;
-            obj->pending_start_ms = 0;
-            gsva_coh_sharers_clear(obj);
-            gsva_coh_pending_clear(obj);
-            qemu_log("GSVA_COH: rx RETIRE local retired"
-                     " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
-                     msg->key.segment_id, msg->seq);
+        if (!obj) {
+            rc = GSVA_ERR_ROUTE_MISSING;
+        } else if (obj->key.epoch != msg->key.epoch) {
+            rc = GSVA_ERR_STALE_EPOCH;
+        } else if (memcmp(&obj->key, &msg->key, sizeof(msg->key))) {
+            rc = GSVA_ERR_KEY_MISMATCH;
         }
     }
-    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, GSVA_OK);
+    if (rc == GSVA_OK) {
+        rc = ubc_gsva_quarantine_local_holder(
+            ubc_dev, &msg->key, msg->source_cna);
+    }
+    if (rc == GSVA_OK && obj->state == GSVA_COH_TIMEOUT) {
+        rc = GSVA_ERR_COH_TIMEOUT;
+    } else if (rc == GSVA_OK && obj->pending) {
+        rc = GSVA_ERR_COH_PENDING;
+    }
+    if (rc == GSVA_OK) {
+        rc = ubc_gsva_drain_local_holder(
+            ubc_dev, &msg->key, msg->source_cna);
+    }
+    if (rc == GSVA_OK) {
+        obj->state = GSVA_COH_RETIRED;
+        obj->owner_cna = 0;
+        obj->pending = false;
+        obj->pending_start_ms = 0;
+        gsva_coh_sharers_clear(obj);
+        gsva_coh_pending_clear(obj);
+        qemu_log("GSVA_COH: rx RETIRE local drained"
+                 " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
+                 msg->key.segment_id, msg->seq);
+    } else {
+        qemu_log("GSVA_COH: rx RETIRE retained quarantine"
+                 " segment_id=%#" PRIx64 " seq=%" PRIu64 " rc=%d\n",
+                 msg->key.segment_id, msg->seq, rc);
+    }
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, (uint32_t)rc);
 }
 
 void gsva_coh_handle_rx_retire_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)

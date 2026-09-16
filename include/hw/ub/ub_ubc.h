@@ -780,4 +780,13 @@ int ubc_gsva_device_fence(BusControllerDev *ubc,
                           uint32_t requester_cna,
                           uint64_t gsva, uint64_t len);
 
+/* Remote RETIRE handling is split so an in-flight coherence operation can
+ * revoke new access immediately while withholding its completion receipt. */
+int ubc_gsva_quarantine_local_holder(BusControllerDev *ubc,
+                                     const GsvaKeyV1 *key,
+                                     uint32_t home_cna);
+int ubc_gsva_drain_local_holder(BusControllerDev *ubc,
+                                const GsvaKeyV1 *key,
+                                uint32_t home_cna);
+
 #endif

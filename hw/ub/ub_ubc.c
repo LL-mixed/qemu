@@ -14760,6 +14760,91 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
     return 0;
 }
 
+static bool sim_dec_gsva_key_exact(const GsvaKeyV1 *left,
+                                   const GsvaKeyV1 *right)
+{
+    return left && right && !memcmp(left, right, sizeof(*left));
+}
+
+int ubc_gsva_quarantine_local_holder(BusControllerDev *ubc,
+                                     const GsvaKeyV1 *key,
+                                     uint32_t home_cna)
+{
+    GsvaRouteEntry *route;
+
+    if (!ubc || !key || !home_cna || home_cna == ubc->parent.cna ||
+        gsva_key_validate(key) != GSVA_OK || !key->epoch ||
+        key->home_va > UINT64_MAX - key->size) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+    gsva_tables_init();
+    route = gsva_route_lookup_base(&g_gsva_routes, key);
+    if (!route) {
+        route = gsva_route_lookup_tombstone(&g_gsva_routes, key);
+        if (!route) {
+            return GSVA_ERR_ROUTE_MISSING;
+        }
+        if (!sim_dec_gsva_key_exact(&route->key, key) ||
+            route->home_cna != home_cna) {
+            return route->key.epoch != key->epoch ?
+                   GSVA_ERR_STALE_EPOCH : GSVA_ERR_KEY_MISMATCH;
+        }
+        return GSVA_OK;
+    }
+    if (!sim_dec_gsva_key_exact(&route->key, key) ||
+        route->home_cna != home_cna) {
+        return route->key.epoch != key->epoch ?
+               GSVA_ERR_STALE_EPOCH : GSVA_ERR_KEY_MISMATCH;
+    }
+    route->state = GSVA_ROUTE_STALE;
+    gsva_tlb_stable_flush_key(key, "remote_retire_quarantine");
+    if (route->address_profile != GSVA_ADDRESS_PROFILE_STRICT_GSVA ||
+        !route->backing_token_id || !route->cpu_window_initialized ||
+        !route->cpu_window_mapped) {
+        return GSVA_ERR_FEATURE_MISSING;
+    }
+    return GSVA_OK;
+}
+
+int ubc_gsva_drain_local_holder(BusControllerDev *ubc,
+                                const GsvaKeyV1 *key,
+                                uint32_t home_cna)
+{
+    GsvaRouteEntry *route;
+    uint64_t map_id;
+    int rc;
+
+    rc = ubc_gsva_quarantine_local_holder(ubc, key, home_cna);
+    if (rc != GSVA_OK) {
+        return rc;
+    }
+    route = gsva_route_lookup_base(&g_gsva_routes, key);
+    if (!route) {
+        return GSVA_OK; /* Exact tombstone validated by quarantine. */
+    }
+    if (ubc->gsva_strict_io_depth || ubc->gsva_unmap_in_progress) {
+        return GSVA_ERR_COH_PENDING;
+    }
+
+    ubc->gsva_unmap_in_progress = true;
+    rc = obmm_coh_send_fence(ubc, route->home_cna,
+                             route->key.home_va, route->key.size,
+                             route->backing_token_id);
+    if (rc != 0) {
+        ubc->gsva_unmap_in_progress = false;
+        return GSVA_ERR_COH_TIMEOUT;
+    }
+    obmm_coh_invalidate_local_range(ubc, route->home_cna,
+                                    route->key.home_va, route->key.size,
+                                    route->backing_token_id);
+    gsva_tlb_stable_flush_key(&route->key, "remote_retire_drained");
+    map_id = route->map_id;
+    rc = gsva_route_unmap(&g_gsva_routes, map_id, true);
+    ubc->gsva_unmap_in_progress = false;
+    gsva_stats_unmap(&g_gsva_stats, rc == GSVA_OK);
+    return rc;
+}
+
 /*
  * ubc_handle_sim_dec_message - Handle incoming SIM_DEC control message
  * This is called from the control channel/message handler
