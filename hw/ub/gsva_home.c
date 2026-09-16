@@ -143,6 +143,45 @@ int gsva_home_acquire(GsvaHomeTable *table, uint32_t local_cna,
     return GSVA_ERR_ROUTE_MISSING;
 }
 
+int gsva_home_resolve_export(const GsvaHomeTable *table, uint32_t local_cna,
+                             uint64_t export_mem_id,
+                             uint32_t backing_token_id,
+                             uint64_t address, uint64_t length,
+                             GsvaHomeRequest *registration)
+{
+    const GsvaHomeBinding *binding;
+
+    if (!table || !local_cna || !export_mem_id || !backing_token_id ||
+        !registration || !valid_range(address, length)) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+    memset(registration, 0, sizeof(*registration));
+    for (binding = table->bindings; binding; binding = binding->next) {
+        const GsvaHomeRequest *candidate = &binding->registration;
+        const GsvaHomeIdentity *identity = &candidate->identity;
+        bool same_export = candidate->export_mem_id == export_mem_id;
+        bool same_range = identity->key.home_va == address &&
+                          identity->key.size == length;
+
+        if (!same_export &&
+            !overlaps(&identity->key, address, length)) {
+            continue;
+        }
+        if (!same_export || !same_range || identity->home_cna != local_cna) {
+            return GSVA_ERR_KEY_MISMATCH;
+        }
+        if (identity->backing_token_id != backing_token_id) {
+            return GSVA_ERR_TOKEN_DENIED;
+        }
+        if (!binding->active) {
+            return GSVA_ERR_SEGMENT_RETIRED;
+        }
+        *registration = *candidate;
+        return GSVA_OK;
+    }
+    return GSVA_ERR_ROUTE_MISSING;
+}
+
 void gsva_home_release(GsvaHomeBinding *pin)
 {
     assert(pin && pin->users);

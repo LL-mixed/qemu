@@ -39,6 +39,13 @@ int gsva_home_update(GsvaHomeTable *table, uint32_t local_cna,
 int gsva_home_acquire(GsvaHomeTable *table, uint32_t local_cna,
                       const GsvaHomeIdentity *identity, uint64_t address,
                       uint64_t length, bool write, GsvaHomeBinding **pin);
+/* Resolve an active local export to its authoritative managed identity.
+ * Exact export, backing token, address and size must all match. */
+int gsva_home_resolve_export(const GsvaHomeTable *table, uint32_t local_cna,
+                             uint64_t export_mem_id,
+                             uint32_t backing_token_id,
+                             uint64_t address, uint64_t length,
+                             GsvaHomeRequest *registration);
 void gsva_home_release(GsvaHomeBinding *pin);
 /* Close admission without dropping identity history or outstanding pins. */
 uint64_t gsva_home_reset(GsvaHomeTable *table);

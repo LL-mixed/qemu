@@ -14148,7 +14148,16 @@ static void sim_dec_register_obmm_gsva_route(
     const SimDecObmmBootstrapRecord *record)
 {
     GsvaKeyV1 key = { 0 };
+    GsvaHomeRequest managed = { 0 };
+    BusControllerDev *ubc = g_sim_decoder && g_sim_decoder->bcs ?
+        g_sim_decoder->bcs->ubc_dev : NULL;
     uint64_t map_id = 0;
+    uint32_t route_source = SIM_DEC_MAP_SOURCE_LEGACY_OBMM;
+    uint32_t token_id;
+    uint32_t token_value;
+    uint32_t access_flags = UB_GSVA_DEVICE_ACCESS_READ_WRITE;
+    bool managed_home = false;
+    int home_rc = GSVA_ERR_ROUTE_MISSING;
     int rc;
     int coh_rc;
 
@@ -14160,13 +14169,34 @@ static void sim_dec_register_obmm_gsva_route(
 
     gsva_tables_init();
 
-    key.version = 1;
-    key.segment_id = record->export_mem_id;
-    key.home_va = record->remote_uba;
-    key.size = record->size;
-    key.p_tag = record->export_cna & 0x00ffffffu;
-    key.cache_policy = 4;
-    key.epoch = 1;
+    if (ubc && record->export_cna == ubc->parent.cna) {
+        home_rc = gsva_home_resolve_export(
+            &ubc->gsva_home, ubc->parent.cna, record->export_mem_id,
+            record->token_id, record->remote_uba, record->size, &managed);
+    }
+    if (home_rc == GSVA_OK) {
+        key = managed.identity.key;
+        token_id = managed.identity.token_id;
+        token_value = managed.identity.token_value;
+        access_flags = managed.access_flags;
+        route_source = SIM_DEC_MAP_SOURCE_GVA_MANAGER;
+        managed_home = true;
+    } else if (home_rc == GSVA_ERR_ROUTE_MISSING) {
+        key.version = 1;
+        key.segment_id = record->export_mem_id;
+        key.home_va = record->remote_uba;
+        key.size = record->size;
+        key.p_tag = record->export_cna & 0x00ffffffu;
+        key.cache_policy = 4;
+        key.epoch = 1;
+        token_id = record->token_id;
+        token_value = record->token_id;
+    } else {
+        qemu_log("GSVA_MAP: managed bootstrap identity rejected"
+                 " export=%" PRIu64 " cna=%" PRIu32 " rc=%d\n",
+                 record->export_mem_id, record->export_cna, home_rc);
+        return;
+    }
 
     if (gsva_route_lookup_base(&g_gsva_routes, &key)) {
         return;
@@ -14177,12 +14207,12 @@ static void sim_dec_register_obmm_gsva_route(
                         record->backing_uba,
                         record->remote_uba,
                         record->remote_uba,
-                        SIM_DEC_MAP_SOURCE_LEGACY_OBMM,
+                        route_source,
                         GSVA_ADDRESS_PROFILE_STRICT_GSVA,
                         record->export_cna,
-                        record->token_id,
-                        record->token_id,
-                        UB_GSVA_DEVICE_ACCESS_READ_WRITE,
+                        token_id,
+                        token_value,
+                        access_flags,
                         &map_id);
     if (rc != GSVA_OK) {
         qemu_log("GSVA_MAP: obmm bootstrap route failed segment=%#" PRIx64
@@ -14191,6 +14221,12 @@ static void sim_dec_register_obmm_gsva_route(
                  key.segment_id, key.home_va, record->backing_uba,
                  key.size, rc);
         return;
+    }
+    if (managed_home) {
+        GsvaRouteEntry *route = gsva_route_lookup_base(&g_gsva_routes, &key);
+
+        assert(route);
+        route->backing_token_id = record->token_id;
     }
 
     coh_rc = gsva_coh_object_create(&g_gsva_coh, &key, 0, map_id);
@@ -14206,9 +14242,9 @@ static void sim_dec_register_obmm_gsva_route(
     qemu_log("GSVA_MAP: obmm bootstrap route segment=%#" PRIx64
              " home_va=%#" PRIx64 " backing=%#" PRIx64
              " size=%#" PRIx64 " token=%" PRIu32
-             " map_id=%#" PRIx64 "\n",
+             " map_id=%#" PRIx64 " managed=%u\n",
              key.segment_id, key.home_va, record->backing_uba,
-             key.size, record->token_id, map_id);
+             key.size, token_id, map_id, managed_home);
 }
 
 /* Helper for sim_dec_gva_tcg_translate to look up GSVA routes.
