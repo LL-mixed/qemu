@@ -7539,6 +7539,16 @@ typedef struct ObmmExportEntry {
 static QTAILQ_HEAD(, ObmmExportEntry) g_obmm_exports = QTAILQ_HEAD_INITIALIZER(g_obmm_exports);
 static ObmmExportEntry *obmm_export_lookup(uint64_t uba, uint64_t len,
                                            uint32_t token_id);
+static bool obmm_export_range_overlaps(uint64_t uba, uint64_t len);
+static MemTxResult obmm_export_read_exact(BusControllerDev *ubc_dev,
+                                          const ObmmExportEntry *entry,
+                                          uint64_t uba, uint8_t *data,
+                                          uint32_t data_len);
+static MemTxResult obmm_export_write_exact(BusControllerDev *ubc_dev,
+                                           const ObmmExportEntry *entry,
+                                           uint64_t uba,
+                                           const uint8_t *data,
+                                           uint32_t data_len);
 static int sim_dec_retire_obmm_export_route(const ObmmExportEntry *entry);
 static bool sim_dec_obmm_export_is_retired(uint32_t export_cna,
                                            uint64_t remote_uba,
@@ -7559,6 +7569,7 @@ void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
                                  const UBCSimDecWritePldHdr *hdr,
                                  const uint8_t *data, uint32_t data_len)
 {
+    ObmmExportEntry *export_entry;
     uint32_t eff_tid;
     MemTxResult ret;
 
@@ -7577,9 +7588,22 @@ void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
     }
 
     eff_tid = ubc_tid_or_auto(hdr->token_id);
-    ret = ubc_dma_write_local_data_tid_strict(ubc_dev, hdr->remote_uba,
-                                              data, data_len, eff_tid);
-    if (ret != MEMTX_OK) {
+    export_entry = obmm_export_lookup(hdr->remote_uba, data_len,
+                                      hdr->token_id);
+    if (export_entry) {
+        ret = obmm_export_write_exact(ubc_dev, export_entry,
+                                      hdr->remote_uba, data, data_len);
+    } else if (obmm_export_range_overlaps(hdr->remote_uba, data_len)) {
+        qemu_log("SIM_DEC_OBMM_EXPORT_IDENTITY_REJECT op=write uba=%#" PRIx64
+                 " len=%u token=%u\n",
+                 (uint64_t)hdr->remote_uba, data_len, hdr->token_id);
+        ret = MEMTX_DECODE_ERROR;
+    } else {
+        ret = ubc_dma_write_local_data_tid_strict(
+            ubc_dev, hdr->remote_uba, data, data_len, eff_tid);
+    }
+    if (ret != MEMTX_OK && !export_entry &&
+        !obmm_export_range_overlaps(hdr->remote_uba, data_len)) {
         gsva_tables_init();
         GsvaRouteEntry *route = gsva_route_lookup_home_va(
             &g_gsva_routes, hdr->remote_uba, data_len);
@@ -7615,26 +7639,9 @@ void ubc_handle_sim_dec_rx_write(BusControllerDev *ubc_dev,
             }
         }
         if (ret != MEMTX_OK) {
-            /* OBMM export fallback: resolve backing_uba from export table. */
-            ObmmExportEntry *exp = obmm_export_lookup(hdr->remote_uba,
-                                                      data_len,
-                                                      hdr->token_id);
-            if (exp && exp->backing_uba) {
-                uint64_t offset = hdr->remote_uba - exp->remote_uba;
-                uint64_t backing_addr = exp->backing_uba + offset;
-                ret = ubc_dma_write_local_data_tid_strict(ubc_dev, backing_addr,
-                                                          data, data_len,
-                                                          UBC_DMA_TID_AUTO);
-                if (ret != MEMTX_OK) {
-                    ret = address_space_write(&address_space_memory, backing_addr,
-                                              MEMTXATTRS_UNSPECIFIED,
-                                              data, data_len);
-                }
-            } else {
-                ret = address_space_write(&address_space_memory, hdr->remote_uba,
-                                          MEMTXATTRS_UNSPECIFIED,
-                                          data, data_len);
-            }
+            ret = address_space_write(&address_space_memory, hdr->remote_uba,
+                                      MEMTXATTRS_UNSPECIFIED,
+                                      data, data_len);
         }
     }
     if (ret != MEMTX_OK) {
@@ -7820,6 +7827,7 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
     UbVoidResponseDecision decision = { 0 };
     UbVoidResponseRequest policy_request;
     UBCSimDecReadRespPldHdr void_response = { 0 };
+    ObmmExportEntry *export_entry;
     UBLinkState *link;
     uint32_t payload_len;
     uint32_t eff_tid;
@@ -7901,10 +7909,35 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
                  req->read_len, eff_tid, dcna, ubc_dev->parent.cna);
     }
 
-    ret = ubc_dma_read_local_data_tid_strict(ubc_dev, req->remote_uba,
-                                             payload + sizeof(*resp),
-                                             req->read_len, eff_tid);
-    if (ret != MEMTX_OK) {
+    export_entry = obmm_export_lookup(req->remote_uba, req->read_len,
+                                      req->token_id);
+    if (export_entry) {
+        ret = obmm_export_read_exact(ubc_dev, export_entry,
+                                     req->remote_uba,
+                                     payload + sizeof(*resp),
+                                     req->read_len);
+        if (void_eligible) {
+            qemu_log("SIM_DEC_OBMM_EXPORT_IDENTITY_ROUTE req=%u token=%u "
+                     "export=%" PRIu64 " generation=%" PRIu64
+                     " backing=%#" PRIx64 "\n",
+                     req->req_id, req->token_id,
+                     export_entry->export_mem_id, export_entry->generation,
+                     export_entry->backing_uba);
+        }
+    } else if (obmm_export_range_overlaps(req->remote_uba,
+                                          req->read_len)) {
+        qemu_log("SIM_DEC_OBMM_EXPORT_IDENTITY_REJECT op=read req=%u "
+                 "uba=%#" PRIx64 " len=%u token=%u\n",
+                 req->req_id, (uint64_t)req->remote_uba,
+                 req->read_len, req->token_id);
+        ret = MEMTX_DECODE_ERROR;
+    } else {
+        ret = ubc_dma_read_local_data_tid_strict(
+            ubc_dev, req->remote_uba, payload + sizeof(*resp),
+            req->read_len, eff_tid);
+    }
+    if (ret != MEMTX_OK && !export_entry &&
+        !obmm_export_range_overlaps(req->remote_uba, req->read_len)) {
         /*
          * The IOMMU (UMMU) may not have page table entries for GSVA
          * export UBA ranges.  Try looking up the GSVA route by home_va
@@ -7947,29 +7980,10 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
             }
         }
         if (ret != MEMTX_OK) {
-            /* OBMM export fallback: resolve backing_uba from export table. */
-            ObmmExportEntry *exp = obmm_export_lookup(req->remote_uba,
-                                                      req->read_len,
-                                                      req->token_id);
-            if (exp && exp->backing_uba) {
-                uint64_t offset = req->remote_uba - exp->remote_uba;
-                uint64_t backing_addr = exp->backing_uba + offset;
-                ret = ubc_dma_read_local_data_tid_strict(ubc_dev, backing_addr,
-                                                         payload + sizeof(*resp),
-                                                         req->read_len,
-                                                         UBC_DMA_TID_AUTO);
-                if (ret != MEMTX_OK) {
-                    ret = address_space_read(&address_space_memory, backing_addr,
-                                             MEMTXATTRS_UNSPECIFIED,
-                                             payload + sizeof(*resp),
-                                             req->read_len);
-                }
-            } else {
-                ret = address_space_read(&address_space_memory, req->remote_uba,
-                                         MEMTXATTRS_UNSPECIFIED,
-                                         payload + sizeof(*resp),
-                                         req->read_len);
-            }
+            ret = address_space_read(&address_space_memory, req->remote_uba,
+                                     MEMTXATTRS_UNSPECIFIED,
+                                     payload + sizeof(*resp),
+                                     req->read_len);
         }
     }
     if (ret != MEMTX_OK) {
@@ -12213,6 +12227,54 @@ static ObmmExportEntry *obmm_export_lookup(uint64_t uba, uint64_t len,
         }
     }
     return NULL;
+}
+
+static bool obmm_export_range_overlaps(uint64_t uba, uint64_t len)
+{
+    ObmmExportEntry *entry;
+
+    QTAILQ_FOREACH(entry, &g_obmm_exports, next) {
+        if (uba >= entry->remote_uba && len <= entry->size &&
+            uba - entry->remote_uba <= entry->size - len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static MemTxResult obmm_export_read_exact(BusControllerDev *ubc_dev,
+                                          const ObmmExportEntry *entry,
+                                          uint64_t uba, uint8_t *data,
+                                          uint32_t data_len)
+{
+    uint64_t backing_addr = entry->backing_uba +
+                            (uba - entry->remote_uba);
+    MemTxResult ret = ubc_dma_read_local_data_tid_strict(
+        ubc_dev, backing_addr, data, data_len, UBC_DMA_TID_AUTO);
+
+    if (ret != MEMTX_OK) {
+        ret = address_space_read(&address_space_memory, backing_addr,
+                                 MEMTXATTRS_UNSPECIFIED, data, data_len);
+    }
+    return ret;
+}
+
+static MemTxResult obmm_export_write_exact(BusControllerDev *ubc_dev,
+                                           const ObmmExportEntry *entry,
+                                           uint64_t uba,
+                                           const uint8_t *data,
+                                           uint32_t data_len)
+{
+    uint64_t backing_addr = entry->backing_uba +
+                            (uba - entry->remote_uba);
+    MemTxResult ret = ubc_dma_write_local_data_tid_strict(
+        ubc_dev, backing_addr, data, data_len, UBC_DMA_TID_AUTO);
+
+    if (ret != MEMTX_OK) {
+        ret = address_space_write(&address_space_memory, backing_addr,
+                                  MEMTXATTRS_UNSPECIFIED, data, data_len);
+    }
+    return ret;
 }
 
 static SimDecMapEntry *sim_dec_find_entry_by_id(uint64_t map_id)
