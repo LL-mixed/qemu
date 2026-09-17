@@ -14227,6 +14227,9 @@ static int sim_dec_register_obmm_gsva_route(
                 existing->token.access_flags == access_flags &&
                 existing->backing_token_id ==
                     (managed_home ? record->token_id : 0) &&
+                (!managed_home ||
+                    (existing->cpu_window_initialized &&
+                     existing->cpu_window_mapped)) &&
                 gsva_coh_lookup(&g_gsva_coh, &key);
 
             if (!exact) {
@@ -14273,6 +14276,21 @@ static int sim_dec_register_obmm_gsva_route(
                  key.segment_id, coh_rc);
         gsva_route_unmap(&g_gsva_routes, map_id, true);
         return SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+    if (managed_home) {
+        GsvaRouteEntry *route =
+            gsva_route_lookup_base(&g_gsva_routes, &key);
+
+        assert(route && !route->cpu_window_initialized &&
+               !route->cpu_window_mapped);
+        gsva_route_init_cpu_window(route, &sim_dec_gsva_cpu_window_ops);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            route->local_pa,
+                                            &route->cpu_window, 10);
+        route->cpu_window_mapped = true;
+        qemu_log("GSVA_MAP: managed bootstrap cpu_window registered"
+                 " pa=%#" PRIx64 " size=%#" PRIx64 "\n",
+                 route->local_pa, route->key.size);
     }
 
     gsva_stats_map(&g_gsva_stats, true);
