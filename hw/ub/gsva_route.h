@@ -64,6 +64,7 @@ typedef struct GsvaRouteEntry {
     GsvaTokenLease token;
     /* V2 separates the physical export credential from the GSVA lease. */
     uint32_t backing_token_id;
+    bool direct_home_backing;
     uint64_t map_id;
     MemoryRegion cpu_window;
     bool cpu_window_initialized;
@@ -99,6 +100,7 @@ typedef struct GsvaRouteAccess {
     uint32_t access_flags;
     uint32_t token_flags;
     uint32_t backing_token_id;
+    bool direct_home_backing;
 } GsvaRouteAccess;
 
 /* Caller holds BQL. Only installed strict V2 windows are PTO-capable. */

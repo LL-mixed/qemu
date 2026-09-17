@@ -9071,7 +9071,6 @@ static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
     if (dcna == ubc_dev->parent.cna) {
         GsvaHomeBinding *pin = NULL;
         GsvaRouteEntry *home_route = NULL;
-        bool restore_cpu_window = false;
         MemTxResult result;
 
         if (strict) {
@@ -9093,13 +9092,12 @@ static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
                 home_route->token.token_value != identity->token_value ||
                 home_route->backing_token_id !=
                     identity->backing_token_id ||
-                !home_route->cpu_window_initialized ||
-                !home_route->cpu_window_mapped ||
-                !ubc_cpu_window_detach(&home_route->cpu_window)) {
+                !home_route->direct_home_backing ||
+                home_route->cpu_window_initialized ||
+                home_route->cpu_window_mapped) {
                 gsva_home_release(pin);
                 return MEMTX_ACCESS_ERROR;
             }
-            restore_cpu_window = true;
         } else if (gsva_home_overlaps(&ubc_dev->gsva_home, remote_uba, len)) {
             return MEMTX_ACCESS_ERROR;
         }
@@ -9109,11 +9107,6 @@ static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
         } else {
             result = ubc_dma_read_local_data_tid_strict(
                 ubc_dev, remote_uba, data, len, ubc_tid_or_auto(token_id));
-        }
-        if (restore_cpu_window) {
-            memory_region_add_subregion_overlap(get_system_memory(),
-                                                home_route->local_pa,
-                                                &home_route->cpu_window, 10);
         }
         if (pin) {
             gsva_home_release(pin);
@@ -14256,8 +14249,9 @@ static int sim_dec_register_obmm_gsva_route(
                 existing->backing_token_id ==
                     (managed_home ? record->token_id : 0) &&
                 (!managed_home ||
-                    (existing->cpu_window_initialized &&
-                     existing->cpu_window_mapped)) &&
+                    (existing->direct_home_backing &&
+                     !existing->cpu_window_initialized &&
+                     !existing->cpu_window_mapped)) &&
                 gsva_coh_lookup(&g_gsva_coh, &key);
 
             if (!exact) {
@@ -14295,6 +14289,7 @@ static int sim_dec_register_obmm_gsva_route(
 
         assert(route);
         route->backing_token_id = record->token_id;
+        route->direct_home_backing = true;
     }
 
     coh_rc = gsva_coh_object_create(&g_gsva_coh, &key, 0, map_id);
@@ -14305,22 +14300,6 @@ static int sim_dec_register_obmm_gsva_route(
         gsva_route_unmap(&g_gsva_routes, map_id, true);
         return SIM_DEC_STATUS_BACKEND_ERROR;
     }
-    if (managed_home) {
-        GsvaRouteEntry *route =
-            gsva_route_lookup_base(&g_gsva_routes, &key);
-
-        assert(route && !route->cpu_window_initialized &&
-               !route->cpu_window_mapped);
-        gsva_route_init_cpu_window(route, &sim_dec_gsva_cpu_window_ops);
-        memory_region_add_subregion_overlap(get_system_memory(),
-                                            route->local_pa,
-                                            &route->cpu_window, 10);
-        route->cpu_window_mapped = true;
-        qemu_log("GSVA_MAP: managed bootstrap cpu_window registered"
-                 " pa=%#" PRIx64 " size=%#" PRIx64 "\n",
-                 route->local_pa, route->key.size);
-    }
-
     gsva_stats_map(&g_gsva_stats, true);
     qemu_log("GSVA_MAP: obmm bootstrap route segment=%#" PRIx64
              " home_va=%#" PRIx64 " backing=%#" PRIx64

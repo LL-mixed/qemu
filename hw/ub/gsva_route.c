@@ -268,6 +268,7 @@ int gsva_route_resolve_pto(GsvaRouteTable *tbl, uint64_t local_pa,
 {
     GsvaRouteEntry *entry, *route = NULL;
     uint64_t offset;
+    bool window_backing;
 
     if (!tbl || !access || !length || local_pa > UINT64_MAX - length) {
         return GSVA_ERR_KEY_MISMATCH;
@@ -291,11 +292,13 @@ int gsva_route_resolve_pto(GsvaRouteTable *tbl, uint64_t local_pa,
         length > route->key.size - offset) {
         return GSVA_ERR_KEY_MISMATCH;
     }
+    window_backing = route->cpu_window_initialized &&
+                     route->cpu_window_mapped;
     if (route->address_profile != GSVA_ADDRESS_PROFILE_STRICT_GSVA ||
         route->local_va != route->key.home_va ||
         route->remote_uba != route->key.home_va ||
         !route->backing_token_id || !route->map_id ||
-        !route->cpu_window_initialized || !route->cpu_window_mapped) {
+        route->direct_home_backing == window_backing) {
         return GSVA_ERR_FEATURE_MISSING;
     }
     if (route->state != GSVA_ROUTE_ACTIVE ||
@@ -323,6 +326,7 @@ int gsva_route_resolve_pto(GsvaRouteTable *tbl, uint64_t local_pa,
         .access_flags = route->token.access_flags,
         .token_flags = route->token.flags,
         .backing_token_id = route->backing_token_id,
+        .direct_home_backing = route->direct_home_backing,
     };
     return GSVA_OK;
 }
@@ -341,7 +345,8 @@ bool gsva_route_access_equal(const GsvaRouteAccess *a,
            a->token_value == b->token_value &&
            a->access_flags == b->access_flags &&
            a->token_flags == b->token_flags &&
-           a->backing_token_id == b->backing_token_id;
+           a->backing_token_id == b->backing_token_id &&
+           a->direct_home_backing == b->direct_home_backing;
 }
 
 GsvaRouteEntry *gsva_route_lookup_base(GsvaRouteTable *tbl,

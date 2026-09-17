@@ -202,6 +202,33 @@ static void test_pto_range_and_permissions(void)
     gsva_route_table_destroy(&table);
 }
 
+static void test_pto_direct_home_backing(void)
+{
+    GsvaRouteTable table;
+    GsvaRouteEntry *route;
+    GsvaRouteAccess access;
+
+    gsva_route_table_init(&table);
+    route = add_route(&table, false);
+    route->backing_token_id = 11;
+    g_assert_cmpint(gsva_route_resolve_pto(
+        &table, route->local_pa, 4096, 7, &access), ==,
+        GSVA_ERR_FEATURE_MISSING);
+    route->direct_home_backing = true;
+    g_assert_cmpint(gsva_route_resolve_pto(
+        &table, route->local_pa, 4096, 7, &access), ==, GSVA_OK);
+    g_assert_true(access.direct_home_backing);
+
+    gsva_route_init_cpu_window(route, NULL);
+    route->cpu_window.container = &container;
+    route->cpu_window_mapped = true;
+    object_ref(OBJECT(route));
+    g_assert_cmpint(gsva_route_resolve_pto(
+        &table, route->local_pa, 4096, 7, &access), ==,
+        GSVA_ERR_FEATURE_MISSING);
+    gsva_route_table_destroy(&table);
+}
+
 static void test_pto_identity_snapshot(void)
 {
     GsvaRouteTable table;
@@ -243,6 +270,7 @@ static void test_pto_identity_snapshot(void)
     CHECK_IDENTITY_FIELD(access_flags);
     CHECK_IDENTITY_FIELD(token_flags);
     CHECK_IDENTITY_FIELD(backing_token_id);
+    CHECK_IDENTITY_FIELD(direct_home_backing);
 #undef CHECK_IDENTITY_FIELD
     g_assert_false(gsva_route_access_equal(NULL, &original));
     gsva_route_table_destroy(&table);
@@ -363,6 +391,7 @@ int main(int argc, char **argv)
     g_test_add_func("/gsva-route/table-destroy", test_table_destroy_with_reference);
     g_test_add_func("/gsva-route/no-window", test_route_without_window);
     g_test_add_func("/gsva-route/pto-range-permissions", test_pto_range_and_permissions);
+    g_test_add_func("/gsva-route/pto-direct-home", test_pto_direct_home_backing);
     g_test_add_func("/gsva-route/pto-identity", test_pto_identity_snapshot);
     g_test_add_func("/gsva-route/pto-live-revalidation", test_pto_live_revalidation);
     g_test_add_func("/gsva-route/pto-ambiguous-pa", test_pto_ambiguous_pa);
