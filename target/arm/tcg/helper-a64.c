@@ -231,6 +231,14 @@ uint64_t HELPER(async_load_remote_load)(CPUARMState *env, target_ulong va,
         env->pc = upcall_entry;
         cpu_loop_exit_noexc(cs);
     }
+    if (result == UB_ASYNC_LOAD_TRY_STALE_MAPPING) {
+        syndrome = syn_data_abort_with_iss(
+            0, memop & MO_SIZE, 0, rt, bytes == 8, 0,
+            0, 0, 0, 0, UB_ASYNC_LOAD_STALE_MAPPING_FSC, false);
+        env->exception.vaddress = va;
+        env->exception.fsr = UB_ASYNC_LOAD_STALE_MAPPING_FSC;
+        raise_exception_ra(env, EXCP_DATA_ABORT, syndrome, 1, retaddr);
+    }
     ub_async_load_cpu_fail_stop(cs);
     cpu_abort(cs, "OBMM EL0 upcall delivery entered fail-stop");
 }

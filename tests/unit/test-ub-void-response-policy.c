@@ -91,6 +91,25 @@ static void test_jitter_is_deterministic(void)
                      second.completion_delay_ns);
 }
 
+static void test_late_duplicate_fault_injection(void)
+{
+    UbVoidResponsePolicy policy;
+
+    g_assert_true(ub_void_response_policy_configure(
+        &policy,
+        "v1|enabled=1|threshold_ns=1000|latency_ns=500|jitter_ns=0|"
+        "fault_voids=1|seed=7|late_duplicates=2",
+        &error_abort));
+    g_assert_cmpuint(policy.config.late_duplicates, ==, 2);
+    g_assert_true(ub_void_response_policy_decide(
+        &policy, &(UbVoidResponseRequest) {
+            .source_cna = 0x11,
+            .request_id = 1,
+            .remote_address = 0x40000000,
+            .length = 8,
+        }).send_void);
+}
+
 static void test_invalid_spec(void)
 {
     UbVoidResponsePolicy policy;
@@ -100,6 +119,14 @@ static void test_invalid_spec(void)
         &policy,
         "v1|enabled=1|threshold_ns=1|latency_ns=10|jitter_ns=11|"
         "fault_voids=0|seed=1",
+        &error));
+    g_assert_nonnull(error);
+    error_free(error);
+    error = NULL;
+    g_assert_false(ub_void_response_policy_configure(
+        &policy,
+        "v1|enabled=1|threshold_ns=1|latency_ns=1|jitter_ns=0|"
+        "fault_voids=1|seed=1|late_duplicates=17",
         &error));
     g_assert_nonnull(error);
     error_free(error);
@@ -114,6 +141,8 @@ int main(int argc, char **argv)
                     test_fault_then_recover);
     g_test_add_func("/ub/void-response/deterministic-jitter",
                     test_jitter_is_deterministic);
+    g_test_add_func("/ub/void-response/late-duplicate-fault-injection",
+                    test_late_duplicate_fault_injection);
     g_test_add_func("/ub/void-response/invalid-spec", test_invalid_spec);
     return g_test_run();
 }

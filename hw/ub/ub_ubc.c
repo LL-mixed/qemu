@@ -7827,6 +7827,7 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
     UBCSimDecReadRespPldHdr *resp;
     MemTxResult ret;
     bool void_eligible;
+    uint64_t duplicate_index;
     int rc;
 
     if (!ubc_dev || !req || req->read_len == 0 ||
@@ -8000,6 +8001,32 @@ void ubc_handle_sim_dec_rx_read_req(BusControllerDev *ubc_dev,
                      " data_len=%u dcna=%#x local_cna=%#x\n",
                      req->req_id, resp->status, resp->data_len, dcna,
                      ubc_dev->parent.cna);
+        }
+    }
+    if (rc >= 0 && decision.send_void &&
+        ubc_dev->void_response_policy.config.late_duplicates) {
+        for (duplicate_index = 0;
+             duplicate_index <
+                 ubc_dev->void_response_policy.config.late_duplicates;
+             duplicate_index++) {
+            uint64_t duplicate_delay = decision.completion_delay_ns;
+            uint64_t extra_delay = (duplicate_index + 1) * 1000;
+
+            duplicate_delay = duplicate_delay > UINT64_MAX - extra_delay ?
+                UINT64_MAX : duplicate_delay + extra_delay;
+            if (!ubc_void_schedule_real_response(
+                    ubc_dev, dcna, payload, payload_len,
+                    duplicate_delay)) {
+                qemu_log("UB_VOID_RESPONSE_DUPLICATE_SCHEDULE_FAILED "
+                         "req=%u dcna=%#x ordinal=%" PRIu64 "\n",
+                         req->req_id, dcna, duplicate_index + 1);
+                break;
+            }
+            qemu_log("UB_VOID_RESPONSE_DUPLICATE_SCHEDULE req=%u "
+                     "dcna=%#x ordinal=%" PRIu64 " delay_ns=%" PRIu64
+                     "\n",
+                     req->req_id, dcna, duplicate_index + 1,
+                     duplicate_delay);
         }
     }
     g_free(payload);
@@ -8178,6 +8205,42 @@ static void ubc_obmm_async_model_publish(
 
 static const char *ubc_void_trigger_name(UbcVoidTrigger trigger);
 
+static void ubc_voided_tombstone_record(BusControllerDev *ubc_dev,
+                                        uint32_t req_id,
+                                        uint32_t peer_cna,
+                                        bool late_seen)
+{
+    uint32_t slot;
+
+    if (!ubc_dev || !req_id) {
+        return;
+    }
+    slot = ubc_dev->next_voided_tombstone++ %
+        UBC_VOID_TOMBSTONE_CAPACITY;
+    ubc_dev->voided_tombstones[slot].active = true;
+    ubc_dev->voided_tombstones[slot].late_seen = late_seen;
+    ubc_dev->voided_tombstones[slot].req_id = req_id;
+    ubc_dev->voided_tombstones[slot].peer_cna = peer_cna;
+}
+
+static UbcVoidTombstone *ubc_voided_tombstone_find(
+    BusControllerDev *ubc_dev, uint32_t req_id, uint32_t peer_cna)
+{
+    uint32_t slot;
+
+    if (!ubc_dev) {
+        return NULL;
+    }
+    for (slot = 0; slot < UBC_VOID_TOMBSTONE_CAPACITY; slot++) {
+        if (ubc_dev->voided_tombstones[slot].active &&
+            ubc_dev->voided_tombstones[slot].req_id == req_id &&
+            ubc_dev->voided_tombstones[slot].peer_cna == peer_cna) {
+            return &ubc_dev->voided_tombstones[slot];
+        }
+    }
+    return NULL;
+}
+
 static void ubc_voided_transaction_bh(void *opaque)
 {
     BusControllerDev *ubc_dev = opaque;
@@ -8195,6 +8258,9 @@ static void ubc_voided_transaction_bh(void *opaque)
         qemu_log("UB_VOID_RESPONSE_LATE_DROP req=%u peer=%#x cause=%s\n",
                  child->req_id, child->peer_cna,
                  ubc_void_trigger_name(child->void_trigger));
+        ubc_dev->void_late_drops++;
+        ubc_voided_tombstone_record(
+            ubc_dev, child->req_id, child->peer_cna, true);
         child->complete(child->opaque, child->token, child->child_index,
                         OBMM_REMOTE_STATUS_VOIDED, NULL, 0,
                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
@@ -8241,6 +8307,7 @@ static bool ubc_handle_sim_dec_async_read_resp(
     UbObmmRemoteDecision decision;
     uint64_t now_ns;
     uint32_t child_slot;
+    UbcVoidTombstone *tombstone;
 
     if (!ubc_dev || !ubc_dev->obmm_async_children) {
         return false;
@@ -8257,6 +8324,22 @@ static bool ubc_handle_sim_dec_async_read_resp(
         }
     }
     if (!child) {
+        tombstone = ubc_voided_tombstone_find(
+            ubc_dev, header->req_id, peer_cna);
+        if (tombstone) {
+            if (tombstone->late_seen) {
+                ubc_dev->void_duplicate_drops++;
+                qemu_log("UB_VOID_RESPONSE_DUPLICATE_DROP req=%u "
+                         "peer=%#x\n", header->req_id, peer_cna);
+            } else {
+                tombstone->late_seen = true;
+                ubc_dev->void_late_drops++;
+                qemu_log("UB_VOID_RESPONSE_LATE_DROP req=%u peer=%#x "
+                         "cause=retired-void\n",
+                         header->req_id, peer_cna);
+            }
+            return true;
+        }
         return false;
     }
     if (header->status == UBC_SIM_DEC_READ_STATUS_VOID) {
@@ -8274,6 +8357,12 @@ static bool ubc_handle_sim_dec_async_read_resp(
         return true;
     }
     if (child->voided) {
+        if (child->late_real_seen) {
+            ubc_dev->void_duplicate_drops++;
+            qemu_log("UB_VOID_RESPONSE_DUPLICATE_DROP req=%u peer=%#x\n",
+                     header->req_id, peer_cna);
+            return true;
+        }
         child->late_real_seen = true;
         qemu_bh_schedule(ubc_dev->voided_transaction_bh);
         return true;
@@ -9046,6 +9135,10 @@ void ubc_sim_dec_remote_read_async_cancel(BusControllerDev *ubc_dev,
         if (child->active && child->token.owner_id == token.owner_id &&
             child->token.slot == token.slot &&
             child->token.generation == token.generation) {
+            if (child->voided) {
+                ubc_voided_tombstone_record(
+                    ubc_dev, child->req_id, child->peer_cna, false);
+            }
             memset(child, 0, sizeof(*child));
         }
     }

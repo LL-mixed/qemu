@@ -10,6 +10,7 @@
 #include "qemu/osdep.h"
 
 #define UB_VOID_RESPONSE_POLICY_MAX_LATENCY_NS 10000000000ULL
+#define UB_VOID_RESPONSE_POLICY_MAX_LATE_DUPLICATES 16ULL
 
 typedef enum UbVoidResponseReason {
     UB_VOID_RESPONSE_DISABLED,
@@ -25,6 +26,7 @@ typedef struct UbVoidResponsePolicyConfig {
     uint64_t jitter_ns;
     uint64_t fault_voids;
     uint64_t seed;
+    uint64_t late_duplicates;
 } UbVoidResponsePolicyConfig;
 
 typedef struct UbVoidResponseRequest {

@@ -154,7 +154,15 @@ typedef struct UbAsyncLoadFuture {
     uint64_t fill_remote_offset;
     uint32_t fill_bytes;
     ObmmRemoteToken backend_token;
+    bool predicated_void;
 } UbAsyncLoadFuture;
+
+typedef struct UbAsyncLoadVoidRetryGuard {
+    bool active;
+    uint64_t context_id;
+    UbAsyncLoadDesc load;
+    UbcObmmResolvedMap resolved;
+} UbAsyncLoadVoidRetryGuard;
 
 struct UbAsyncLoadDeviceState {
     BusControllerDev *ubc_dev;
@@ -202,6 +210,12 @@ struct UbAsyncLoadDeviceState {
     bool context_cookie_used[UB_ASYNC_LOAD_MAX_CONTEXTS];
     UbAsyncLoadMap maps[UB_ASYNC_LOAD_MAX_PENDING_LOADS];
     UbAsyncLoadFuture futures[UB_ASYNC_LOAD_MAX_PENDING_LOADS];
+    UbAsyncLoadVoidRetryGuard
+        void_retry_guards[UB_ASYNC_LOAD_MAX_CONTEXTS];
+    uint64_t void_retry_armed;
+    uint64_t void_retry_revalidated;
+    uint64_t void_retry_stale_rejected;
+    uint64_t void_retry_released;
 };
 
 static UbAsyncLoadDeviceState *ub_async_load_global;
@@ -669,6 +683,12 @@ static bool ub_async_load_reset(UbAsyncLoadDeviceState *state)
     memset(state->context_cookies, 0, sizeof(state->context_cookies));
     memset(state->context_cookie_used, 0,
            sizeof(state->context_cookie_used));
+    memset(state->void_retry_guards, 0,
+           sizeof(state->void_retry_guards));
+    state->void_retry_armed = 0;
+    state->void_retry_revalidated = 0;
+    state->void_retry_stale_rejected = 0;
+    state->void_retry_released = 0;
     state->upcall_active = false;
     state->active_context_id = 0;
     state->logical_context_count = 0;
@@ -935,7 +955,8 @@ uint64_t ub_async_load_device_read(UbAsyncLoadDeviceState *state, hwaddr reg,
             UB_ASYNC_LOAD_CAP_WFE_WAIT |
             UB_ASYNC_LOAD_CAP_CACHEABLE_FILL_REPLAY;
         if (ubc_void_response_policy_enabled(state->ubc_dev)) {
-            value |= UB_ASYNC_LOAD_CAP_VOID_RESPONSE_RETRY;
+            value |= UB_ASYNC_LOAD_CAP_VOID_RESPONSE_RETRY |
+                UB_ASYNC_LOAD_CAP_VOID_RETRY_REVALIDATE;
         }
         break;
     case ASYNC_LOAD_REG_IRQ_STATUS:
@@ -1302,6 +1323,126 @@ static UbAsyncLoadMap *ub_async_load_find_map(UbAsyncLoadDeviceState *state,
     return NULL;
 }
 
+static UbAsyncLoadVoidRetryGuard *ub_async_load_void_retry_guard(
+    UbAsyncLoadDeviceState *state)
+{
+    uint16_t slot;
+
+    if (!state || !state->active_context_id) {
+        return NULL;
+    }
+    slot = ub_async_load_context_id_slot(state->active_context_id);
+    if (slot >= state->logical_context_count ||
+        slot >= G_N_ELEMENTS(state->void_retry_guards)) {
+        return NULL;
+    }
+    return &state->void_retry_guards[slot];
+}
+
+static bool ub_async_load_void_retry_load_equal(
+    const UbAsyncLoadDesc *expected, const UbAsyncLoadDesc *actual)
+{
+    return expected->context_cookie == actual->context_cookie &&
+        expected->fault_pc == actual->fault_pc &&
+        expected->effective_va == actual->effective_va &&
+        expected->map_id == actual->map_id &&
+        expected->map_generation == actual->map_generation &&
+        expected->map_model_generation == actual->map_model_generation &&
+        expected->remote_offset == actual->remote_offset &&
+        expected->rt == actual->rt &&
+        expected->access_bytes == actual->access_bytes &&
+        expected->mmu_index == actual->mmu_index &&
+        expected->sign_extend == actual->sign_extend &&
+        expected->big_endian == actual->big_endian &&
+        expected->normal_cacheable == actual->normal_cacheable;
+}
+
+static bool ub_async_load_void_retry_resolved_equal(
+    const UbcObmmResolvedMap *expected, const UbcObmmResolvedMap *actual)
+{
+    return ubc_obmm_map_identity_equal(expected, actual) &&
+        expected->local_pa == actual->local_pa &&
+        expected->remote_uba == actual->remote_uba &&
+        expected->length == actual->length;
+}
+
+static bool ub_async_load_void_retry_covers(
+    UbAsyncLoadDeviceState *state, uint64_t va, uint8_t bytes)
+{
+    UbAsyncLoadVoidRetryGuard *guard = ub_async_load_void_retry_guard(state);
+
+    return guard && guard->active &&
+        guard->context_id == state->active_context_id &&
+        guard->load.effective_va == va &&
+        guard->load.access_bytes == bytes;
+}
+
+static bool ub_async_load_void_retry_validate(
+    UbAsyncLoadDeviceState *state, const UbAsyncLoadDesc *load,
+    const UbcObmmResolvedMap *resolved)
+{
+    UbAsyncLoadVoidRetryGuard *guard = ub_async_load_void_retry_guard(state);
+
+    if (!guard || !load || !resolved) {
+        return false;
+    }
+    if (!guard->active) {
+        *guard = (UbAsyncLoadVoidRetryGuard) {
+            .active = true,
+            .context_id = state->active_context_id,
+            .load = *load,
+            .resolved = *resolved,
+        };
+        state->void_retry_armed++;
+        qemu_log("UB_VOID_RETRY_GUARD_ARM context=%#" PRIx64
+                 " pc=%#" PRIx64 " va=%#" PRIx64
+                 " policy_map=%" PRIu64 ":%" PRIu64
+                 " provider_map=%" PRIu64 ":%" PRIu64 "\n",
+                 guard->context_id, load->fault_pc, load->effective_va,
+                 load->map_id, load->map_generation,
+                 resolved->map_id, resolved->map_generation);
+        return true;
+    }
+    if (guard->context_id == state->active_context_id &&
+        ub_async_load_void_retry_load_equal(&guard->load, load) &&
+        ub_async_load_void_retry_resolved_equal(
+            &guard->resolved, resolved)) {
+        state->void_retry_revalidated++;
+        return true;
+    }
+    state->void_retry_stale_rejected++;
+    qemu_log("UB_VOID_RETRY_STALE_MAPPING context=%#" PRIx64
+             " pc=%#" PRIx64 " va=%#" PRIx64
+             " old_policy_map=%" PRIu64 ":%" PRIu64
+             " new_policy_map=%" PRIu64 ":%" PRIu64
+             " old_provider_map=%" PRIu64 ":%" PRIu64
+             " new_provider_map=%" PRIu64 ":%" PRIu64
+             " action=terminal-access-error\n",
+             state->active_context_id, load->fault_pc, load->effective_va,
+             guard->load.map_id, guard->load.map_generation,
+             load->map_id, load->map_generation,
+             guard->resolved.map_id, guard->resolved.map_generation,
+             resolved->map_id, resolved->map_generation);
+    memset(guard, 0, sizeof(*guard));
+    return false;
+}
+
+static void ub_async_load_void_retry_release(UbAsyncLoadDeviceState *state)
+{
+    UbAsyncLoadVoidRetryGuard *guard = ub_async_load_void_retry_guard(state);
+
+    if (!guard || !guard->active ||
+        guard->context_id != state->active_context_id) {
+        return;
+    }
+    qemu_log("UB_VOID_RETRY_GUARD_RELEASE context=%#" PRIx64
+             " pc=%#" PRIx64 " va=%#" PRIx64 "\n",
+             guard->context_id, guard->load.fault_pc,
+             guard->load.effective_va);
+    memset(guard, 0, sizeof(*guard));
+    state->void_retry_released++;
+}
+
 bool ub_async_load_cpu_address_is_remote(CPUState *cpu, uint64_t va,
                                   uint8_t bytes)
 {
@@ -1310,7 +1451,8 @@ bool ub_async_load_cpu_address_is_remote(CPUState *cpu, uint64_t va,
     uint64_t map_id;
 
     return state && state->session_active && state->home_cpu == cpu &&
-        ub_async_load_find_map(state, va, bytes, &remote_offset, &map_id);
+        (ub_async_load_find_map(state, va, bytes, &remote_offset, &map_id) ||
+         ub_async_load_void_retry_covers(state, va, bytes));
 }
 
 bool ub_async_load_cpu_replay_expected(CPUState *cpu)
@@ -1593,7 +1735,9 @@ static void ub_async_load_remote_complete(void *opaque,
     if (!future->active) {
         return;
     }
-    if (result->status == OBMM_REMOTE_STATUS_VOIDED) {
+    if (result->status == OBMM_REMOTE_STATUS_VOIDED ||
+        (future->predicated_void &&
+         result->status != OBMM_REMOTE_STATUS_SUCCESS)) {
         ub_async_load_future_release(future);
         return;
     }
@@ -1655,7 +1799,7 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
     UbAsyncLoadDeviceState *state = ub_async_load_global;
     UbAsyncLoadDesc resolved_load;
     UbAsyncLoadPltToken plt_token;
-    UbAsyncLoadPendingResult pending;
+    UbAsyncLoadPendingResult pending = UB_ASYNC_LOAD_PENDING_ACCEPTED;
     ObmmRemoteRequest request;
     ObmmRemoteResult inline_result;
     ObmmRemoteToken backend_token;
@@ -1679,9 +1823,27 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
         state->upcall_active) {
         return UB_ASYNC_LOAD_TRY_NOT_REMOTE;
     }
+    predicated_void = ubc_void_response_policy_enabled(state->ubc_dev) &&
+        ub_async_load_cpu_kernel_task_mode(cpu);
     map = ub_async_load_find_map(state, load->effective_va,
                           load->access_bytes, &remote_offset, &map_id);
     if (!map) {
+        if (predicated_void && ub_async_load_void_retry_covers(
+                state, load->effective_va, load->access_bytes)) {
+            UbAsyncLoadVoidRetryGuard *guard =
+                ub_async_load_void_retry_guard(state);
+
+            state->void_retry_stale_rejected++;
+            qemu_log("UB_VOID_RETRY_STALE_MAPPING context=%#" PRIx64
+                     " pc=%#" PRIx64 " va=%#" PRIx64
+                     " old_policy_map=%" PRIu64 ":%" PRIu64
+                     " new_policy_map=missing action=terminal-access-error\n",
+                     state->active_context_id, load->fault_pc,
+                     load->effective_va, guard->load.map_id,
+                     guard->load.map_generation);
+            memset(guard, 0, sizeof(*guard));
+            return UB_ASYNC_LOAD_TRY_STALE_MAPPING;
+        }
         return ub_async_load_cpu_replay_expected(cpu) ?
             UB_ASYNC_LOAD_TRY_FAIL_STOP : UB_ASYNC_LOAD_TRY_NOT_REMOTE;
     }
@@ -1690,6 +1852,10 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
     resolved_load.map_generation = map->generation;
     resolved_load.map_model_generation = map->model_generation;
     resolved_load.remote_offset = remote_offset;
+    if (predicated_void && !ub_async_load_void_retry_validate(
+            state, &resolved_load, &map->resolved)) {
+        return UB_ASYNC_LOAD_TRY_STALE_MAPPING;
+    }
     if (resolved_load.normal_cacheable) {
         cache_lookup = ubc_obmm_cacheable_fill_lookup(
             state->ubc_dev, &map->resolved, remote_offset,
@@ -1703,6 +1869,9 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
                      state->active_context_id, resolved_load.fault_pc,
                      resolved_load.effective_va,
                      ub_async_load_pending_count(state->model));
+            if (predicated_void) {
+                ub_async_load_void_retry_release(state);
+            }
             return UB_ASYNC_LOAD_TRY_NOT_REMOTE;
         }
         if (cache_lookup < 0 || state->replay_armed) {
@@ -1758,8 +1927,7 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
     }
     future->context_id = state->active_context_id;
     future->load = resolved_load;
-    predicated_void = ubc_void_response_policy_enabled(state->ubc_dev) &&
-        ub_async_load_cpu_kernel_task_mode(cpu);
+    future->predicated_void = predicated_void;
     if (predicated_void) {
         if (resolved_load.normal_cacheable) {
             future->kind = UB_ASYNC_LOAD_FUTURE_CACHEABLE;
@@ -1852,7 +2020,8 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
         }
         ub_async_load_future_release(future);
         if (predicated_void) {
-            return UB_ASYNC_LOAD_TRY_FAIL_STOP;
+            ub_async_load_void_retry_release(state);
+            return UB_ASYNC_LOAD_TRY_STALE_MAPPING;
         }
     } else if (disposition == OBMM_SUBMIT_INLINE) {
         if (predicated_void && resolved_load.normal_cacheable) {
@@ -1869,8 +2038,11 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
                     state->model, inline_result.bytes_done);
             }
             ub_async_load_future_release(future);
+            if (filled) {
+                ub_async_load_void_retry_release(state);
+            }
             return filled ? UB_ASYNC_LOAD_TRY_NOT_REMOTE :
-                UB_ASYNC_LOAD_TRY_FAIL_STOP;
+                UB_ASYNC_LOAD_TRY_STALE_MAPPING;
         }
         if (predicated_void) {
             bool valid = inline_result.status == OBMM_REMOTE_STATUS_SUCCESS &&
@@ -1879,8 +2051,11 @@ UbAsyncLoadTryResult ub_async_load_cpu_remote_load(
                     inline_result.bytes_done, replay_value);
 
             ub_async_load_future_release(future);
+            if (valid) {
+                ub_async_load_void_retry_release(state);
+            }
             return valid ? UB_ASYNC_LOAD_TRY_REPLAYED :
-                UB_ASYNC_LOAD_TRY_FAIL_STOP;
+                UB_ASYNC_LOAD_TRY_STALE_MAPPING;
         }
         if (!resolved_load.normal_cacheable) {
             trace_async_load_load_inline(

@@ -40,6 +40,14 @@ OBJECT_DECLARE_TYPE(BusControllerDev, BusControllerDevClass, BUS_CONTROLLER_DEV)
 #define UB_ENTITY_GUID_DW_NUM  4
 #define UB_ENTITY_MAX_RES_NUM  3
 #define UB_MAX_ENTITIES        8
+#define UBC_VOID_TOMBSTONE_CAPACITY 64
+
+typedef struct UbcVoidTombstone {
+    bool active;
+    bool late_seen;
+    uint32_t req_id;
+    uint32_t peer_cna;
+} UbcVoidTombstone;
 
 typedef enum UBEntityState {
     UB_ENTITY_STATE_ABSENT,
@@ -165,6 +173,10 @@ typedef struct BusControllerDev {
     struct UbcVoidPendingResponse *void_pending_responses;
     QEMUBH *voided_transaction_bh;
     struct UbcObmmAsyncChild *obmm_async_children;
+    UbcVoidTombstone voided_tombstones[UBC_VOID_TOMBSTONE_CAPACITY];
+    uint32_t next_voided_tombstone;
+    uint64_t void_late_drops;
+    uint64_t void_duplicate_drops;
     struct UbObmmAsyncState *obmm_async;
     struct UbAsyncLoadDeviceState *ub_async_load;
     UBEntityDesc entities[UB_MAX_ENTITIES]; /* per-entity descriptor table */

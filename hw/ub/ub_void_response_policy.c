@@ -68,7 +68,9 @@ bool ub_void_response_policy_configure(UbVoidResponsePolicy *policy,
     uint64_t jitter_ns;
     uint64_t fault_voids;
     uint64_t seed;
+    uint64_t late_duplicates = 0;
     int consumed = 0;
+    int fields;
 
     if (!policy) {
         error_setg(errp, "void-response policy state is missing");
@@ -78,21 +80,34 @@ bool ub_void_response_policy_configure(UbVoidResponsePolicy *policy,
     if (!spec || !*spec || strcmp(spec, "off") == 0) {
         return true;
     }
-    if (sscanf(spec,
-               "v1|enabled=%u|threshold_ns=%" SCNu64
-               "|latency_ns=%" SCNu64 "|jitter_ns=%" SCNu64
-               "|fault_voids=%" SCNu64 "|seed=%" SCNu64 "%n",
-               &enabled, &threshold_ns, &latency_ns, &jitter_ns,
-               &fault_voids, &seed, &consumed) != 6 ||
+    fields = sscanf(spec,
+                    "v1|enabled=%u|threshold_ns=%" SCNu64
+                    "|latency_ns=%" SCNu64 "|jitter_ns=%" SCNu64
+                    "|fault_voids=%" SCNu64 "|seed=%" SCNu64
+                    "|late_duplicates=%" SCNu64 "%n",
+                    &enabled, &threshold_ns, &latency_ns, &jitter_ns,
+                    &fault_voids, &seed, &late_duplicates, &consumed);
+    if (fields != 7) {
+        consumed = 0;
+        fields = sscanf(spec,
+                        "v1|enabled=%u|threshold_ns=%" SCNu64
+                        "|latency_ns=%" SCNu64 "|jitter_ns=%" SCNu64
+                        "|fault_voids=%" SCNu64 "|seed=%" SCNu64 "%n",
+                        &enabled, &threshold_ns, &latency_ns, &jitter_ns,
+                        &fault_voids, &seed, &consumed);
+    }
+    if ((fields != 6 && fields != 7) ||
         spec[consumed] != '\0' || enabled > 1 || seed == 0 ||
         threshold_ns > UB_VOID_RESPONSE_POLICY_MAX_LATENCY_NS ||
         latency_ns > UB_VOID_RESPONSE_POLICY_MAX_LATENCY_NS ||
         jitter_ns > UB_VOID_RESPONSE_POLICY_MAX_LATENCY_NS ||
-        jitter_ns > latency_ns) {
+        jitter_ns > latency_ns ||
+        late_duplicates > UB_VOID_RESPONSE_POLICY_MAX_LATE_DUPLICATES) {
         error_setg(errp,
                    "invalid void-response policy; expected "
                    "v1|enabled=0|1|threshold_ns=N|latency_ns=N|"
-                   "jitter_ns=N|fault_voids=N|seed=N");
+                   "jitter_ns=N|fault_voids=N|seed=N"
+                   "[|late_duplicates=N]");
         return false;
     }
     policy->config = (UbVoidResponsePolicyConfig) {
@@ -102,6 +117,7 @@ bool ub_void_response_policy_configure(UbVoidResponsePolicy *policy,
         .jitter_ns = jitter_ns,
         .fault_voids = fault_voids,
         .seed = seed,
+        .late_duplicates = late_duplicates,
     };
     return true;
 }
