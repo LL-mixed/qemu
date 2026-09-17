@@ -61,6 +61,13 @@ static bool gsva_coh_ub_link_tx_enabled(void)
     return env && g_strcmp0(env, "1") == 0;
 }
 
+static bool gsva_coh_trace_hits_enabled(void)
+{
+    const char *env = g_getenv("UBC_TRACE_DATA_PATH");
+
+    return env && env[0] && g_strcmp0(env, "0") != 0;
+}
+
 static void gsva_coh_set_bitmap_bit(uint64_t *bitmap, uint32_t cna)
 {
     if (cna < 64) {
@@ -371,12 +378,17 @@ int gsva_coh_read_acquire_tx(GsvaCohTable *tbl, const GsvaRouteTable *routes,
                  requester_cna, key->segment_id);
         break;
 
-    case GSVA_COH_S:
+    case GSVA_COH_S: {
+        bool existing_sharer = gsva_coh_sharer_has(obj, requester_cna);
+
         gsva_coh_sharer_add(obj, requester_cna);
-        qemu_log("GSVA_COH: ReadAcquire S->S cna=%" PRIu32
-                 " segment_id=%#" PRIx64 "\n",
-                 requester_cna, key->segment_id);
+        if (!existing_sharer || gsva_coh_trace_hits_enabled()) {
+            qemu_log("GSVA_COH: ReadAcquire S->S cna=%" PRIu32
+                     " segment_id=%#" PRIx64 "\n",
+                     requester_cna, key->segment_id);
+        }
         break;
+    }
 
     case GSVA_COH_E:
         if (obj->owner_cna != 0 && obj->owner_cna != requester_cna &&
@@ -703,9 +715,11 @@ int gsva_coh_write_acquire_tx(GsvaCohTable *tbl, const GsvaRouteTable *routes,
     case GSVA_COH_M:
         if (obj->owner_cna == requester_cna) {
             /* Already owner, no state change */
-            qemu_log("GSVA_COH: WriteAcquire M->M (owner) cna=%" PRIu32
-                     " segment_id=%#" PRIx64 "\n",
-                     requester_cna, key->segment_id);
+            if (gsva_coh_trace_hits_enabled()) {
+                qemu_log("GSVA_COH: WriteAcquire M->M (owner) cna=%" PRIu32
+                         " segment_id=%#" PRIx64 "\n",
+                         requester_cna, key->segment_id);
+            }
         } else {
             uint32_t old_owner = obj->owner_cna;
 
