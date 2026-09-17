@@ -7485,6 +7485,7 @@ typedef struct ObmmExportEntry {
 static QTAILQ_HEAD(, ObmmExportEntry) g_obmm_exports = QTAILQ_HEAD_INITIALIZER(g_obmm_exports);
 static ObmmExportEntry *obmm_export_lookup(uint64_t uba, uint64_t len,
                                            uint32_t token_id);
+static int sim_dec_retire_obmm_export_route(const ObmmExportEntry *entry);
 static bool sim_dec_obmm_export_is_retired(uint32_t export_cna,
                                            uint64_t remote_uba,
                                            uint32_t token_id,
@@ -13661,6 +13662,7 @@ static int sim_dec_handle_obmm_export_retire(
     g_autofree char *data = NULL;
     GError *err = NULL;
     uint64_t export_generation;
+    int route_status;
     bool found = false;
 
     if (!req || req->export_mem_id == 0 || req->remote_uba == 0 ||
@@ -13679,6 +13681,10 @@ static int sim_dec_handle_obmm_export_retire(
     }
     if (!found) {
         return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+    route_status = sim_dec_retire_obmm_export_route(entry);
+    if (route_status != SIM_DEC_STATUS_SUCCESS) {
+        return route_status;
     }
     export_generation = entry->generation;
     dir = sim_dec_obmm_retired_dir();
@@ -14276,6 +14282,103 @@ static int sim_dec_register_obmm_gsva_route(
              " map_id=%#" PRIx64 " managed=%u\n",
              key.segment_id, key.home_va, record->backing_uba,
              key.size, token_id, map_id, managed_home);
+    return SIM_DEC_STATUS_SUCCESS;
+}
+
+static int sim_dec_retire_obmm_export_route(const ObmmExportEntry *entry)
+{
+    BusControllerDev *ubc = g_sim_decoder && g_sim_decoder->bcs ?
+        g_sim_decoder->bcs->ubc_dev : NULL;
+    GsvaKeyV1 key = { 0 };
+    GsvaRouteEntry *route;
+    uint64_t map_id;
+    int rc;
+
+    if (!entry) {
+        return SIM_DEC_STATUS_INVALID_PARAM;
+    }
+    if (!g_sim_decoder || !g_sim_decoder->experimental_gsva_enabled ||
+        !g_gsva_initialized) {
+        return SIM_DEC_STATUS_SUCCESS;
+    }
+    if (!ubc) {
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+
+    key.version = 1;
+    key.segment_id = entry->export_mem_id;
+    key.home_va = entry->remote_uba;
+    key.size = entry->size;
+    key.p_tag = entry->export_cna & 0x00ffffffu;
+    key.cache_policy = 4;
+    key.epoch = 1;
+    route = gsva_route_lookup_base(&g_gsva_routes, &key);
+    if (!route) {
+        return SIM_DEC_STATUS_SUCCESS;
+    }
+    if (memcmp(&route->key, &key, sizeof(key)) ||
+        route->source != SIM_DEC_MAP_SOURCE_LEGACY_OBMM ||
+        route->address_profile != GSVA_ADDRESS_PROFILE_STRICT_GSVA ||
+        route->local_pa != entry->backing_uba ||
+        route->local_va != entry->remote_uba ||
+        route->remote_uba != entry->remote_uba ||
+        route->home_cna != entry->export_cna ||
+        route->token.token_id != entry->token_id ||
+        route->token.token_value != entry->token_id ||
+        route->token.access_flags != UB_GSVA_DEVICE_ACCESS_READ_WRITE ||
+        route->backing_token_id != 0 ||
+        (route->state != GSVA_ROUTE_ACTIVE &&
+         route->state != GSVA_ROUTE_STALE)) {
+        qemu_log("GSVA_UNMAP: OBMM export retire route mismatch"
+                 " segment=%#" PRIx64 " home_va=%#" PRIx64
+                 " token=%" PRIu32 "\n",
+                 key.segment_id, key.home_va, entry->token_id);
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+    if (ubc->gsva_strict_io_depth || ubc->gsva_unmap_in_progress) {
+        return SIM_DEC_STATUS_RESOURCE_BUSY;
+    }
+
+    route->state = GSVA_ROUTE_STALE;
+    ubc->gsva_unmap_in_progress = true;
+    rc = obmm_coh_send_fence(ubc, route->home_cna,
+                             route->key.home_va, route->key.size,
+                             route->token.token_id);
+    if (rc != 0) {
+        ubc->gsva_unmap_in_progress = false;
+        qemu_log("GSVA_UNMAP: OBMM export retire fence failed"
+                 " segment=%#" PRIx64 " rc=%d\n",
+                 key.segment_id, rc);
+        return SIM_DEC_STATUS_RESOURCE_BUSY;
+    }
+    obmm_coh_invalidate_local_range(ubc, route->home_cna,
+                                    route->key.home_va, route->key.size,
+                                    route->token.token_id);
+    rc = gsva_coh_object_remove(&g_gsva_coh, &route->key);
+    if (rc != GSVA_OK) {
+        ubc->gsva_unmap_in_progress = false;
+        qemu_log("GSVA_UNMAP: OBMM export retire coherence cleanup failed"
+                 " segment=%#" PRIx64 " rc=%d\n",
+                 key.segment_id, rc);
+        return rc == GSVA_ERR_COH_PENDING || rc == GSVA_ERR_COH_TIMEOUT ?
+               SIM_DEC_STATUS_RESOURCE_BUSY : SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+
+    gsva_tlb_stable_flush_key(&route->key, "obmm_export_retire");
+    map_id = route->map_id;
+    rc = gsva_route_unmap(&g_gsva_routes, map_id, false);
+    ubc->gsva_unmap_in_progress = false;
+    gsva_stats_unmap(&g_gsva_stats, rc == GSVA_OK);
+    if (rc != GSVA_OK) {
+        qemu_log("GSVA_UNMAP: OBMM export retire route cleanup failed"
+                 " segment=%#" PRIx64 " map_id=%#" PRIx64 " rc=%d\n",
+                 key.segment_id, map_id, rc);
+        return SIM_DEC_STATUS_BACKEND_ERROR;
+    }
+    sim_dec_flush_gva_tlbs("obmm_export_retire");
+    qemu_log("GSVA_UNMAP: OBMM export route retired"
+             " segment=%#" PRIx64 " map_id=%#" PRIx64 "\n",
+             key.segment_id, map_id);
     return SIM_DEC_STATUS_SUCCESS;
 }
 
