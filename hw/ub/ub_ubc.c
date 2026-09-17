@@ -12022,7 +12022,7 @@ static void obmm_export_register(const SimDecObmmBootstrapRecord *record)
     QTAILQ_INSERT_TAIL(&g_obmm_exports, entry, next);
 }
 
-static void sim_dec_register_obmm_gsva_route(
+static int sim_dec_register_obmm_gsva_route(
     const SimDecObmmBootstrapRecord *record);
 
 
@@ -13774,11 +13774,16 @@ static int sim_dec_handle_obmm_bootstrap_publish(
         return SIM_DEC_STATUS_BACKEND_ERROR;
     }
 
+    if (g_sim_decoder->experimental_gsva_enabled) {
+        int route_status = sim_dec_register_obmm_gsva_route(record);
+
+        if (route_status != SIM_DEC_STATUS_SUCCESS) {
+            g_unlink(tmp_path);
+            return route_status;
+        }
+    }
     /* Make the local payload resolvable before publishing peer visibility. */
     obmm_export_register(record);
-    if (g_sim_decoder->experimental_gsva_enabled) {
-        sim_dec_register_obmm_gsva_route(record);
-    }
     if (g_rename(tmp_path, path) != 0) {
         qemu_log("SIM_DEC: OBMM bootstrap publish rename failed: %s\n",
                  g_strerror(errno));
@@ -14144,7 +14149,7 @@ static void gsva_tables_init(void)
     }
 }
 
-static void sim_dec_register_obmm_gsva_route(
+static int sim_dec_register_obmm_gsva_route(
     const SimDecObmmBootstrapRecord *record)
 {
     GsvaKeyV1 key = { 0 };
@@ -14164,7 +14169,7 @@ static void sim_dec_register_obmm_gsva_route(
     if (!record || record->export_mem_id == 0 || record->remote_uba == 0 ||
         record->backing_uba == 0 || record->size == 0 ||
         record->export_cna == 0 || record->token_id == 0) {
-        return;
+        return SIM_DEC_STATUS_INVALID_PARAM;
     }
 
     gsva_tables_init();
@@ -14195,11 +14200,37 @@ static void sim_dec_register_obmm_gsva_route(
         qemu_log("GSVA_MAP: managed bootstrap identity rejected"
                  " export=%" PRIu64 " cna=%" PRIu32 " rc=%d\n",
                  record->export_mem_id, record->export_cna, home_rc);
-        return;
+        return SIM_DEC_STATUS_BACKEND_ERROR;
     }
 
-    if (gsva_route_lookup_base(&g_gsva_routes, &key)) {
-        return;
+    {
+        GsvaRouteEntry *existing =
+            gsva_route_lookup_base(&g_gsva_routes, &key);
+
+        if (existing) {
+            bool exact = !memcmp(&existing->key, &key, sizeof(key)) &&
+                existing->state == GSVA_ROUTE_ACTIVE &&
+                existing->local_pa == record->backing_uba &&
+                existing->local_va == record->remote_uba &&
+                existing->remote_uba == record->remote_uba &&
+                existing->source == route_source &&
+                existing->address_profile == GSVA_ADDRESS_PROFILE_STRICT_GSVA &&
+                existing->home_cna == record->export_cna &&
+                existing->token.token_id == token_id &&
+                existing->token.token_value == token_value &&
+                existing->token.access_flags == access_flags &&
+                existing->backing_token_id ==
+                    (managed_home ? record->token_id : 0) &&
+                gsva_coh_lookup(&g_gsva_coh, &key);
+
+            if (!exact) {
+                qemu_log("GSVA_MAP: bootstrap replay conflicts with active route"
+                         " segment=%#" PRIx64 " home_va=%#" PRIx64 "\n",
+                         key.segment_id, key.home_va);
+                return SIM_DEC_STATUS_BACKEND_ERROR;
+            }
+            return SIM_DEC_STATUS_SUCCESS;
+        }
     }
 
     rc = gsva_route_map(&g_gsva_routes,
@@ -14220,7 +14251,7 @@ static void sim_dec_register_obmm_gsva_route(
                  " size=%#" PRIx64 " rc=%d\n",
                  key.segment_id, key.home_va, record->backing_uba,
                  key.size, rc);
-        return;
+        return SIM_DEC_STATUS_BACKEND_ERROR;
     }
     if (managed_home) {
         GsvaRouteEntry *route = gsva_route_lookup_base(&g_gsva_routes, &key);
@@ -14235,7 +14266,7 @@ static void sim_dec_register_obmm_gsva_route(
                  PRIx64 " rc=%d\n",
                  key.segment_id, coh_rc);
         gsva_route_unmap(&g_gsva_routes, map_id, true);
-        return;
+        return SIM_DEC_STATUS_BACKEND_ERROR;
     }
 
     gsva_stats_map(&g_gsva_stats, true);
@@ -14245,6 +14276,7 @@ static void sim_dec_register_obmm_gsva_route(
              " map_id=%#" PRIx64 " managed=%u\n",
              key.segment_id, key.home_va, record->backing_uba,
              key.size, token_id, map_id, managed_home);
+    return SIM_DEC_STATUS_SUCCESS;
 }
 
 /* Helper for sim_dec_gva_tcg_translate to look up GSVA routes.
@@ -14752,12 +14784,14 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
         /* PA-MESI fence before route removal (V1 sim: best-effort) */
         if (coh_rc == GSVA_OK && g_sim_decoder && g_sim_decoder->bcs &&
             g_sim_decoder->bcs->ubc_dev) {
+            uint32_t fence_token = route->backing_token_id ?
+                route->backing_token_id : route->token.token_id;
             int fence_rc = obmm_coh_send_fence(
                 g_sim_decoder->bcs->ubc_dev,
                 route->home_cna,
                 route->key.home_va,
                 route->key.size,
-                route->token.token_id);
+                fence_token);
             if (fence_rc != 0) {
                 qemu_log("GSVA_UNMAP: PA-MESI fence failed: %d\n", fence_rc);
             } else {
@@ -14766,7 +14800,7 @@ static int sim_dec_handle_gsva_unmap(const SimDecGsvaUnmapReq *req,
                     route->home_cna,
                     route->key.home_va,
                     route->key.size,
-                    route->token.token_id);
+                    fence_token);
                 qemu_log("GSVA_UNMAP: PA-MESI fence+invalidate done"
                          " segment_id=%#" PRIx64 "\n",
                          route->key.segment_id);
@@ -15052,6 +15086,15 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
         }
         request = (const GsvaHomeRequest *)(data + sizeof(*hdr));
         error = gsva_home_update(&ubc->gsva_home, ubc->parent.cna, request);
+        if (error == GSVA_OK && request->operation == GSVA_HOME_REVOKE) {
+            int route_error = ubc_gsva_complete_home_retire(
+                ubc, &request->identity.key);
+
+            if (route_error != GSVA_OK &&
+                route_error != GSVA_ERR_ROUTE_MISSING) {
+                error = route_error;
+            }
+        }
         qemu_log("GSVA_HOME: operation=%u segment=%#" PRIx64
                  " epoch=%" PRIu64 " export=%" PRIu64 " error=%d\n",
                  request->operation, (uint64_t)request->identity.key.segment_id,
