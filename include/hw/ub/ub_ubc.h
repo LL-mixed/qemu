@@ -135,8 +135,9 @@ typedef struct UBCEqState {
     uint32_t eq_id;
     uint64_t eq_buf_addr;    /* EQ buffer guest physical address */
     uint32_t eq_depth;       /* number of EQEs */
-    uint32_t eq_pi;          /* producer index */
-    uint32_t eq_ci;          /* consumer index (for query only) */
+    uint32_t eq_pi;          /* producer ring slot */
+    uint32_t eq_prod_index;  /* monotonic 24-bit producer index */
+    uint32_t eq_ci;          /* monotonic 24-bit consumer index */
     uint32_t eq_owner_phase; /* owner bit phase for EQE generation */
     uint32_t irq_num;        /* USI vector number programmed by guest */
 } UBCEqState;

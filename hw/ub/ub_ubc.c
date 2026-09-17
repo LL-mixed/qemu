@@ -1830,6 +1830,12 @@ typedef struct UbcVoidPendingResponse {
 #define UDMA_DOORBELL_OFFSET     0x80
 #define UDMA_HW_PAGE_SIZE        0x1000
 #define UBASE_EQE_SIZE           64
+#define UBASE_EQ_DB_CMD_CEQ      0x2
+#define UBASE_EQ_DB_EQN_MASK     0xFF
+#define UBASE_EQ_DB_TYPE_SHIFT   16
+#define UBASE_EQ_DB_TYPE_MASK    0x3
+#define UBASE_EQ_DB_CI_SHIFT     32
+#define UBASE_EQ_DB_INDEX_MASK   0xFFFFFF
 
 /* RDMA WRITE payload header (prepended before actual data) */
 typedef struct {
@@ -3143,13 +3149,17 @@ static bool ubc_push_ceq_event(BusControllerDev *ubc_dev, uint32_t ceqn,
     }
 
     ceq->eq_pi = (ceq->eq_pi + 1) % ceq->eq_depth;
+    ceq->eq_prod_index = (ceq->eq_prod_index + 1) &
+                         UBASE_EQ_DB_INDEX_MASK;
     if (ceq->eq_pi == 0) {
         ceq->eq_owner_phase ^= 1;
     }
 
     if (ubc_trace_data_path_enabled()) {
-        qemu_log("ubc CEQE: ceqn=%u jfcn=%u owner=%u eq_pi=%u irq_num=%u\n",
-                 ceqn, jfcn, owner, ceq->eq_pi, ceq->irq_num);
+        qemu_log("ubc CEQE: ceqn=%u jfcn=%u owner=%u eq_pi=%u "
+                 "prod=%u irq_num=%u\n",
+                 ceqn, jfcn, owner, ceq->eq_pi, ceq->eq_prod_index,
+                 ceq->irq_num);
     }
 
     /*
@@ -3552,14 +3562,15 @@ static int ubc_handle_post_mb(BusControllerDev *ubc_dev,
 
             dma_ret = ubc_dma_read(ubc_dev, dma_addr, ctx_buf, UBASE_EQ_CTX_SIZE);
             if (dma_ret == MEMTX_OK) {
-                dw[0] = (dw[0] & 0xFFu) | ((ceq->eq_pi & 0xFFFFFFu) << 8);
+                dw[0] = (dw[0] & 0xFFu) |
+                        ((ceq->eq_prod_index & 0xFFFFFFu) << 8);
                 dw[0] = (dw[0] & ~0x3u) | 0x1u;
                 dw[1] = (dw[1] & 0xFFu) | ((ceq->eq_ci & 0xFFFFFFu) << 8);
                 dw[11] = (dw[11] & ~0x3u) | 0x1u;
                 ubc_dma_write(ubc_dev, dma_addr, ctx_buf, UBASE_EQ_CTX_SIZE);
             }
-            qemu_log("ubc POST_MB QUERY_CEQ: eqn=%u pi=%u ci=%u\n",
-                     tag, ceq->eq_pi, ceq->eq_ci);
+            qemu_log("ubc POST_MB QUERY_CEQ: eqn=%u pi=%u slot=%u ci=%u\n",
+                     tag, ceq->eq_prod_index, ceq->eq_pi, ceq->eq_ci);
         }
         mb.status = cpu_to_le32(0);
         break;
@@ -3934,6 +3945,49 @@ static bool ubc_notify_vector(BusControllerDev *ubc_dev, uint16_t usi_vector,
             qemu_log("ubc %s msi notify fallback vector=%u rid=0x%x\n",
                      name, msi_vector, UBC_INTERRUPT_ID_START + msi_vector);
         }
+    }
+    return true;
+}
+
+/*
+ * Consume the ubase EQ doorbell written at ERS1 offset zero.  The CEQ
+ * interrupt handler is budgeted, so acknowledging part of a non-empty CEQ
+ * must reassert its notification.  Real hardware does this after observing
+ * the consumer index; without it, a burst larger than the handler budget can
+ * leave completions stranded and the network TX queue stopped forever.
+ */
+static bool ubc_handle_eq_doorbell(BusControllerDev *ubc_dev, uint64_t value)
+{
+    uint32_t eqn = value & UBASE_EQ_DB_EQN_MASK;
+    uint32_t type = (value >> UBASE_EQ_DB_TYPE_SHIFT) &
+                    UBASE_EQ_DB_TYPE_MASK;
+    uint32_t ci = (value >> UBASE_EQ_DB_CI_SHIFT) &
+                  UBASE_EQ_DB_INDEX_MASK;
+    UBCEqState *ceq;
+
+    if (type != UBASE_EQ_DB_CMD_CEQ) {
+        return false;
+    }
+    if (eqn >= UBC_MAX_CEQS) {
+        qemu_log("ubc CEQ doorbell: ceqn=%u out of range ci=%u\n",
+                 eqn, ci);
+        return true;
+    }
+    ceq = &ubc_dev->ceqs[eqn];
+    if (!ceq->active || ceq->eq_depth == 0) {
+        qemu_log("ubc CEQ doorbell: ceqn=%u inactive ci=%u\n", eqn, ci);
+        return true;
+    }
+
+    ceq->eq_ci = ci;
+    if (ceq->eq_ci != ceq->eq_prod_index) {
+        if (ubc_trace_data_path_enabled()) {
+            qemu_log("ubc CEQ doorbell: ceqn=%u ci=%u prod=%u "
+                     "action=renotify\n",
+                     eqn, ceq->eq_ci, ceq->eq_prod_index);
+        }
+        ubc_notify_vector(ubc_dev, (uint16_t)ceq->irq_num,
+                          (uint16_t)(2 + eqn), "ceq");
     }
     return true;
 }
@@ -10504,6 +10558,11 @@ static void ub_ers_region_write(void *opaque, hwaddr addr, uint64_t val, unsigne
     hwaddr obmm_async_reg;
     hwaddr ub_async_load_reg;
     hwaddr linqu_reg;
+
+    if (ers->idx == 1 && addr == 0 && len == sizeof(uint64_t) &&
+        ubc_handle_eq_doorbell(ubc_dev, val)) {
+        return;
+    }
 
     if (ers->idx == 2 && len >= DWORD_SIZE) {
         if (ubc_dev->obmm_async &&
