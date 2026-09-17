@@ -9070,6 +9070,8 @@ static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
     }
     if (dcna == ubc_dev->parent.cna) {
         GsvaHomeBinding *pin = NULL;
+        GsvaRouteEntry *home_route = NULL;
+        bool restore_cpu_window = false;
         MemTxResult result;
 
         if (strict) {
@@ -9077,6 +9079,27 @@ static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
                                   remote_uba, len, write, &pin) != GSVA_OK) {
                 return MEMTX_ACCESS_ERROR;
             }
+            home_route = gsva_route_lookup_base(&g_gsva_routes,
+                                                &identity->key);
+            if (!home_route ||
+                memcmp(&home_route->key, &identity->key,
+                       sizeof(identity->key)) ||
+                home_route->state != GSVA_ROUTE_ACTIVE ||
+                home_route->source != SIM_DEC_MAP_SOURCE_GVA_MANAGER ||
+                home_route->address_profile !=
+                    GSVA_ADDRESS_PROFILE_STRICT_GSVA ||
+                home_route->home_cna != identity->home_cna ||
+                home_route->token.token_id != identity->token_id ||
+                home_route->token.token_value != identity->token_value ||
+                home_route->backing_token_id !=
+                    identity->backing_token_id ||
+                !home_route->cpu_window_initialized ||
+                !home_route->cpu_window_mapped ||
+                !ubc_cpu_window_detach(&home_route->cpu_window)) {
+                gsva_home_release(pin);
+                return MEMTX_ACCESS_ERROR;
+            }
+            restore_cpu_window = true;
         } else if (gsva_home_overlaps(&ubc_dev->gsva_home, remote_uba, len)) {
             return MEMTX_ACCESS_ERROR;
         }
@@ -9086,6 +9109,11 @@ static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
         } else {
             result = ubc_dma_read_local_data_tid_strict(
                 ubc_dev, remote_uba, data, len, ubc_tid_or_auto(token_id));
+        }
+        if (restore_cpu_window) {
+            memory_region_add_subregion_overlap(get_system_memory(),
+                                                home_route->local_pa,
+                                                &home_route->cpu_window, 10);
         }
         if (pin) {
             gsva_home_release(pin);
