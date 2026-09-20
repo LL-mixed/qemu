@@ -7662,6 +7662,7 @@ void ubc_handle_gsva_io(BusControllerDev *ubc_dev, const uint8_t *payload,
     uint32_t len;
     uint32_t header_size;
     GsvaHomeBinding *pin = NULL;
+    ObmmExportEntry *export_entry = NULL;
 
     if (!ubc_dev || !ubc_dev->ummu || !payload || payload_len < sizeof(*io) || !peer_cna ||
         io->magic != UBC_GSVA_IO_MAGIC ||
@@ -7696,17 +7697,32 @@ void ubc_handle_gsva_io(BusControllerDev *ubc_dev, const uint8_t *payload,
                 &pin) != GSVA_OK) {
             goto reply;
         }
+        export_entry = obmm_export_lookup(io->request.remote_uba, len,
+                                          io->request.token_id);
+        if (!export_entry) {
+            goto reply;
+        }
     } else if (gsva_home_overlaps(&ubc_dev->gsva_home,
                                   io->request.remote_uba, len)) {
         goto reply;
     }
     if (io->write) {
         memcpy(reply + sizeof(*response), payload + header_size, len);
-        result = ubc_dma_write_local_data_tid_strict(ubc_dev,
-            io->request.remote_uba, payload + header_size, len, io->request.token_id);
+        result = export_entry ?
+            obmm_export_write_exact(ubc_dev, export_entry,
+                                    io->request.remote_uba,
+                                    payload + header_size, len) :
+            ubc_dma_write_local_data_tid_strict(
+                ubc_dev, io->request.remote_uba,
+                payload + header_size, len, io->request.token_id);
     } else {
-        result = ubc_dma_read_local_data_tid_strict(ubc_dev,
-            io->request.remote_uba, reply + sizeof(*response), len, io->request.token_id);
+        result = export_entry ?
+            obmm_export_read_exact(ubc_dev, export_entry,
+                                   io->request.remote_uba,
+                                   reply + sizeof(*response), len) :
+            ubc_dma_read_local_data_tid_strict(
+                ubc_dev, io->request.remote_uba,
+                reply + sizeof(*response), len, io->request.token_id);
     }
     if (pin) {
         gsva_home_release(pin);
@@ -9232,6 +9248,7 @@ static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
     if (dcna == ubc_dev->parent.cna) {
         GsvaHomeBinding *pin = NULL;
         GsvaRouteEntry *home_route = NULL;
+        ObmmExportEntry *export_entry = NULL;
         MemTxResult result;
 
         if (strict) {
@@ -9259,15 +9276,27 @@ static MemTxResult ubc_sim_dec_remote_io_body(BusControllerDev *ubc_dev,
                 gsva_home_release(pin);
                 return MEMTX_ACCESS_ERROR;
             }
+            export_entry = obmm_export_lookup(remote_uba, len, token_id);
+            if (!export_entry) {
+                gsva_home_release(pin);
+                return MEMTX_ACCESS_ERROR;
+            }
         } else if (gsva_home_overlaps(&ubc_dev->gsva_home, remote_uba, len)) {
             return MEMTX_ACCESS_ERROR;
         }
         if (write) {
-            result = ubc_dma_write_local_data_tid_strict(
-                ubc_dev, remote_uba, data, len, token_id);
+            result = export_entry ?
+                obmm_export_write_exact(ubc_dev, export_entry,
+                                        remote_uba, data, len) :
+                ubc_dma_write_local_data_tid_strict(
+                    ubc_dev, remote_uba, data, len, token_id);
         } else {
-            result = ubc_dma_read_local_data_tid_strict(
-                ubc_dev, remote_uba, data, len, ubc_tid_or_auto(token_id));
+            result = export_entry ?
+                obmm_export_read_exact(ubc_dev, export_entry,
+                                       remote_uba, data, len) :
+                ubc_dma_read_local_data_tid_strict(
+                    ubc_dev, remote_uba, data, len,
+                    ubc_tid_or_auto(token_id));
         }
         if (pin) {
             gsva_home_release(pin);
