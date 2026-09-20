@@ -22,6 +22,7 @@ ub_ss.add(files(
   'gsva_key.c',
   'gsva_home.c',
   'gsva_route.c',
+  'gsva_token_rotation.c',
   'gsva_coherence.c',
   'gsva_stats.c',
   'ub_npu.c',

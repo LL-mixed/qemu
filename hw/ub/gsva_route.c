@@ -477,6 +477,9 @@ int gsva_route_rotate_token(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
             continue;
         }
         if (gsva_key_base_equal(&entry->key, key)) {
+            if (memcmp(&entry->key, key, sizeof(*key)) != 0) {
+                return GSVA_ERR_STALE_EPOCH;
+            }
             if (!entry->token.active ||
                 entry->token.state != GSVA_TOKEN_ACTIVE ||
                 entry->token.token_id != token_id) {
@@ -514,6 +517,9 @@ int gsva_route_ack_token_revoke(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
             continue;
         }
         if (gsva_key_base_equal(&entry->key, key)) {
+            if (memcmp(&entry->key, key, sizeof(*key)) != 0) {
+                return GSVA_ERR_STALE_EPOCH;
+            }
             if (entry->token.active &&
                 entry->token.state == GSVA_TOKEN_ACTIVE &&
                 entry->token.token_id == token_id &&
@@ -539,6 +545,37 @@ int gsva_route_ack_token_revoke(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
         }
     }
 
+    return GSVA_ERR_ROUTE_MISSING;
+}
+
+int gsva_route_abort_token_revoke(GsvaRouteTable *tbl,
+                                  const GsvaKeyV1 *key,
+                                  uint32_t token_id,
+                                  uint32_t pending_token_value)
+{
+    GsvaRouteEntry *entry;
+
+    if (!tbl || !key || !token_id || !pending_token_value) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+    QTAILQ_FOREACH(entry, &tbl->routes, next) {
+        if (entry->state != GSVA_ROUTE_ACTIVE ||
+            !gsva_key_base_equal(&entry->key, key)) {
+            continue;
+        }
+        if (memcmp(&entry->key, key, sizeof(*key)) != 0) {
+            return GSVA_ERR_STALE_EPOCH;
+        }
+        if (entry->token.state != GSVA_TOKEN_REVOKING ||
+            entry->token.token_id != token_id ||
+            entry->token.pending_token_value != pending_token_value) {
+            return GSVA_ERR_TOKEN_DENIED;
+        }
+        entry->token.pending_token_value = 0;
+        entry->token.state = GSVA_TOKEN_ACTIVE;
+        entry->token.active = true;
+        return GSVA_OK;
+    }
     return GSVA_ERR_ROUTE_MISSING;
 }
 

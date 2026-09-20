@@ -162,6 +162,12 @@ int gsva_route_ack_token_revoke(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
                                 uint32_t new_token_value,
                                 uint32_t requester_cna);
 
+/* Restore an exact pending rotation to its previous active token. */
+int gsva_route_abort_token_revoke(GsvaRouteTable *tbl,
+                                  const GsvaKeyV1 *key,
+                                  uint32_t token_id,
+                                  uint32_t pending_token_value);
+
 /* Get GSVA route stats */
 void gsva_route_get_stats(GsvaRouteTable *tbl,
                           uint64_t *map_total, uint64_t *unmap_total,

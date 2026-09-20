@@ -3,6 +3,7 @@
  * extracted production-function test in ub_sim. */
 #include "qemu/osdep.h"
 #include "hw/ub/gsva_coherence.h"
+#include "hw/ub/gsva_token_rotation.h"
 #include "hw/ub/ub_ubc.h"
 
 static uint64_t now_ms = 100;
@@ -103,6 +104,17 @@ int gsva_route_rotate_token(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
 int gsva_home_rotate_token(GsvaHomeTable *table, uint32_t local_cna,
                            const GsvaKeyV1 *key, uint32_t token_id,
                            uint32_t value)
+{
+    g_assert_not_reached();
+}
+
+int gsva_token_rotation_apply_home(GsvaHomeTable *home, uint32_t local_cna,
+                                   GsvaRouteTable *routes,
+                                   const GsvaKeyV1 *key,
+                                   uint32_t requester_cna,
+                                   uint32_t token_id,
+                                   uint32_t new_token_value,
+                                   bool route_already_pending)
 {
     g_assert_not_reached();
 }

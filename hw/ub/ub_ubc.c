@@ -15831,13 +15831,19 @@ int ubc_handle_sim_dec_message(const uint8_t *data, uint32_t len,
             ev_rc = gsva_route_rotate_token(&g_gsva_routes, ev_key,
                                             token_id, token_value);
             if (ev_rc == GSVA_OK) {
+                int revoke_rc;
+
                 gsva_tlb_stable_flush_key(ev_key, "token_revoke_pending");
-                (void)gsva_coh_token_revoke_tx(&g_gsva_coh,
-                                               g_sim_decoder &&
-                                               g_sim_decoder->bcs ?
-                                               g_sim_decoder->bcs->ubc_dev : NULL,
-                                               ev_key, requester_cna,
-                                               token_id, token_value);
+                revoke_rc = gsva_coh_token_revoke_tx(
+                    &g_gsva_coh,
+                    g_sim_decoder && g_sim_decoder->bcs ?
+                    g_sim_decoder->bcs->ubc_dev : NULL,
+                    ev_key, requester_cna, token_id, token_value);
+                if (revoke_rc != GSVA_OK) {
+                    (void)gsva_route_abort_token_revoke(
+                        &g_gsva_routes, ev_key, token_id, token_value);
+                    ev_rc = revoke_rc;
+                }
             }
             break;
         case 7: /* Fence */
