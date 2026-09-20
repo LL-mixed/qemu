@@ -15904,25 +15904,39 @@ static MemTxResult ubc_gsva_route_backing_read(BusControllerDev *ubc,
                                                uint64_t len)
 {
     ObmmExportEntry *exp;
+    uint32_t backing_token_id;
     bool restore_cpu_window;
     MemTxResult ret;
 
+    backing_token_id = route && route->backing_token_id ?
+        route->backing_token_id : route ? route->token.token_id : 0;
     if (route && route->home_cna == ubc->parent.cna) {
         ret = ubc_dma_read_local_data_tid_strict(
-            ubc, gsva, dst, len, ubc_tid_or_auto(route->token.token_id));
+            ubc, gsva, dst, len, ubc_tid_or_auto(backing_token_id));
         if (ret == MEMTX_OK) {
             return ret;
         }
     } else if (route && route->home_cna != 0) {
-        ret = ubc_sim_dec_remote_read(ubc, gsva, route->token.token_id,
-                                      route->home_cna, dst, (uint32_t)len);
+        if (route->backing_token_id) {
+            ret = ubc_sim_dec_remote_io(
+                ubc, gsva, route->backing_token_id, route->home_cna,
+                dst, (uint32_t)len, true, false,
+                &(GsvaHomeIdentity){.key = route->key,
+                    .home_cna = route->home_cna,
+                    .token_id = route->token.token_id,
+                    .token_value = route->token.token_value,
+                    .backing_token_id = route->backing_token_id});
+        } else {
+            ret = ubc_sim_dec_remote_read(
+                ubc, gsva, route->token.token_id, route->home_cna,
+                dst, (uint32_t)len);
+        }
         if (ret == MEMTX_OK) {
             return ret;
         }
     }
 
-    exp = obmm_export_lookup(gsva, len,
-                             route ? route->token.token_id : 0);
+    exp = obmm_export_lookup(gsva, len, backing_token_id);
     if (exp && exp->backing_uba) {
         uint64_t offset = gsva - exp->remote_uba;
         uint64_t backing_addr = exp->backing_uba + offset;
@@ -15937,6 +15951,9 @@ static MemTxResult ubc_gsva_route_backing_read(BusControllerDev *ubc,
         if (ret == MEMTX_OK) {
             return ret;
         }
+    }
+    if (route && route->backing_token_id) {
+        return MEMTX_ACCESS_ERROR;
     }
 
     restore_cpu_window = route && route->cpu_window_mapped &&
@@ -15959,25 +15976,39 @@ static MemTxResult ubc_gsva_route_backing_write(BusControllerDev *ubc,
                                                 uint64_t len)
 {
     ObmmExportEntry *exp;
+    uint32_t backing_token_id;
     bool restore_cpu_window;
     MemTxResult ret;
 
+    backing_token_id = route && route->backing_token_id ?
+        route->backing_token_id : route ? route->token.token_id : 0;
     if (route && route->home_cna == ubc->parent.cna) {
         ret = ubc_dma_write_local_data_tid_strict(
-            ubc, gsva, src, len, ubc_tid_or_auto(route->token.token_id));
+            ubc, gsva, src, len, ubc_tid_or_auto(backing_token_id));
         if (ret == MEMTX_OK) {
             return ret;
         }
     } else if (route && route->home_cna != 0) {
-        ret = ubc_sim_dec_remote_write(ubc, gsva, route->token.token_id,
-                                       route->home_cna, src, (uint32_t)len);
+        if (route->backing_token_id) {
+            ret = ubc_sim_dec_remote_io(
+                ubc, gsva, route->backing_token_id, route->home_cna,
+                (uint8_t *)src, (uint32_t)len, true, true,
+                &(GsvaHomeIdentity){.key = route->key,
+                    .home_cna = route->home_cna,
+                    .token_id = route->token.token_id,
+                    .token_value = route->token.token_value,
+                    .backing_token_id = route->backing_token_id});
+        } else {
+            ret = ubc_sim_dec_remote_write(
+                ubc, gsva, route->token.token_id, route->home_cna,
+                src, (uint32_t)len);
+        }
         if (ret == MEMTX_OK) {
             return ret;
         }
     }
 
-    exp = obmm_export_lookup(gsva, len,
-                             route ? route->token.token_id : 0);
+    exp = obmm_export_lookup(gsva, len, backing_token_id);
     if (exp && exp->backing_uba) {
         uint64_t offset = gsva - exp->remote_uba;
         uint64_t backing_addr = exp->backing_uba + offset;
@@ -15992,6 +16023,9 @@ static MemTxResult ubc_gsva_route_backing_write(BusControllerDev *ubc,
         if (ret == MEMTX_OK) {
             return ret;
         }
+    }
+    if (route && route->backing_token_id) {
+        return MEMTX_ACCESS_ERROR;
     }
 
     restore_cpu_window = route && route->cpu_window_mapped &&
