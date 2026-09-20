@@ -143,6 +143,42 @@ int gsva_home_acquire(GsvaHomeTable *table, uint32_t local_cna,
     return GSVA_ERR_ROUTE_MISSING;
 }
 
+int gsva_home_rotate_token(GsvaHomeTable *table, uint32_t local_cna,
+                           const GsvaKeyV1 *key, uint32_t token_id,
+                           uint32_t new_token_value)
+{
+    GsvaHomeBinding *binding;
+
+    if (!table || !local_cna || !key ||
+        gsva_key_validate(key) != GSVA_OK || !token_id ||
+        !new_token_value) {
+        return GSVA_ERR_BAD_VERSION;
+    }
+    for (binding = table->bindings; binding; binding = binding->next) {
+        GsvaHomeIdentity *identity = &binding->registration.identity;
+
+        if (!gsva_key_base_equal(&identity->key, key)) {
+            continue;
+        }
+        if (memcmp(&identity->key, key, sizeof(*key)) != 0) {
+            return GSVA_ERR_STALE_EPOCH;
+        }
+        if (!binding->active) {
+            return GSVA_ERR_SEGMENT_RETIRED;
+        }
+        if (identity->home_cna != local_cna ||
+            identity->token_id != token_id) {
+            return GSVA_ERR_TOKEN_DENIED;
+        }
+        if (binding->users) {
+            return GSVA_ERR_COH_PENDING;
+        }
+        identity->token_value = new_token_value;
+        return GSVA_OK;
+    }
+    return GSVA_ERR_ROUTE_MISSING;
+}
+
 int gsva_home_resolve_export(const GsvaHomeTable *table, uint32_t local_cna,
                              uint64_t export_mem_id,
                              uint32_t backing_token_id,

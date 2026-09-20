@@ -94,6 +94,19 @@ int gsva_route_ack_token_revoke(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
     g_assert_not_reached();
 }
 
+int gsva_route_rotate_token(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
+                            uint32_t token_id, uint32_t value)
+{
+    g_assert_not_reached();
+}
+
+int gsva_home_rotate_token(GsvaHomeTable *table, uint32_t local_cna,
+                           const GsvaKeyV1 *key, uint32_t token_id,
+                           uint32_t value)
+{
+    g_assert_not_reached();
+}
+
 static GsvaCohObject *start(bool transport, bool failure)
 {
     GsvaCohObject *obj;

@@ -39,6 +39,9 @@ int gsva_home_update(GsvaHomeTable *table, uint32_t local_cna,
 int gsva_home_acquire(GsvaHomeTable *table, uint32_t local_cna,
                       const GsvaHomeIdentity *identity, uint64_t address,
                       uint64_t length, bool write, GsvaHomeBinding **pin);
+int gsva_home_rotate_token(GsvaHomeTable *table, uint32_t local_cna,
+                           const GsvaKeyV1 *key, uint32_t token_id,
+                           uint32_t new_token_value);
 /* Resolve an active local export to its authoritative managed identity.
  * Exact export, backing token, address and size must all match. */
 int gsva_home_resolve_export(const GsvaHomeTable *table, uint32_t local_cna,

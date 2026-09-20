@@ -1539,10 +1539,34 @@ void gsva_coh_handle_rx_retire_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1
 
 void gsva_coh_handle_rx_token_revoke(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
 {
+    int rc = GSVA_ERR_ROUTE_MISSING;
+    uint32_t token_id = msg->access_flags;
+    uint32_t new_token_value = (uint32_t)msg->access_len;
+
     qemu_log("GSVA_COH: rx TOKEN_REVOKE from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
              msg->source_cna, msg->key.segment_id, msg->seq);
-    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, GSVA_OK);
+    if (ubc_dev && msg->target_cna == ubc_dev->parent.cna &&
+        g_gsva_route_default_table) {
+        rc = gsva_route_rotate_token(g_gsva_route_default_table,
+                                     &msg->key, token_id,
+                                     new_token_value);
+        if (rc == GSVA_OK) {
+            rc = gsva_home_rotate_token(&ubc_dev->gsva_home,
+                                        ubc_dev->parent.cna, &msg->key,
+                                        token_id, new_token_value);
+        }
+        if (rc == GSVA_OK) {
+            rc = gsva_route_ack_token_revoke(g_gsva_route_default_table,
+                                             &msg->key, token_id,
+                                             new_token_value,
+                                             msg->source_cna);
+        }
+    }
+    qemu_log("GSVA_COH: rx TOKEN_REVOKE applied from cna=%" PRIu32
+             " segment_id=%#" PRIx64 " token_id=%" PRIu32 " rc=%d\n",
+             msg->source_cna, msg->key.segment_id, token_id, rc);
+    gsva_coh_send_ack(ubc_dev, msg, UBC_MSG_SUB_GSVA_COH, rc);
 }
 
 void gsva_coh_handle_rx_token_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
@@ -1555,7 +1579,9 @@ void gsva_coh_handle_rx_token_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1 
              " segment_id=%#" PRIx64 " seq=%" PRIu64
              " token_id=%" PRIu32 "\n",
              msg->source_cna, msg->key.segment_id, msg->seq, token_id);
-    if (g_gsva_route_default_table) {
+    if (msg->error != GSVA_OK) {
+        rc = msg->error;
+    } else if (g_gsva_route_default_table) {
         rc = gsva_route_ack_token_revoke(g_gsva_route_default_table,
                                          &msg->key, token_id,
                                          new_token_value, msg->source_cna);

@@ -64,6 +64,10 @@ tests = {
     meson.project_source_root() / 'hw/ub/gsva_coherence.c',
     meson.project_source_root() / 'hw/ub/gsva_key.c'
   ],
+  'test-gsva-home': [
+    meson.project_source_root() / 'hw/ub/gsva_home.c',
+    meson.project_source_root() / 'hw/ub/gsva_key.c'
+  ],
   'test-ub-void-response-policy': [
     meson.project_source_root() / 'hw/ub/ub_void_response_policy.c'
   ],
