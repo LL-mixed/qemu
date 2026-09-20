@@ -12277,23 +12277,24 @@ static MemTxResult obmm_export_read_exact(BusControllerDev *ubc_dev,
                                           uint64_t data_len)
 {
     uint64_t offset;
-    uint64_t backing_addr;
 
     if (!ubc_dev || !entry || !data || data_len == 0 ||
-        uba < entry->remote_uba) {
+        entry->token_id == 0 || uba < entry->remote_uba) {
         return MEMTX_DECODE_ERROR;
     }
     offset = uba - entry->remote_uba;
-    if (data_len > entry->size || offset > entry->size - data_len ||
-        offset > UINT64_MAX - entry->backing_uba ||
-        data_len > UINT64_MAX - (entry->backing_uba + offset)) {
+    if (data_len > entry->size || offset > entry->size - data_len) {
         return MEMTX_DECODE_ERROR;
     }
-    backing_addr = entry->backing_uba + offset;
 
-    /* backing_uba is guest physical memory, not a UMMU IOVA. */
-    return address_space_read(&address_space_memory, backing_addr,
-                              MEMTXATTRS_UNSPECIFIED, data, data_len);
+    /*
+     * remote_uba is the contiguous exported address space.  The physical
+     * backing may contain multiple non-contiguous scatterlist entries, while
+     * backing_uba names only the first entry.  Resolve every offset through
+     * the export token so the UMMU selects the correct backing segment.
+     */
+    return ubc_dma_read_local_data_tid_strict(ubc_dev, uba, data, data_len,
+                                              entry->token_id);
 }
 
 static MemTxResult obmm_export_write_exact(BusControllerDev *ubc_dev,
@@ -12303,23 +12304,18 @@ static MemTxResult obmm_export_write_exact(BusControllerDev *ubc_dev,
                                            uint64_t data_len)
 {
     uint64_t offset;
-    uint64_t backing_addr;
 
     if (!ubc_dev || !entry || !data || data_len == 0 ||
-        uba < entry->remote_uba) {
+        entry->token_id == 0 || uba < entry->remote_uba) {
         return MEMTX_DECODE_ERROR;
     }
     offset = uba - entry->remote_uba;
-    if (data_len > entry->size || offset > entry->size - data_len ||
-        offset > UINT64_MAX - entry->backing_uba ||
-        data_len > UINT64_MAX - (entry->backing_uba + offset)) {
+    if (data_len > entry->size || offset > entry->size - data_len) {
         return MEMTX_DECODE_ERROR;
     }
-    backing_addr = entry->backing_uba + offset;
 
-    /* backing_uba is guest physical memory, not a UMMU IOVA. */
-    return address_space_write(&address_space_memory, backing_addr,
-                               MEMTXATTRS_UNSPECIFIED, data, data_len);
+    return ubc_dma_write_local_data_tid_strict(ubc_dev, uba, data, data_len,
+                                               entry->token_id);
 }
 
 static SimDecMapEntry *sim_dec_find_entry_by_id(uint64_t map_id)
