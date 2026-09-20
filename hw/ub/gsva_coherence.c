@@ -924,9 +924,10 @@ int gsva_coh_token_revoke_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
                              uint32_t token_id, uint32_t new_token_value)
 {
     GsvaCohObject *obj;
-    uint32_t targets[GSVA_COH_MAX_HOLDERS] = {0};
-    uint32_t target_count = 0;
-    uint32_t i;
+    GsvaRouteEntry *route;
+    uint32_t home_cna;
+    GsvaCohMsgV1 revoke = {0};
+    int tx_rc;
 
     if (!tbl || !key) {
         return GSVA_ERR_BAD_VERSION;
@@ -939,58 +940,40 @@ int gsva_coh_token_revoke_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
     if (!obj) {
         return GSVA_ERR_ROUTE_MISSING;
     }
-
-    if (obj->state == GSVA_COH_E || obj->state == GSVA_COH_M) {
-        if (obj->owner_cna != 0 && obj->owner_cna != requester_cna) {
-            targets[target_count++] = obj->owner_cna;
-        }
-    } else if (obj->state == GSVA_COH_S) {
-        for (i = 0; i < obj->sharer_count; i++) {
-            uint32_t cna = obj->sharer_cnas[i];
-
-            if (cna == requester_cna) {
-                continue;
-            }
-            if (target_count < GSVA_COH_MAX_HOLDERS) {
-                targets[target_count++] = cna;
-            }
-        }
+    route = g_gsva_route_default_table ?
+        gsva_route_lookup_base(g_gsva_route_default_table, key) : NULL;
+    if (!route || !route->home_cna) {
+        return GSVA_ERR_ROUTE_MISSING;
     }
+    home_cna = route->home_cna;
 
-    qemu_log("GSVA_COH: TokenRevoke holders segment_id=%#" PRIx64
-             " requester=%" PRIu32 " targets=%" PRIu32
+    qemu_log("GSVA_COH: TokenRevoke home segment_id=%#" PRIx64
+             " requester=%" PRIu32 " home=%" PRIu32
              " token_id=%" PRIu32 "\n",
-             key->segment_id, requester_cna, target_count, token_id);
+             key->segment_id, requester_cna, home_cna, token_id);
 
     if (!ubc_dev || !gsva_coh_ub_link_tx_enabled()) {
         return GSVA_OK;
     }
-
-    for (i = 0; i < target_count; i++) {
-        GsvaCohMsgV1 revoke = {0};
-        int tx_rc;
-
-        if (targets[i] == ubc_dev->parent.cna) {
-            continue;
-        }
-        revoke.version = 1;
-        revoke.op = GSVA_COH_MSG_TOKEN_REVOKE;
-        revoke.seq = 0;
-        revoke.source_cna = requester_cna;
-        revoke.target_cna = targets[i];
-        revoke.key = *key;
-        revoke.access_va = key->home_va;
-        revoke.access_len = new_token_value;
-        revoke.access_flags = token_id;
-        tx_rc = gsva_coh_send_ub_link_msg(
-                ubc_dev, targets[i], UBC_MSG_SUB_GSVA_COH, &revoke);
-        qemu_log("GSVA_COH: tx TOKEN_REVOKE target=%" PRIu32
-                 " segment_id=%#" PRIx64 " token_id=%" PRIu32
-                 " rc=%d\n",
-                 targets[i], key->segment_id, token_id, tx_rc);
+    if (home_cna == ubc_dev->parent.cna) {
+        return GSVA_OK;
     }
 
-    return GSVA_OK;
+    revoke.version = 1;
+    revoke.op = GSVA_COH_MSG_TOKEN_REVOKE;
+    revoke.seq = 0;
+    revoke.source_cna = requester_cna;
+    revoke.target_cna = home_cna;
+    revoke.key = *key;
+    revoke.access_va = key->home_va;
+    revoke.access_len = new_token_value;
+    revoke.access_flags = token_id;
+    tx_rc = gsva_coh_send_ub_link_msg(
+        ubc_dev, home_cna, UBC_MSG_SUB_GSVA_COH, &revoke);
+    qemu_log("GSVA_COH: tx TOKEN_REVOKE home=%" PRIu32
+             " segment_id=%#" PRIx64 " token_id=%" PRIu32 " rc=%d\n",
+             home_cna, key->segment_id, token_id, tx_rc);
+    return tx_rc == 0 ? GSVA_OK : GSVA_ERR_COH_TIMEOUT;
 }
 
 int gsva_coh_fence_tx(GsvaCohTable *tbl, BusControllerDev *ubc_dev,
