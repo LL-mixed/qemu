@@ -514,6 +514,13 @@ int gsva_route_ack_token_revoke(GsvaRouteTable *tbl, const GsvaKeyV1 *key,
             continue;
         }
         if (gsva_key_base_equal(&entry->key, key)) {
+            if (entry->token.active &&
+                entry->token.state == GSVA_TOKEN_ACTIVE &&
+                entry->token.token_id == token_id &&
+                entry->token.token_value == new_token_value &&
+                entry->token.pending_token_value == 0) {
+                return GSVA_OK;
+            }
             if (entry->token.state != GSVA_TOKEN_REVOKING ||
                 entry->token.token_id != token_id ||
                 entry->token.pending_token_value != new_token_value) {

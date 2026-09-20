@@ -1522,28 +1522,33 @@ void gsva_coh_handle_rx_retire_ack(BusControllerDev *ubc_dev, const GsvaCohMsgV1
 
 void gsva_coh_handle_rx_token_revoke(BusControllerDev *ubc_dev, const GsvaCohMsgV1 *msg)
 {
+    GsvaRouteEntry *route = NULL;
     int rc = GSVA_ERR_ROUTE_MISSING;
+    int route_rc;
     uint32_t token_id = msg->access_flags;
     uint32_t new_token_value = (uint32_t)msg->access_len;
 
     qemu_log("GSVA_COH: rx TOKEN_REVOKE from cna=%" PRIu32
              " segment_id=%#" PRIx64 " seq=%" PRIu64 "\n",
              msg->source_cna, msg->key.segment_id, msg->seq);
-    if (ubc_dev && msg->target_cna == ubc_dev->parent.cna &&
-        g_gsva_route_default_table) {
-        rc = gsva_route_rotate_token(g_gsva_route_default_table,
-                                     &msg->key, token_id,
-                                     new_token_value);
-        if (rc == GSVA_OK) {
-            rc = gsva_home_rotate_token(&ubc_dev->gsva_home,
-                                        ubc_dev->parent.cna, &msg->key,
-                                        token_id, new_token_value);
+    if (ubc_dev && msg->target_cna == ubc_dev->parent.cna) {
+        rc = gsva_home_rotate_token(&ubc_dev->gsva_home,
+                                    ubc_dev->parent.cna, &msg->key,
+                                    token_id, new_token_value);
+        if (rc == GSVA_OK && g_gsva_route_default_table) {
+            route = gsva_route_lookup_base(g_gsva_route_default_table,
+                                           &msg->key);
         }
-        if (rc == GSVA_OK) {
-            rc = gsva_route_ack_token_revoke(g_gsva_route_default_table,
-                                             &msg->key, token_id,
-                                             new_token_value,
-                                             msg->source_cna);
+        if (rc == GSVA_OK && route) {
+            route_rc = gsva_route_rotate_token(g_gsva_route_default_table,
+                                               &msg->key, token_id,
+                                               new_token_value);
+            if (route_rc == GSVA_OK) {
+                route_rc = gsva_route_ack_token_revoke(
+                    g_gsva_route_default_table, &msg->key, token_id,
+                    new_token_value, msg->source_cna);
+            }
+            rc = route_rc;
         }
     }
     qemu_log("GSVA_COH: rx TOKEN_REVOKE applied from cna=%" PRIu32

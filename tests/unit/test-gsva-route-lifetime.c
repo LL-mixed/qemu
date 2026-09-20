@@ -291,6 +291,7 @@ static void test_pto_live_revalidation(void)
     g_assert_cmpint(gsva_route_resolve_pto(&table, pa, 4096, 7, &current), ==,
                     GSVA_ERR_TOKEN_DENIED);
     g_assert_cmpint(gsva_route_ack_token_revoke(&table, &key, 2, 4, 7), ==, 0);
+    g_assert_cmpint(gsva_route_ack_token_revoke(&table, &key, 2, 4, 7), ==, 0);
     g_assert_cmpint(gsva_route_resolve_pto(&table, pa, 4096, 7, &current), ==, 0);
     g_assert_false(gsva_route_access_equal(&original, &current));
     route->backing_token_id++;
