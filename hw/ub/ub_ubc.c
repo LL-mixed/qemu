@@ -7543,12 +7543,12 @@ static bool obmm_export_range_overlaps(uint64_t uba, uint64_t len);
 static MemTxResult obmm_export_read_exact(BusControllerDev *ubc_dev,
                                           const ObmmExportEntry *entry,
                                           uint64_t uba, uint8_t *data,
-                                          uint32_t data_len);
+                                          uint64_t data_len);
 static MemTxResult obmm_export_write_exact(BusControllerDev *ubc_dev,
                                            const ObmmExportEntry *entry,
                                            uint64_t uba,
                                            const uint8_t *data,
-                                           uint32_t data_len);
+                                           uint64_t data_len);
 static int sim_dec_retire_obmm_export_route(const ObmmExportEntry *entry);
 static bool sim_dec_obmm_export_is_retired(uint32_t export_cna,
                                            uint64_t remote_uba,
@@ -12274,36 +12274,52 @@ static bool obmm_export_range_overlaps(uint64_t uba, uint64_t len)
 static MemTxResult obmm_export_read_exact(BusControllerDev *ubc_dev,
                                           const ObmmExportEntry *entry,
                                           uint64_t uba, uint8_t *data,
-                                          uint32_t data_len)
+                                          uint64_t data_len)
 {
-    uint64_t backing_addr = entry->backing_uba +
-                            (uba - entry->remote_uba);
-    MemTxResult ret = ubc_dma_read_local_data_tid_strict(
-        ubc_dev, backing_addr, data, data_len, UBC_DMA_TID_AUTO);
+    uint64_t offset;
+    uint64_t backing_addr;
 
-    if (ret != MEMTX_OK) {
-        ret = address_space_read(&address_space_memory, backing_addr,
-                                 MEMTXATTRS_UNSPECIFIED, data, data_len);
+    if (!ubc_dev || !entry || !data || data_len == 0 ||
+        uba < entry->remote_uba) {
+        return MEMTX_DECODE_ERROR;
     }
-    return ret;
+    offset = uba - entry->remote_uba;
+    if (data_len > entry->size || offset > entry->size - data_len ||
+        offset > UINT64_MAX - entry->backing_uba ||
+        data_len > UINT64_MAX - (entry->backing_uba + offset)) {
+        return MEMTX_DECODE_ERROR;
+    }
+    backing_addr = entry->backing_uba + offset;
+
+    /* backing_uba is guest physical memory, not a UMMU IOVA. */
+    return address_space_read(&address_space_memory, backing_addr,
+                              MEMTXATTRS_UNSPECIFIED, data, data_len);
 }
 
 static MemTxResult obmm_export_write_exact(BusControllerDev *ubc_dev,
                                            const ObmmExportEntry *entry,
                                            uint64_t uba,
                                            const uint8_t *data,
-                                           uint32_t data_len)
+                                           uint64_t data_len)
 {
-    uint64_t backing_addr = entry->backing_uba +
-                            (uba - entry->remote_uba);
-    MemTxResult ret = ubc_dma_write_local_data_tid_strict(
-        ubc_dev, backing_addr, data, data_len, UBC_DMA_TID_AUTO);
+    uint64_t offset;
+    uint64_t backing_addr;
 
-    if (ret != MEMTX_OK) {
-        ret = address_space_write(&address_space_memory, backing_addr,
-                                  MEMTXATTRS_UNSPECIFIED, data, data_len);
+    if (!ubc_dev || !entry || !data || data_len == 0 ||
+        uba < entry->remote_uba) {
+        return MEMTX_DECODE_ERROR;
     }
-    return ret;
+    offset = uba - entry->remote_uba;
+    if (data_len > entry->size || offset > entry->size - data_len ||
+        offset > UINT64_MAX - entry->backing_uba ||
+        data_len > UINT64_MAX - (entry->backing_uba + offset)) {
+        return MEMTX_DECODE_ERROR;
+    }
+    backing_addr = entry->backing_uba + offset;
+
+    /* backing_uba is guest physical memory, not a UMMU IOVA. */
+    return address_space_write(&address_space_memory, backing_addr,
+                               MEMTXATTRS_UNSPECIFIED, data, data_len);
 }
 
 static SimDecMapEntry *sim_dec_find_entry_by_id(uint64_t map_id)
@@ -15916,6 +15932,10 @@ static MemTxResult ubc_gsva_route_backing_read(BusControllerDev *ubc,
 
     backing_token_id = route && route->backing_token_id ?
         route->backing_token_id : route ? route->token.token_id : 0;
+    exp = obmm_export_lookup(gsva, len, backing_token_id);
+    if (route && route->home_cna == ubc->parent.cna && exp) {
+        return obmm_export_read_exact(ubc, exp, gsva, dst, len);
+    }
     if (route && route->home_cna == ubc->parent.cna) {
         ret = ubc_dma_read_local_data_tid_strict(
             ubc, gsva, dst, len, ubc_tid_or_auto(backing_token_id));
@@ -15942,18 +15962,8 @@ static MemTxResult ubc_gsva_route_backing_read(BusControllerDev *ubc,
         }
     }
 
-    exp = obmm_export_lookup(gsva, len, backing_token_id);
     if (exp && exp->backing_uba) {
-        uint64_t offset = gsva - exp->remote_uba;
-        uint64_t backing_addr = exp->backing_uba + offset;
-
-        ret = ubc_dma_read_local_data_tid_strict(ubc, backing_addr, dst, len,
-                                                 UBC_DMA_TID_AUTO);
-        if (ret == MEMTX_OK) {
-            return ret;
-        }
-        ret = address_space_read(&address_space_memory, backing_addr,
-                                 MEMTXATTRS_UNSPECIFIED, dst, len);
+        ret = obmm_export_read_exact(ubc, exp, gsva, dst, len);
         if (ret == MEMTX_OK) {
             return ret;
         }
@@ -15988,6 +15998,10 @@ static MemTxResult ubc_gsva_route_backing_write(BusControllerDev *ubc,
 
     backing_token_id = route && route->backing_token_id ?
         route->backing_token_id : route ? route->token.token_id : 0;
+    exp = obmm_export_lookup(gsva, len, backing_token_id);
+    if (route && route->home_cna == ubc->parent.cna && exp) {
+        return obmm_export_write_exact(ubc, exp, gsva, src, len);
+    }
     if (route && route->home_cna == ubc->parent.cna) {
         ret = ubc_dma_write_local_data_tid_strict(
             ubc, gsva, src, len, ubc_tid_or_auto(backing_token_id));
@@ -16014,18 +16028,8 @@ static MemTxResult ubc_gsva_route_backing_write(BusControllerDev *ubc,
         }
     }
 
-    exp = obmm_export_lookup(gsva, len, backing_token_id);
     if (exp && exp->backing_uba) {
-        uint64_t offset = gsva - exp->remote_uba;
-        uint64_t backing_addr = exp->backing_uba + offset;
-
-        ret = ubc_dma_write_local_data_tid_strict(ubc, backing_addr, src, len,
-                                                  UBC_DMA_TID_AUTO);
-        if (ret == MEMTX_OK) {
-            return ret;
-        }
-        ret = address_space_write(&address_space_memory, backing_addr,
-                                  MEMTXATTRS_UNSPECIFIED, src, len);
+        ret = obmm_export_write_exact(ubc, exp, gsva, src, len);
         if (ret == MEMTX_OK) {
             return ret;
         }
